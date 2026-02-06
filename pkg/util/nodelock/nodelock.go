@@ -52,6 +52,7 @@ var (
 		Factor:   1.0,
 		Jitter:   0.1,
 	}
+	NodeLockEnbaled bool
 )
 
 // nodeLockManager manages locks on a per-node basis to allow concurrent
@@ -118,6 +119,11 @@ func setupNodeLockTimeout() {
 }
 
 func SetNodeLock(nodeName string, lockname string, pods *corev1.Pod) error {
+	if !NodeLockEnbaled {
+		klog.InfoS("nodeLock is diabled", "method", "SetNodeLock", "nodeName", nodeName, "lockname", lockname)
+		return nil
+	}
+
 	// Acquire per-node lock instead of global lock
 	nodeLock := nodeLocks.getLock(nodeName)
 	nodeLock.Lock()
@@ -157,6 +163,11 @@ func SetNodeLock(nodeName string, lockname string, pods *corev1.Pod) error {
 }
 
 func ReleaseNodeLock(nodeName string, lockname string, pod *corev1.Pod, skipNodeLockOwnerCheck bool) error {
+	if !NodeLockEnbaled {
+		klog.InfoS("nodeLock is diabled", "method", "ReleaseNodeLock", "nodeName", nodeName, "lockname", lockname)
+		return nil
+	}
+
 	if pod == nil {
 		return fmt.Errorf("cannot release node lock: pod is nil")
 	}

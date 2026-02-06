@@ -37,6 +37,7 @@ import (
 	"github.com/Project-HAMi/HAMi/pkg/util"
 	"github.com/Project-HAMi/HAMi/pkg/util/client"
 	flagutil "github.com/Project-HAMi/HAMi/pkg/util/flag"
+	"github.com/Project-HAMi/HAMi/pkg/util/nodelock"
 )
 
 func main() {
@@ -146,6 +147,12 @@ func main() {
 			Name:  "v",
 			Usage: "number for the log level verbosity",
 			Value: 0,
+		},
+		&cli.BoolFlag{
+			Name:        "node-lock-enabled",
+			Usage:       "enable nodeLock or not",
+			Value:       true,                      // 默认开启
+			Destination: &nodelock.NodeLockEnbaled, // 直接绑定到 util 包变量
 		},
 	}
 	c.Flags = append(c.Flags, addFlags()...)

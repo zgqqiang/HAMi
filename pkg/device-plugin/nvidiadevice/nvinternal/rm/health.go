@@ -101,6 +101,11 @@ func (r *nvmlResourceManager) checkHealth(stop <-chan any, devices Devices, unhe
 		skippedXids[additionalXid] = true
 	}
 
+    for _, additionalXid := range getAdditionalXids(os.Getenv("FORCE-CHECK-XIDS")) {
+        klog.Infof("FORCE CHECK XID as unhealthy: %v", additionalXid)
+        skippedXids[additionalXid] = false
+    }
+	
 	eventSet, ret := r.nvml.EventSetCreate()
 	if ret != nvml.SUCCESS {
 		return fmt.Errorf("failed to create event set: %v", ret)

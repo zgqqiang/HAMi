@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -60,11 +61,16 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 		klog.Warningf(template+" - Denying admission as pod has no containers", pod.Namespace, pod.Name, pod.UID)
 		return admission.Denied("pod has no containers")
 	}
-	if pod.Spec.SchedulerName != "" &&
-		pod.Spec.SchedulerName != corev1.DefaultSchedulerName || !config.ForceOverwriteDefaultScheduler &&
-		(len(config.SchedulerName) == 0 || pod.Spec.SchedulerName != config.SchedulerName) {
-		klog.Infof(template+" - Pod already has different scheduler assigned", req.Namespace, req.Name, req.UID)
-		return admission.Allowed("pod already has different scheduler assigned")
+	// keep the same logic as oss version if env FORCE_PATCH_CUSTOM_SCHEDULER is not set to "true"
+	// and still do the patch if it's set to "true"
+	forcePatchCustomScheduler := os.Getenv("FORCE_PATCH_CUSTOM_SCHEDULER")
+	if forcePatchCustomScheduler != "true" {
+		if pod.Spec.SchedulerName != "" &&
+			(pod.Spec.SchedulerName != corev1.DefaultSchedulerName || !config.ForceOverwriteDefaultScheduler) &&
+			(len(config.SchedulerName) == 0 || pod.Spec.SchedulerName != config.SchedulerName) {
+			klog.Infof(template+" - Pod already has different scheduler assigned", req.Namespace, req.Name, req.UID)
+			return admission.Allowed("pod already has different scheduler assigned")
+		}
 	}
 	klog.Infof(template, pod.Namespace, pod.Name, pod.UID)
 	hasResource := false

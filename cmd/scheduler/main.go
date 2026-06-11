@@ -85,6 +85,8 @@ func init() {
 	rootCmd.Flags().StringVar(&config.LeaderElectResourceName, "leader-elect-resource-name", "", "The name of resource object that is used for leader election")
 	rootCmd.Flags().StringVar(&config.LeaderElectResourceNamespace, "leader-elect-resource-namespace", "", "The namespace of resource object that is used for leader election")
 
+	rootCmd.Flags().BoolVar(&nodelock.NodeLockEnbaled, "node-lock-enabled", true, "enable nodeLock or not")
+
 	rootCmd.PersistentFlags().AddGoFlagSet(config.GlobalFlagSet())
 	rootCmd.AddCommand(version.VersionCmd)
 	rootCmd.Flags().AddGoFlagSet(util.InitKlogFlags())

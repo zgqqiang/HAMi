@@ -391,10 +391,12 @@ func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[strin
 				s.rmNodeDevices(val.Name, devhandsk)
 				continue
 			}
-			if !needUpdate {
-				klog.V(5).InfoS("No update needed for device", "nodeName", val.Name, "deviceVendor", devhandsk)
-				continue
-			}
+
+			// todo 强制更新，CheckHealth里面没有考虑状态发生变化，相关issues https://github.com/Project-HAMi/HAMi/issues/2020
+			//if !needUpdate {
+			//	klog.V(5).InfoS("No update needed for device", "nodeName", val.Name, "deviceVendor", devhandsk)
+			//	continue
+			//}
 			nodeInfo := &device.NodeInfo{}
 			nodeInfo.ID = val.Name
 			nodeInfo.Node = val

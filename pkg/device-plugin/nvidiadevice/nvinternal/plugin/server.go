@@ -75,6 +75,17 @@ const (
 	deviceListEnvVar                          = "NVIDIA_VISIBLE_DEVICES"
 )
 
+const (
+	LibNvshareHostPath          = "/usr/local/nvshare/libnvshare.so"
+	LibNvshareContainerPath     = "/usr/lib/nvshare/libnvshare.so"
+	SocketHostPath              = "/usr/local/nvshare/scheduler.sock"
+	SocketContainerPath         = "/var/run/nvshare/scheduler.sock"
+	NvshareVirtualDevicesEnvVar = "NVSHARE_VIRTUAL_DEVICES"
+	NvidiaDevicesEnvVar         = "NVIDIA_VISIBLE_DEVICES"
+	NvidiaExposeMountDir        = "/var/run/nvidia-container-devices"
+	NvidiaExposeMountHostPath   = "/dev/null"
+)
+
 var (
 	hostHookPath string
 	ConfigFile   *string
@@ -519,15 +530,93 @@ func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *kubeletdev
 				PodAllocationFailed(nodename, current, NodeLockNvidia)
 				return &kubeletdevicepluginv1beta1.AllocateResponse{}, errors.New("device number not matched")
 			}
-			response, err := plugin.getAllocateResponse(plugin.GetContainerDeviceStrArray(devreq))
-			if err != nil {
-				return nil, fmt.Errorf("failed to get allocate response: %v", err)
+
+			response := &kubeletdevicepluginv1beta1.ContainerAllocateResponse{}
+
+			nvShareEnable := current.Annotations[util.GetNVShare()] == "true"
+			if !nvShareEnable {
+				response, err = plugin.getAllocateResponse(plugin.GetContainerDeviceStrArray(devreq))
+				if err != nil {
+					PodAllocationFailed(nodename, current, NodeLockNvidia)
+					return nil, fmt.Errorf("failed to get allocate response: %v", err)
+				}
 			}
 
 			err = EraseNextDeviceTypeFromAnnotation(nvidia.NvidiaGPUDevice, *current)
 			if err != nil {
 				PodAllocationFailed(nodename, current, NodeLockNvidia)
 				return &kubeletdevicepluginv1beta1.AllocateResponse{}, err
+			}
+
+			if nvShareEnable {
+				if !plugin.schedulerConfig.NVShare {
+					PodAllocationFailed(nodename, current, NodeLockNvidia)
+					return nil, fmt.Errorf("nvshare is not enabled in scheduler config for pod %s/%s on node %s",
+						current.Namespace, current.Name, nodename)
+				}
+
+				// 直接 hami 注解 UUID
+				seen := make(map[string]struct{}, len(devreq))
+				uuids := make([]string, 0, len(devreq))
+				for _, dev := range devreq {
+					if _, ok := seen[dev.UUID]; ok {
+						continue
+					}
+					seen[dev.UUID] = struct{}{}
+					uuids = append(uuids, dev.UUID)
+				}
+
+				if len(uuids) != 1 {
+					PodAllocationFailed(nodename, current, NodeLockNvidia)
+					if len(uuids) == 0 {
+						return nil, fmt.Errorf("nvshare single oversub requires exactly 1 GPU, but pod %s/%s on node %s requested none",
+							current.Namespace, current.Name, nodename)
+					}
+					return nil, fmt.Errorf("nvshare single oversub requires exactly 1 GPU, but pod %s/%s on node %s requested %d (%v)",
+						current.Namespace, current.Name, nodename, len(uuids), uuids)
+				}
+
+				var envsMap map[string]string
+				envsMap = make(map[string]string)
+				envsMap[NvidiaDevicesEnvVar] = strings.Join(uuids, ",")
+
+				envsMap["LD_PRELOAD"] = LibNvshareContainerPath
+				if current.Annotations[util.GetNVShareSingleOverSub()] == "true" {
+					if !plugin.schedulerConfig.NVShareEnableSingleOverSub {
+						PodAllocationFailed(nodename, current, NodeLockNvidia)
+						return nil, fmt.Errorf("nvshare single oversub is not enabled in scheduler config for pod %s/%s on node %s",
+							current.Namespace, current.Name, nodename)
+					}
+					envsMap["NVSHARE_ENABLE_SINGLE_OVERSUB"] = "1"
+				}
+
+				response.Envs = envsMap
+
+				var mounts []*kubeletdevicepluginv1beta1.Mount
+				nvShareLibHostPath := LibNvshareHostPath
+				if util.GetNVShareLibVersion() != "" {
+					nvShareLibHostPath = LibNvshareHostPath + "." + util.GetNVShareLibVersion()
+				}
+				mount := &kubeletdevicepluginv1beta1.Mount{
+					HostPath:      nvShareLibHostPath,
+					ContainerPath: LibNvshareContainerPath,
+					ReadOnly:      true,
+				}
+				mounts = append(mounts, mount)
+				/* Mount scheduler socket */
+				mount = &kubeletdevicepluginv1beta1.Mount{
+					HostPath:      SocketHostPath,
+					ContainerPath: SocketContainerPath,
+					ReadOnly:      true,
+				}
+				mounts = append(mounts, mount)
+
+				response.Mounts = mounts
+				responses.ContainerResponses = append(responses.ContainerResponses, response)
+
+				klog.Infoln("Allocate Response", responses.ContainerResponses)
+				PodAllocationTrySuccess(nodename, nvidia.NvidiaGPUDevice, NodeLockNvidia, current)
+				return &responses, nil
 			}
 
 			if plugin.operatingMode != "mig" {

@@ -17,6 +17,8 @@ limitations under the License.
 package nvidia
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,11 +26,16 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/env"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
 	"github.com/Project-HAMi/HAMi/pkg/device/common"
@@ -130,6 +137,11 @@ type NodeDefaultConfig struct {
 	PreConfiguredDeviceMemory *int64   `yaml:"preConfiguredDeviceMemory" json:"preconfigureddevicememory"`
 	// LogLevel is LIBCUDA_LOG_LEVEL value
 	LogLevel *LibCudaLogLevel `yaml:"libCudaLogLevel" json:"libcudaloglevel"`
+
+	NVShare bool `yaml:"nvShare" json:"nvShare,omitempty"`
+	// NVShareEnableSingleOverSub 是否开启 nvshare 单进程显存超分
+	// 对应环境变量 NVSHARE_ENABLE_SINGLE_OVERSUB=1
+	NVShareEnableSingleOverSub bool `yaml:"nvShareEnableSingleOverSub" json:"nvShareEnableSingleOverSub,omitempty"`
 }
 
 type FilterDevice struct {
@@ -161,6 +173,76 @@ type NvidiaGPUDevices struct {
 	config         NvidiaConfig
 	ReportedGPUNum map[string]int64 // key: nodeName, value: reported GPU count
 	mu             sync.Mutex       // protects concurrent access to ReportedGPUNum
+}
+
+var (
+	loadConfigMu      sync.Mutex
+	nodeConfigsByName map[string]*NodeDefaultConfig
+)
+
+func GetNodeConfigsByName() (map[string]*NodeDefaultConfig, error) {
+	loadConfigMu.Lock()
+	defer loadConfigMu.Unlock()
+
+	if nodeConfigsByName != nil {
+		return nodeConfigsByName, nil
+	}
+
+	configs, err := doLoadDevicePluginConfigs()
+	if err != nil {
+		return nil, err // 不置位，下次调用会重试
+	}
+
+	nodeConfigsByName = configs
+	return nodeConfigsByName, nil
+}
+
+// 如果是dra部署没有rbac权限
+func doLoadDevicePluginConfigs() (map[string]*NodeDefaultConfig, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("InClusterConfig failed: %w", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("NewForConfig failed: %w", err)
+	}
+
+	hamiNamespace := env.GetString("HAMI_NAMESPACE", "hami")
+	configMapName := env.GetString("HAMI_DEVICE_PLUGIN", "hami-device-plugin")
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	cm, err := clientset.CoreV1().ConfigMaps(hamiNamespace).Get(
+		ctx, configMapName, metav1.GetOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get configmap %s/%s failed: %w",
+			hamiNamespace, configMapName, err)
+	}
+
+	configMapKey := env.GetString("HAMI_CONFIGMAP_KEY", "config.json")
+	raw, ok := cm.Data[configMapKey]
+	if !ok {
+		return nil, fmt.Errorf("configmap %s/%s missing key %q",
+			hamiNamespace, configMapName, configMapKey)
+	}
+
+	var cfg DevicePluginConfigs
+	if err = json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return nil, fmt.Errorf("unmarshal configmap %s/%s key %q failed: %w",
+			hamiNamespace, configMapName, configMapKey, err)
+	}
+
+	result := make(map[string]*NodeDefaultConfig, len(cfg.Nodeconfig))
+	for i := range cfg.Nodeconfig {
+		nc := cfg.Nodeconfig[i].NodeDefaultConfig
+		result[cfg.Nodeconfig[i].Name] = &nc
+	}
+
+	return result, nil
 }
 
 func InitNvidiaDevice(nvconfig NvidiaConfig) *NvidiaGPUDevices {
@@ -755,9 +837,57 @@ func (nv *NvidiaGPUDevices) Fit(devices []*device.DeviceUsage, request device.Co
 	var tmpDevs map[string]device.ContainerDevices
 	tmpDevs = make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
+	podNVShareEnable := pod.Annotations != nil && pod.Annotations[util.GetNVShare()] == "true"
+	podNVShareEnableSingleOverSub := pod.Annotations != nil && pod.Annotations[util.GetNVShareSingleOverSub()] == "true"
+
+	nodeConfigs, err := GetNodeConfigsByName()
+	if err != nil {
+		klog.ErrorS(err, "failed to get node configs by name")
+		// 不 return，继续用空 map 或默认配置
+		nodeConfigs = map[string]*NodeDefaultConfig{}
+	}
+	var (
+		nodeNVShareEnable, nodeNVShareEnableSingleOverSub bool
+		nodeName                                          string
+	)
+	if nodeInfo != nil && nodeInfo.Node != nil && nodeConfigs != nil {
+		nodeName = nodeInfo.Node.Name
+		nodeConfig := nodeConfigsByName[nodeName]
+		nodeNVShareEnable = nodeConfig != nil && nodeConfig.NVShare
+		nodeNVShareEnableSingleOverSub = nodeConfig != nil && nodeConfig.NVShareEnableSingleOverSub
+	}
+
 	needTopology := util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod) == util.GPUSchedulerPolicyTopology.String()
+
 	for i := len(devices) - 1; i >= 0; i-- {
 		dev := devices[i]
+
+		// 只能卡0
+		if podNVShareEnable {
+			if !nodeNVShareEnable {
+				reason["NVShareNodeDisabled"]++
+				klog.V(5).InfoS("skipping device: node nvshare disabled",
+					"pod", klog.KObj(pod), "node", nodeName,
+					"device", dev.ID, "deviceIndex", i)
+				continue
+			}
+
+			if dev.Index != 0 {
+				continue
+			}
+
+			if podNVShareEnableSingleOverSub != nodeNVShareEnableSingleOverSub {
+				reason["NVShareOverSubMismatch"]++
+				klog.V(5).InfoS("skipping device: nvshare single-oversub mismatch",
+					"pod", klog.KObj(pod),
+					"podOverSub", podNVShareEnableSingleOverSub,
+					"nodeOverSub", nodeNVShareEnableSingleOverSub,
+					"nodeName", nodeName,
+					"device", dev.ID, "deviceIndex", i)
+				continue
+			}
+		}
+
 		klog.V(4).InfoS("scoring pod", "pod", klog.KObj(pod), "device", dev.ID, "Memreq", k.Memreq, "MemPercentagereq", k.MemPercentagereq, "Coresreq", k.Coresreq, "Nums", k.Nums, "device index", i)
 		if !dev.Health {
 			reason[common.CardNotHealth]++
@@ -791,6 +921,14 @@ func (nv *NvidiaGPUDevices) Fit(devices []*device.DeviceUsage, request device.Co
 			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used)
 			continue
 		}
+
+		// nvshare 需要在一张卡上
+		if podNVShareEnable && dev.Count < dev.Used+k.Nums {
+			reason[common.CardTimeSlicingExhausted]++
+			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used)
+			continue
+		}
+
 		if k.Coresreq > 100 {
 			klog.ErrorS(nil, "core limit can't exceed 100", "pod", klog.KObj(pod), "device", dev.ID)
 			k.Coresreq = 100
@@ -838,6 +976,22 @@ func (nv *NvidiaGPUDevices) Fit(devices []*device.DeviceUsage, request device.Co
 
 		if k.Nums > 0 {
 			klog.V(5).InfoS("find fit device", "pod", klog.KObj(pod), "device", dev.ID)
+
+			if podNVShareEnable {
+				for i := int32(0); i < k.Nums; i++ {
+					tmpDevs[k.Type] = append(tmpDevs[k.Type], device.ContainerDevice{
+						Idx:       int(dev.Index),
+						UUID:      dev.ID,
+						Type:      k.Type,
+						Usedmem:   memreq,
+						Usedcores: k.Coresreq,
+					})
+				}
+
+				// 单卡这里不需要拓扑
+				return true, tmpDevs, ""
+			}
+
 			if !needTopology {
 				k.Nums--
 			}

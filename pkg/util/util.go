@@ -26,6 +26,7 @@ import (
 
 	"github.com/Project-HAMi/HAMi/pkg/util/client"
 	"github.com/Project-HAMi/HAMi/pkg/util/nodelock"
+	"k8s.io/utils/env"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -218,4 +219,16 @@ func IsPodInTerminatedState(pod *corev1.Pod) bool {
 
 func AllContainersCreated(pod *corev1.Pod) bool {
 	return len(pod.Status.ContainerStatuses) >= len(pod.Spec.Containers)
+}
+
+func GetNVShare() string {
+	return env.GetString("NVSHARE_ANNOTATION_KEY", "kubegien.org/nvshare")
+}
+
+func GetNVShareSingleOverSub() string {
+	return env.GetString("NVSHARE_OVERSUB_ANNOTATION_KEY", "kubegien.org/nvShareEnableSingleOverSub")
+}
+
+func GetNVShareLibVersion() string {
+	return env.GetString("NVSHARE_LIB_VERSION", "")
 }

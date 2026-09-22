@@ -36,6 +36,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -141,6 +142,16 @@ func (plugin *NvidiaDevicePlugin) getAPIDevices() *[]*device.DeviceInfo {
 		} else {
 			klog.Warningln("mig mode enabled, the memory scaling is not applied")
 		}
+
+		// 只针对卡0
+		if plugin.operatingMode != nvidia.MigMode && plugin.schedulerConfig.NVShare && idx == 0 {
+			if plugin.schedulerConfig.NVShareEnableSingleOverSub {
+				registeredmem = math.MaxInt32
+			} else {
+				registeredmem = int32(memoryTotal / 1024 / 1024)
+			}
+		}
+
 		health := true
 		for _, val := range devs {
 			if strings.Compare(val.ID, UUID) == 0 {
@@ -166,6 +177,14 @@ func (plugin *NvidiaDevicePlugin) getAPIDevices() *[]*device.DeviceInfo {
 		devcore := int32(100)
 		if plugin.operatingMode != nvidia.MigMode {
 			devcore = int32(*plugin.schedulerConfig.DeviceCoreScaling * 100)
+			// 只针对卡0
+			if plugin.schedulerConfig.NVShare && idx == 0 {
+				if plugin.schedulerConfig.NVShareEnableSingleOverSub {
+					devcore = math.MaxInt32
+				} else {
+					devcore = int32(100)
+				}
+			}
 		} else {
 			klog.Warning("mig mode enabled, the core scaling is not applied")
 		}

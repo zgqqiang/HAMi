@@ -144,8 +144,8 @@ func (plugin *NvidiaDevicePlugin) getAPIDevices() *[]*device.DeviceInfo {
 		}
 
 		// 只针对卡0
-		if plugin.operatingMode != nvidia.MigMode && plugin.schedulerConfig.NVShare && idx == 0 {
-			if plugin.schedulerConfig.NVShareEnableSingleOverSub {
+		if plugin.operatingMode != nvidia.MigMode && idx == 0 {
+			if plugin.schedulerConfig.DeviceSplitCount != nil && *plugin.schedulerConfig.DeviceSplitCount > 1 {
 				registeredmem = math.MaxInt32
 			} else {
 				registeredmem = int32(memoryTotal / 1024 / 1024)
@@ -179,7 +179,7 @@ func (plugin *NvidiaDevicePlugin) getAPIDevices() *[]*device.DeviceInfo {
 			devcore = int32(*plugin.schedulerConfig.DeviceCoreScaling * 100)
 			// 只针对卡0
 			if plugin.schedulerConfig.NVShare && idx == 0 {
-				if plugin.schedulerConfig.NVShareEnableSingleOverSub {
+				if plugin.schedulerConfig.DeviceSplitCount != nil && *plugin.schedulerConfig.DeviceSplitCount > 1 {
 					devcore = math.MaxInt32
 				} else {
 					devcore = int32(100)

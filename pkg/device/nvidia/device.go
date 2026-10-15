@@ -139,9 +139,6 @@ type NodeDefaultConfig struct {
 	LogLevel *LibCudaLogLevel `yaml:"libCudaLogLevel" json:"libcudaloglevel"`
 
 	NVShare bool `yaml:"nvShare" json:"nvShare,omitempty"`
-	// NVShareEnableSingleOverSub 是否开启 nvshare 单进程显存超分
-	// 对应环境变量 NVSHARE_ENABLE_SINGLE_OVERSUB=1
-	NVShareEnableSingleOverSub bool `yaml:"nvShareEnableSingleOverSub" json:"nvShareEnableSingleOverSub,omitempty"`
 }
 
 type FilterDevice struct {
@@ -838,7 +835,6 @@ func (nv *NvidiaGPUDevices) Fit(devices []*device.DeviceUsage, request device.Co
 	tmpDevs = make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
 	podNVShareEnable := pod.Annotations != nil && pod.Annotations[util.GetNVShare()] == "true"
-	podNVShareEnableSingleOverSub := pod.Annotations != nil && pod.Annotations[util.GetNVShareSingleOverSub()] == "true"
 
 	nodeConfigs, err := GetNodeConfigsByName()
 	if err != nil {
@@ -847,14 +843,13 @@ func (nv *NvidiaGPUDevices) Fit(devices []*device.DeviceUsage, request device.Co
 		nodeConfigs = map[string]*NodeDefaultConfig{}
 	}
 	var (
-		nodeNVShareEnable, nodeNVShareEnableSingleOverSub bool
-		nodeName                                          string
+		nodeNVShareEnable bool
+		nodeName          string
 	)
 	if nodeInfo != nil && nodeInfo.Node != nil && nodeConfigs != nil {
 		nodeName = nodeInfo.Node.Name
 		nodeConfig := nodeConfigsByName[nodeName]
 		nodeNVShareEnable = nodeConfig != nil && nodeConfig.NVShare
-		nodeNVShareEnableSingleOverSub = nodeConfig != nil && nodeConfig.NVShareEnableSingleOverSub
 	}
 
 	needTopology := util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod) == util.GPUSchedulerPolicyTopology.String()
@@ -873,17 +868,6 @@ func (nv *NvidiaGPUDevices) Fit(devices []*device.DeviceUsage, request device.Co
 			}
 
 			if dev.Index != 0 {
-				continue
-			}
-
-			if podNVShareEnableSingleOverSub != nodeNVShareEnableSingleOverSub {
-				reason["NVShareOverSubMismatch"]++
-				klog.V(5).InfoS("skipping device: nvshare single-oversub mismatch",
-					"pod", klog.KObj(pod),
-					"podOverSub", podNVShareEnableSingleOverSub,
-					"nodeOverSub", nodeNVShareEnableSingleOverSub,
-					"nodeName", nodeName,
-					"device", dev.ID, "deviceIndex", i)
 				continue
 			}
 		}

@@ -582,11 +582,6 @@ func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *kubeletdev
 
 				envsMap["LD_PRELOAD"] = LibNvshareContainerPath
 				if current.Annotations[util.GetNVShareSingleOverSub()] == "true" {
-					if !plugin.schedulerConfig.NVShareEnableSingleOverSub {
-						PodAllocationFailed(nodename, current, NodeLockNvidia)
-						return nil, fmt.Errorf("nvshare single oversub is not enabled in scheduler config for pod %s/%s on node %s",
-							current.Namespace, current.Name, nodename)
-					}
 					envsMap["NVSHARE_ENABLE_SINGLE_OVERSUB"] = "1"
 				}
 

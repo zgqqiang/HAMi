@@ -21,6 +21,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -44,29 +46,34 @@ const (
 	Ascend910NetworkWeight     = 10
 	VNPUModeAnnotation         = "huawei.com/vnpu-mode"
 	VNPUModeHamiCore           = "hami-core"
+	VNPUModeENPU               = "enpu"
+	VNPUModeTemplate           = "template"
 	VNPUNodeSelectorAnnotation = "hami-vnpu-core"
+	VNPUNodeENPUAnnotation     = "hami.io/enpu"
+	effectiveVNPUModeKey       = "hami.io/effective-vnpu-mode"
 )
 
 type Devices struct {
-	config           VNPUConfig
-	nodeRegisterAnno string
-	useUUIDAnno      string
-	noUseUUIDAnno    string
-	handshakeAnno    string
-	hamiVnpuCore     bool
+	config                 VNPUConfig
+	nodeRegisterAnno       string
+	useUUIDAnno            string
+	noUseUUIDAnno          string
+	handshakeAnno          string
+	vnpuMode               string
+	enpuPolicy             string
+	overwriteEnv           bool
+	runtimeClassName       string
+	allAscendResourceNames []corev1.ResourceName
 }
 
 type RuntimeInfo struct {
 	UUID   string `json:"UUID,omitempty"`
 	Temp   string `json:"temp,omitempty"`
 	Memory int64  `json:"memory,omitempty"`
-	Core   int32  `json:"core,omitempty"`
+	Core   int64  `json:"core,omitempty"`
 }
 
-var (
-	enableAscend bool
-	configFile   string
-)
+var enableAscend bool
 
 func (dev *Devices) trimMemory(m int64) (int64, string) {
 	for i := range dev.config.Templates {
@@ -85,15 +92,28 @@ func InitDevices(vnpus VNPUs) []*Devices {
 	if !enableAscend {
 		return devs
 	}
+	mode, err := vnpus.mode()
+	if err != nil {
+		klog.Errorf("Invalid Ascend VNPU configuration: %v", err)
+		return devs
+	}
+	allAscendResourceNames := make([]corev1.ResourceName, 0, len(vnpus.Configs))
+	for _, vnpu := range vnpus.Configs {
+		allAscendResourceNames = append(allAscendResourceNames, corev1.ResourceName(vnpu.ResourceName))
+	}
 	for _, vnpu := range vnpus.Configs {
 		commonWord := vnpu.CommonWord
 		dev := &Devices{
-			config:           vnpu,
-			nodeRegisterAnno: fmt.Sprintf("hami.io/node-register-%s", commonWord),
-			useUUIDAnno:      fmt.Sprintf("hami.io/use-%s-uuid", commonWord),
-			noUseUUIDAnno:    fmt.Sprintf("hami.io/no-use-%s-uuid", commonWord),
-			handshakeAnno:    fmt.Sprintf("hami.io/node-handshake-%s", commonWord),
-			hamiVnpuCore:     vnpus.HamiVnpuCore,
+			config:                 vnpu,
+			nodeRegisterAnno:       fmt.Sprintf("hami.io/node-register-%s", commonWord),
+			useUUIDAnno:            fmt.Sprintf("hami.io/use-%s-uuid", commonWord),
+			noUseUUIDAnno:          fmt.Sprintf("hami.io/no-use-%s-uuid", commonWord),
+			handshakeAnno:          fmt.Sprintf("hami.io/node-handshake-%s", commonWord),
+			vnpuMode:               mode,
+			enpuPolicy:             vnpus.EnpuPolicy,
+			overwriteEnv:           vnpus.OverwriteEnv,
+			runtimeClassName:       vnpus.RuntimeClassName,
+			allAscendResourceNames: allAscendResourceNames,
 		}
 		sort.Slice(dev.config.Templates, func(i, j int) bool {
 			return dev.config.Templates[i].Memory < dev.config.Templates[j].Memory
@@ -118,10 +138,56 @@ func (dev *Devices) CommonWord() string {
 	return dev.config.CommonWord
 }
 
+func (dev *Devices) containerRequestsAnyAscendResource(ctr *corev1.Container) bool {
+	for _, name := range dev.allAscendResourceNames {
+		if _, ok := ctr.Resources.Limits[name]; ok {
+			return true
+		}
+		if _, ok := ctr.Resources.Requests[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func lastEnvValueEquals(env []corev1.EnvVar, name, value string) bool {
+	// kubelet will dedupes same-name env and the last one wins, so iterate backward
+	for _, e := range slices.Backward(env) {
+		if e.Name != name {
+			continue
+		}
+		// TODO: currently ignore the ValueFrom reference, because it's complicated to get the runtime value.
+		return e.ValueFrom == nil && e.Value == value
+	}
+	return false
+}
+
 func (dev *Devices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) (bool, error) {
+	vnpuMode := p.Annotations[VNPUModeAnnotation]
+	isENPU := isENPUMode(vnpuMode)
 	count, ok := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceName)]
+	if !ok && isENPU {
+		count, ok = ctr.Resources.Requests[corev1.ResourceName(dev.config.ResourceName)]
+	}
 	if !ok {
-		if dev.config.OverwriteEnv {
+		if dev.containerRequestsAnyAscendResource(ctr) {
+			return false, nil
+		}
+		// The container-level JSON is decoded once and cached.
+		podMode, _ := util.ParsePodOverwriteEnv(p.Annotations[util.OverwriteEnvAnnotationKey])
+		if ctrMode, listed := cachedContainerOverwriteEnv(p.Annotations[util.OverwriteEnvContainersAnnotationKey], ctr.Name); listed {
+			podMode = ctrMode
+		}
+		inject := false
+		switch podMode {
+		case util.OverwriteEnvOn:
+			inject = true
+		case util.OverwriteEnvOff:
+			inject = false
+		default:
+			inject = dev.overwriteEnv
+		}
+		if inject && !lastEnvValueEquals(ctr.Env, "ASCEND_VISIBLE_DEVICES", "") {
 			ctr.Env = append(ctr.Env, corev1.EnvVar{
 				Name:  "ASCEND_VISIBLE_DEVICES",
 				Value: "",
@@ -131,7 +197,7 @@ func (dev *Devices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) (bool,
 	}
 
 	reqNum := count.Value()
-	if dev.config.CommonWord == Ascend910CType {
+	if dev.config.CommonWord == Ascend910CType && dev.config.SuperPod && !isENPU {
 		if reqNum == 1 {
 			// Since the minimum allocation unit is one physical module (2 NPUs), round up the limits and requests to 2.
 			klog.InfoS("Adjusted Ascend910C device request from 1 to 2 (minimum allocation unit)", "pod", klog.KObj(p))
@@ -148,35 +214,50 @@ func (dev *Devices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) (bool,
 		}
 	}
 
-	// Check if hami-core is declared
-	vnpuMode := p.Annotations[VNPUModeAnnotation]
 	isHAMiCore := (vnpuMode == VNPUModeHamiCore)
-
-	if isHAMiCore {
-		klog.V(3).Infof("Ascend core resource detected, injecting postStart lifecycle for container %s", ctr.Name)
-
-		if ctr.Lifecycle == nil {
-			ctr.Lifecycle = &corev1.Lifecycle{}
+	isSoftSlice := isHAMiCore || isENPU
+	if !isSoftSlice && dev.config.ResourceCoreName != "" {
+		coreQ, ok := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceCoreName)]
+		if !ok {
+			coreQ, ok = ctr.Resources.Requests[corev1.ResourceName(dev.config.ResourceCoreName)]
 		}
-
-		// Inject PostStart hook to start the limiter process
-		if ctr.Lifecycle.PostStart == nil {
-			ctr.Lifecycle.PostStart = &corev1.LifecycleHandler{
-				Exec: &corev1.ExecAction{
-					Command: []string{
-						"bash",
-						"-c",
-						"export RUST_LOG=info\n/hami-vnpu-core/limiter > /tmp/limiter_manager.log 2>&1 &",
-					},
-				},
+		if ok && coreQ.Value() > 0 {
+			if vnpuMode == VNPUModeTemplate {
+				return false, fmt.Errorf("%s is only supported in hami-core (soft split) mode", dev.config.ResourceCoreName)
 			}
+			if p.Annotations == nil {
+				p.Annotations = map[string]string{}
+			}
+			p.Annotations[VNPUModeAnnotation] = VNPUModeHamiCore
+			isHAMiCore = true
+			isSoftSlice = true
+			klog.InfoS("Inferred hami-core vnpu mode from core request", "pod", klog.KObj(p), "core", coreQ.Value())
 		}
+	}
+	if isENPU && reqNum != 1 {
+		return false, fmt.Errorf("ENPU mode supports exactly one Ascend device per container, got %d", reqNum)
+	}
+	if isENPU {
+		if err := dev.validateENPUPolicy(p); err != nil {
+			return false, err
+		}
+		p.Annotations["huawei.com/enpu-policy"] = dev.enpuPolicyForPod(p)
+		if ctr.Resources.Limits == nil {
+			ctr.Resources.Limits = corev1.ResourceList{}
+		}
+		ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceName)] = count
 	}
 
 	trimMem := dev.config.MemoryAllocatable
 	memory, ok := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceMemoryName)]
+	if !ok && isENPU {
+		memory, ok = ctr.Resources.Requests[corev1.ResourceName(dev.config.ResourceMemoryName)]
+	}
 	if ok {
-		if isHAMiCore {
+		// An unspecified mode is resolved per candidate node in Fit. Preserve the
+		// exact request here because admission does not know whether the selected
+		// node uses templates or a soft-slice backend.
+		if isSoftSlice || vnpuMode == "" {
 			trimMem = memory.Value()
 		} else {
 			trimMem, _ = dev.trimMemory(memory.Value())
@@ -185,17 +266,27 @@ func (dev *Devices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) (bool,
 			}
 		}
 	}
-	if count.Value() > 1 && !isHAMiCore {
+	// count, not reqNum: the 910C SuperPod rewrite to 2 is HAMi's module
+	// packaging rule, not a multi device request, and #2005 added 910C vNPU
+	// templates so a single device fractional request stays schedulable.
+	if count.Value() > 1 && vnpuMode == VNPUModeTemplate {
 		if trimMem != dev.config.MemoryAllocatable {
-			return true, errors.New("vNPU nor supported for multiple devices")
+			return true, errors.New("vNPU not supported for multiple devices")
 		}
 	}
-	ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceMemoryName)] = resource.MustParse(fmt.Sprint(trimMem))
-	ctr.Resources.Requests[corev1.ResourceName(dev.config.ResourceMemoryName)] = resource.MustParse(fmt.Sprint(trimMem))
+	if dev.config.ResourceMemoryName != "" {
+		// Requests may be nil when the pod declares only limits; writing to a
+		// nil map panics.
+		if ctr.Resources.Requests == nil {
+			ctr.Resources.Requests = corev1.ResourceList{}
+		}
+		ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceMemoryName)] = resource.MustParse(fmt.Sprint(trimMem))
+		ctr.Resources.Requests[corev1.ResourceName(dev.config.ResourceMemoryName)] = resource.MustParse(fmt.Sprint(trimMem))
+	}
 
 	// Set runtime class name if it is not set by user and the runtime class name is configured
-	if p.Spec.RuntimeClassName == nil && dev.config.RuntimeClassName != "" {
-		p.Spec.RuntimeClassName = &dev.config.RuntimeClassName
+	if p.Spec.RuntimeClassName == nil && dev.runtimeClassName != "" {
+		p.Spec.RuntimeClassName = &dev.runtimeClassName
 	}
 	return true, nil
 }
@@ -210,8 +301,21 @@ func (dev *Devices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo, error) 
 		klog.ErrorS(err, "failed to unmarshal node devices", "node", n.Name, "device annotation", anno)
 		return []*device.DeviceInfo{}, err
 	}
+	normalizeSoftSlice := dev.nodeSupportsHamiCore(&n) || dev.nodeSupportsENPU(&n)
 	for idx := range nodeDevices {
 		nodeDevices[idx].DeviceVendor = dev.config.CommonWord
+		if !normalizeSoftSlice {
+			continue
+		}
+		advertised := nodeDevices[idx].Devcore
+		budget := hamiCorePercentBudget(advertised)
+		if budget == advertised {
+			continue
+		}
+		klog.V(5).InfoS("soft-slice Devcore normalized to percentage budget",
+			"node", n.Name, "device", nodeDevices[idx].ID,
+			"advertised", advertised, "budget", budget)
+		nodeDevices[idx].Devcore = budget
 	}
 	if len(nodeDevices) == 0 {
 		klog.InfoS("no gpu device found", "node", n.Name, "device annotation", anno)
@@ -229,7 +333,10 @@ func (dev *Devices) PatchAnnotations(pod *corev1.Pod, annoInput *map[string]stri
 		(*annoInput)["predicate-time"] = strconv.FormatInt(time.Now().Unix(), 10)
 
 		// Check if hami-core is declared
-		vnpuMode := pod.Annotations[VNPUModeAnnotation]
+		vnpuMode := ""
+		if pod.Annotations != nil {
+			vnpuMode = pod.Annotations[VNPUModeAnnotation]
+		}
 		klog.V(4).Infof("Patching pod %s with vnpu mode: %s", pod.Name, vnpuMode)
 
 		allocateStr := fmt.Sprintf("huawei.com/%s", dev.CommonWord())
@@ -238,13 +345,22 @@ func (dev *Devices) PatchAnnotations(pod *corev1.Pod, annoInput *map[string]stri
 			for _, val := range dp {
 				info := RuntimeInfo{UUID: val.UUID}
 
-				// If is hami core, populate Memory and Core directly without using Temp
-				if vnpuMode == VNPUModeHamiCore {
-					info.Memory = int64(val.Usedmem)
+				effectiveMode := vnpuMode
+				if val.CustomInfo != nil {
+					if mode, ok := val.CustomInfo[effectiveVNPUModeKey].(string); ok {
+						effectiveMode = mode
+					}
+				}
+
+				// Soft-slice allocations use their exact memory without a template.
+				if effectiveMode == VNPUModeHamiCore || isENPUMode(effectiveMode) {
+					info.Memory = val.Usedmem
 					info.Core = val.Usedcores
 				} else {
-					_, temp := dev.trimMemory(int64(val.Usedmem))
+					_, temp := dev.trimMemory(val.Usedmem)
 					info.Temp = temp
+					info.Memory = val.Usedmem
+					info.Core = val.Usedcores
 				}
 
 				rtInfo = append(rtInfo, info)
@@ -260,14 +376,7 @@ func (dev *Devices) PatchAnnotations(pod *corev1.Pod, annoInput *map[string]stri
 }
 
 func (dev *Devices) LockNode(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 
@@ -275,14 +384,7 @@ func (dev *Devices) LockNode(n *corev1.Node, p *corev1.Pod) error {
 }
 
 func (dev *Devices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 
@@ -301,10 +403,10 @@ func (dev *Devices) checkType(annos map[string]string, d device.DeviceUsage, n d
 }
 
 func (dev *Devices) CheckHealth(devType string, n *corev1.Node) (bool, bool) {
-	return device.CheckHealth(devType, dev.GetResourceNames().ResourceCountName, n)
+	return device.CheckHealth(devType, dev.GetResourceNames().ResourceCountName, n, n.Annotations[dev.nodeRegisterAnno])
 }
 
-func (dev *Devices) GenerateResourceRequests(ctr *corev1.Container) device.ContainerDeviceRequest {
+func (dev *Devices) GenerateResourceRequests(ctr *corev1.Container) (device.ContainerDeviceRequest, error) {
 	ascendResourceCount := corev1.ResourceName(dev.config.ResourceName)
 	ascendResourceMem := corev1.ResourceName(dev.config.ResourceMemoryName)
 	ascendResourceCore := corev1.ResourceName(dev.config.ResourceCoreName)
@@ -317,45 +419,62 @@ func (dev *Devices) GenerateResourceRequests(ctr *corev1.Container) device.Conta
 		klog.V(3).Infof("Counting %s devices", dev.config.CommonWord)
 		if n, ok := v.AsInt64(); ok {
 			klog.Info("Found AscendDevices devices")
+			if n == 0 {
+				// An explicit zero count means no device is requested,
+				// not an invalid request. See the nvidia backend.
+				return device.ContainerDeviceRequest{}, nil
+			}
+			if n < 0 {
+				klog.ErrorS(nil, "ascend device count request is out of range", "container", ctr.Name, "request", n)
+				return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: dev.config.CommonWord, Reason: fmt.Sprintf("device count %d is out of range", n)}
+			}
 			memnum := 0
 			mem, ok := ctr.Resources.Limits[ascendResourceMem]
 			if !ok {
 				mem, ok = ctr.Resources.Requests[ascendResourceMem]
 			}
 			if ok {
+				// Negative quantities such as -1m return ok=false from AsInt64, so reject by sign first.
+				if mem.Sign() < 0 {
+					klog.ErrorS(nil, "ascend device memory request is negative", "container", ctr.Name, "request", mem.String(), "device", dev.config.CommonWord)
+					return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: dev.config.CommonWord, Reason: fmt.Sprintf("memory request %s is negative", mem.String())}
+				}
 				memnums, ok := mem.AsInt64()
 				if ok {
+					// Ascend memory is in MB, so a value as large as a byte quantity such as 16Gi is a wrong-unit mistake.
+					if memnums > math.MaxInt32 {
+						klog.ErrorS(nil, "ascend device memory request is out of range; memory unit is treated as MB not Byte, so a quantity such as 16Gi is invalid, request 16384 for 16GB instead",
+							"container", ctr.Name, "request", mem.String(), "device", dev.config.CommonWord)
+						return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: dev.config.CommonWord, Reason: fmt.Sprintf("memory request %s is out of range; memory unit is treated as MB not Byte", mem.String())}
+					}
 					if dev.config.MemoryFactor > 1 {
 						rawMemnums := memnums
-						memnums = memnums * int64(dev.config.MemoryFactor)
+						if memnums > math.MaxInt64/dev.config.MemoryFactor {
+							klog.ErrorS(nil, "ascend device memory request overflows int64 after applying memory factor; memory unit is treated as MB not Byte",
+								"container", ctr.Name, "raw", rawMemnums, "factor", dev.config.MemoryFactor)
+							return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: dev.config.CommonWord, Reason: fmt.Sprintf("memory request %d overflows int64 after applying memory factor %d", rawMemnums, dev.config.MemoryFactor)}
+						}
+						memnums *= dev.config.MemoryFactor
 						klog.V(4).Infof("Update Ascend memory request. before %d, after %d, factor %d", rawMemnums, memnums, dev.config.MemoryFactor)
 					}
-					// If "core" is requested, it explicitly indicates the use of soft-partitioning.
-					isCoreRequested := false
-					if ascendResourceCore != "" {
-						_, isCoreRequested = ctr.Resources.Limits[ascendResourceCore]
-						if !isCoreRequested {
-							_, isCoreRequested = ctr.Resources.Requests[ascendResourceCore]
-						}
-					}
-
-					if isCoreRequested {
-						// Soft-partitioning: Use the raw value directly.
-						memnum = int(memnums)
-					} else {
-						m, _ := dev.trimMemory(memnums)
-						memnum = int(m)
-					}
+					memnum = int(memnums)
 				}
 			}
 
 			// Process Core Resources
-			corenum := int32(0)
+			corenum := int64(0)
 			if ascendResourceCore != "" {
-				if cv, ok := ctr.Resources.Limits[ascendResourceCore]; ok {
-					corenum = int32(cv.Value())
-				} else if cv, ok := ctr.Resources.Requests[ascendResourceCore]; ok {
-					corenum = int32(cv.Value())
+				cv, ok := ctr.Resources.Limits[ascendResourceCore]
+				if !ok {
+					cv, ok = ctr.Resources.Requests[ascendResourceCore]
+				}
+				if ok {
+					corenums, valid := cv.AsInt64()
+					if !valid || corenums < 0 || corenums > 100 {
+						klog.ErrorS(nil, "ascend device core request is out of range", "container", ctr.Name, "request", cv.String())
+						return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: dev.config.CommonWord, Reason: fmt.Sprintf("core request %s is out of range (must be an integer between 0 and 100)", cv.String())}
+					}
+					corenum = corenums
 				}
 			}
 
@@ -365,15 +484,21 @@ func (dev *Devices) GenerateResourceRequests(ctr *corev1.Container) device.Conta
 			}
 
 			return device.ContainerDeviceRequest{
-				Nums:             int32(n),
+				Nums:             n,
 				Type:             dev.CommonWord(),
-				Memreq:           int32(memnum),
-				MemPercentagereq: int32(mempnum),
+				Memreq:           int64(memnum),
+				MemPercentagereq: int64(mempnum),
 				Coresreq:         corenum,
-			}
+			}, nil
 		}
+		// A quantity the apiserver accepts as an integer can still be too
+		// large for int64 (1Ei, 1e19). Falling through would report the
+		// container as device-less, which is the fail-open this change
+		// exists to remove.
+		klog.ErrorS(nil, "ascend device count request is not a plain integer", "container", ctr.Name, "request", v.String())
+		return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "ascend", Reason: fmt.Sprintf("device count %s is not a plain integer", v.String())}
 	}
-	return device.ContainerDeviceRequest{}
+	return device.ContainerDeviceRequest{}, nil
 }
 
 func (dev *Devices) ScoreNode(node *corev1.Node, podDevices device.PodSingleDevice, previous []*device.DeviceUsage, policy string) float32 {
@@ -426,7 +551,294 @@ func (dev *Devices) GetResourceNames() device.ResourceNames {
 		ResourceCountName:  dev.config.ResourceName,
 		ResourceMemoryName: dev.config.ResourceMemoryName,
 		ResourceCoreName:   dev.config.ResourceCoreName,
+		MemoryFactor:       dev.config.MemoryFactor,
 	}
+}
+
+// hamiCorePercentBase is the fixed 0-100 percentage scale hami-core Coresreq
+// is expressed in.
+const hamiCorePercentBase = 100
+
+func (dev *Devices) nodeSupportsHamiCore(n *corev1.Node) bool {
+	supported := dev.vnpuMode == VNPUModeHamiCore
+	if n != nil && n.Annotations != nil {
+		if val, ok := n.Annotations[VNPUNodeSelectorAnnotation]; ok {
+			supported = val == "true"
+		}
+	}
+	return supported
+}
+
+func (dev *Devices) nodeSupportsENPU(n *corev1.Node) bool {
+	supported := dev.vnpuMode == VNPUModeENPU
+	if n != nil && n.Annotations != nil {
+		if val, ok := n.Annotations[VNPUNodeENPUAnnotation]; ok {
+			supported = val == "true"
+		}
+	}
+	return supported
+}
+
+func isENPUMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case VNPUModeENPU, "ubs-virt", "vcann-rt":
+		return true
+	default:
+		return false
+	}
+}
+
+func enpuSchedulingPolicy(pod *corev1.Pod) string {
+	if pod == nil {
+		return "elastic"
+	}
+	return normalizeENPUPolicy(enpuPolicyOverride(pod))
+}
+
+func enpuPolicyOverride(pod *corev1.Pod) string {
+	if pod == nil {
+		return ""
+	}
+	value := ""
+	if pod.Annotations != nil {
+		value = pod.Annotations["huawei.com/enpu-policy"]
+		if value == "" {
+			value = pod.Annotations["huawei.com/scheduler.softShareDev.policy"]
+		}
+	}
+	if value == "" && pod.Labels != nil {
+		value = pod.Labels["huawei.com/scheduler.softShareDev.policy"]
+	}
+	return strings.TrimSpace(value)
+}
+
+func validENPUPolicy(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "fixed", "fixed-share", "fixed_share", "2", "elastic", "3", "best-effort", "best_effort", "besteffort":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeENPUPolicy(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "fixed", "fixed-share", "fixed_share":
+		return "fixed-share"
+	case "3", "best-effort", "best_effort", "besteffort":
+		return "best-effort"
+	default:
+		return "elastic"
+	}
+}
+
+func (dev *Devices) enpuPolicyForPod(pod *corev1.Pod) string {
+	if enpuPolicyOverride(pod) != "" {
+		return enpuSchedulingPolicy(pod)
+	}
+	return normalizeENPUPolicy(dev.enpuPolicy)
+}
+
+func (dev *Devices) validateENPUPolicy(pod *corev1.Pod) error {
+	policy := enpuPolicyOverride(pod)
+	if policy == "" {
+		policy = strings.TrimSpace(dev.enpuPolicy)
+	}
+	if policy != "" && !validENPUPolicy(policy) {
+		return fmt.Errorf("invalid ENPU scheduling policy %q", policy)
+	}
+	return nil
+}
+
+func (dev *Devices) enpuPolicyCompatible(usage *device.DeviceUsage, pod *corev1.Pod, nodeENPU bool) bool {
+	policy := dev.enpuPolicyForPod(pod)
+	for _, info := range usage.PodInfos {
+		if info == nil || info.Pod == nil {
+			continue
+		}
+		mode := ""
+		if info.Annotations != nil {
+			mode = info.Annotations[VNPUModeAnnotation]
+		}
+		if !isENPUMode(mode) && (!nodeENPU || mode != "") {
+			continue
+		}
+		if existingPolicy := enpuPolicyOverride(info.Pod); !validENPUPolicy(existingPolicy) || normalizeENPUPolicy(existingPolicy) != policy {
+			return false
+		}
+	}
+	return true
+}
+
+// softSliceModeCompatible keeps hami-core and ENPU on separate physical DIEs.
+func softSliceModeCompatible(usage *device.DeviceUsage, enpu, nodeHamiCore bool) bool {
+	for _, info := range usage.PodInfos {
+		if info == nil || info.Pod == nil {
+			continue
+		}
+		mode := info.Annotations[VNPUModeAnnotation]
+		if enpu && (mode == VNPUModeHamiCore || (mode == "" && nodeHamiCore)) {
+			return false
+		}
+		if !enpu && isENPUMode(mode) {
+			return false
+		}
+	}
+	return true
+}
+
+// hamiCorePercentBudget is the percentage capacity stored on hami-core nodes.
+//
+// Coresreq is a percentage, not physical AI cores, so a plugin that has not
+// enabled hami-core registers Devcore as the hardware AICore count
+// (8/20/24/30). GetNodeDevices rewrites any advertised value at or below the
+// base to 100 so Fit and the rest of the scheduler see one inventory unit.
+//
+// The coupled plugin change (Project-HAMi/ascend-device-plugin#132) advertises
+// Devcore = round(100 * deviceCoreScaling) for hami-core and never reports less
+// than the base, so any higher value is an intentional oversell budget.
+func hamiCorePercentBudget(advertisedTotalcore int64) int64 {
+	if advertisedTotalcore > hamiCorePercentBase {
+		return advertisedTotalcore
+	}
+	return hamiCorePercentBase
+}
+
+// hamiCoreExclusiveOccupant reports whether a single Pod already holds the
+// whole percentage base on dev.
+//
+// dev.Used cannot answer that. CollapseInitContainerUsage takes the peak core
+// usage and the peak slot count independently, so a Pod whose init container
+// reserves the whole card and whose app containers then run alongside is
+// recorded as Usedcores at the base with two slots. Reading dev.Used == 1 would
+// miss the reservation and let an oversold budget admit a second tenant onto a
+// card that is still exclusively held.
+//
+// Per-Pod entries are collapsed, so a Pod spreading the base across several of
+// its own containers counts as an occupant too. Such a card is full at the base
+// budget without oversell anyway, so this only declines to oversell it. Two
+// Pods holding half the card each stay below the base individually and keep
+// sharing an oversold card.
+func hamiCoreExclusiveOccupant(dev *device.DeviceUsage) bool {
+	for _, podInfo := range dev.PodInfos {
+		if podInfo == nil {
+			continue
+		}
+		for _, podSingle := range podInfo.Devices {
+			for _, ctrDevs := range podSingle {
+				for _, ctrDev := range ctrDevs {
+					if ctrDev.UUID == dev.ID && ctrDev.Usedcores >= hamiCorePercentBase {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// incomingHamiCoreOnDevice is the cores this pod concurrently holds on dev
+// while the container being fitted is placed.
+//
+// allocated holds one row per pod container, aligned with container order and
+// including empty rows for containers that request nothing, so the row index
+// identifies the container and therefore its lifecycle stage.
+//
+// Only concurrent usage may be counted, because Kubernetes runs ordinary init
+// containers one at a time: an ordinary init container that has been placed has
+// already exited when the next container is fitted, so its rows must not count.
+// A sidecar init container (restartPolicy Always) keeps running for the whole
+// pod lifetime and stays resident, as do regular containers.
+//
+// This value feeds the `self` argument of hamiCoreIncomingExclusive, which adds
+// the request under judgement itself, so the container being fitted must NOT be
+// included here or its request would be counted twice.
+func incomingHamiCoreOnDevice(devID string, allocated *device.PodDevices, tmpDevs map[string]device.ContainerDevices, pod *corev1.Pod) int64 {
+	var sum int64
+	add := func(devs device.ContainerDevices) {
+		for _, d := range devs {
+			if d.UUID == devID {
+				sum += d.Usedcores
+			}
+		}
+	}
+
+	numInit := 0
+	if pod != nil {
+		numInit = len(pod.Spec.InitContainers)
+	}
+
+	if allocated != nil {
+		for _, podSingle := range *allocated {
+			for cidx, ctrDevs := range podSingle {
+				if !containerStillRunning(pod, cidx, numInit) {
+					continue
+				}
+				add(ctrDevs)
+			}
+		}
+	}
+
+	// Rows Fit already chose earlier in this same call, for the container being
+	// placed. They are that container's own occupancy, not the request under
+	// judgement, so they belong in `self`.
+	for _, ctrDevs := range tmpDevs {
+		add(ctrDevs)
+	}
+	return sum
+}
+
+// containerStillRunning reports whether the container at row index cidx still
+// occupies its devices while another container of the same pod is being fitted.
+//
+// Ordinary init containers run sequentially, so such a container has exited by
+// the time the next container is fitted. A sidecar init container keeps running
+// for the whole pod lifetime. Regular containers run together.
+func containerStillRunning(pod *corev1.Pod, cidx, numInit int) bool {
+	if cidx < 0 {
+		return false
+	}
+	if cidx < numInit {
+		// Only sidecars survive past the init phase.
+		return pod != nil && cidx < len(pod.Spec.InitContainers) &&
+			util.IsSidecarContainer(&pod.Spec.InitContainers[cidx])
+	}
+	return true
+}
+
+// hamiCoreOthersOnDevice sums cores already held on dev by pods other than
+// pod. In-flight usage from this scheduling pass (sidecar / prior containers
+// recorded by AddResourceUsage but not yet in PodInfos) is treated as self.
+func hamiCoreOthersOnDevice(dev *device.DeviceUsage, pod *corev1.Pod) int64 {
+	var others int64
+	for _, podInfo := range dev.PodInfos {
+		if podInfo == nil || podInfo.Pod == nil {
+			continue
+		}
+		if pod != nil && podInfo.UID != "" && pod.UID != "" && podInfo.UID == pod.UID {
+			continue
+		}
+		for _, podSingle := range podInfo.Devices {
+			for _, ctrDevs := range podSingle {
+				for _, ctrDev := range ctrDevs {
+					if ctrDev.UUID == dev.ID {
+						others += ctrDev.Usedcores
+					}
+				}
+			}
+		}
+	}
+	return others
+}
+
+// hamiCoreIncomingExclusive reports whether this request would take the
+// incoming pod to the percentage base on a card that already has another
+// tenant.
+func hamiCoreIncomingExclusive(dev *device.DeviceUsage, pod *corev1.Pod, self, coresreq int64) bool {
+	if self+coresreq < hamiCorePercentBase {
+		return false
+	}
+	return hamiCoreOthersOnDevice(dev, pod) > 0
 }
 
 func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerDeviceRequest, pod *corev1.Pod, nodeInfo *device.NodeInfo, allocated *device.PodDevices) (bool, map[string]device.ContainerDevices, string) {
@@ -437,6 +849,11 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 	var tmpDevs map[string]device.ContainerDevices
 	tmpDevs = make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
+	if k.Coresreq > 100 || k.Coresreq < 0 {
+		klog.ErrorS(nil, "core limit out of range (must be 0-100)", "pod", klog.KObj(pod), "coresreq", k.Coresreq)
+		return false, tmpDevs, "core limit out of range"
+	}
+	isMutex := util.PolicyContains(util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod), util.GPUSchedulerPolicyMutex)
 
 	vnpuMode := ""
 	if pod != nil && pod.Annotations != nil {
@@ -444,31 +861,69 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 	}
 
 	isHAMiCore := (vnpuMode == VNPUModeHamiCore)
+	isENPU := isENPUMode(vnpuMode)
+	isTemplate := (vnpuMode == VNPUModeTemplate)
 
 	// Verify whether the Node supports hami vnpu core.
-	// Global hamiVnpuCore config acts as the default; node-level annotation takes higher priority.
-	nodeSupportHamiCore := npu.hamiVnpuCore
+	// The global VNPU mode acts as the default; node capability annotations take higher priority.
+	var node *corev1.Node
+	if nodeInfo != nil {
+		node = nodeInfo.Node
+	}
+	nodeSupportHamiCore := npu.nodeSupportsHamiCore(node)
+	nodeSupportENPU := npu.nodeSupportsENPU(node)
+	effectiveHamiCore := isHAMiCore || (vnpuMode == "" && nodeSupportHamiCore)
 
-	if nodeInfo != nil && nodeInfo.Node != nil && nodeInfo.Node.Annotations != nil {
-		if val, ok := nodeInfo.Node.Annotations[VNPUNodeSelectorAnnotation]; ok {
-			nodeSupportHamiCore = val == "true"
+	if isHAMiCore && !nodeSupportHamiCore {
+		reason[common.ModeNotFit]++
+		klog.V(4).InfoS("Node filtered: pod requests hami-core but node does not support it", "pod", klog.KObj(pod))
+		return false, nil, common.GenReason(reason, len(devices))
+	}
+	if isENPU && !nodeSupportENPU {
+		reason[common.ModeNotFit]++
+		klog.V(4).InfoS("Node filtered: pod requests enpu but node does not support it", "pod", klog.KObj(pod))
+		return false, nil, common.GenReason(reason, len(devices))
+	}
+	if !isENPU && nodeSupportENPU && !nodeSupportHamiCore {
+		reason[common.ModeNotFit]++
+		klog.V(4).InfoS("Node filtered: ENPU node requires explicit huawei.com/vnpu-mode: enpu", "pod", klog.KObj(pod))
+		return false, nil, common.GenReason(reason, len(devices))
+	}
+	if isTemplate && (nodeSupportHamiCore || nodeSupportENPU) {
+		reason[common.ModeNotFit]++
+		klog.V(4).InfoS("Node filtered: pod requests template mode but node uses a soft-slice backend", "pod", klog.KObj(pod))
+		return false, nil, common.GenReason(reason, len(devices))
+	}
+	if isENPU {
+		if err := npu.validateENPUPolicy(pod); err != nil {
+			reason[common.ModeNotFit]++
+			klog.V(4).InfoS("Node filtered: invalid ENPU scheduling policy", "pod", klog.KObj(pod), "error", err)
+			return false, nil, common.GenReason(reason, len(devices))
 		}
 	}
-
-	var totalMemPerCard int32 = 0
-	if len(devices) > 0 {
-		totalMemPerCard = devices[0].Totalmem
+	if isENPU && k.Coresreq == 0 {
+		k.Coresreq = hamiCorePercentBase
 	}
-
-	if request.Memreq > 0 && request.Memreq < totalMemPerCard && request.Nums > 0 {
-		if !nodeSupportHamiCore && isHAMiCore {
-			reason[common.ModeNotFit]++
-			klog.V(4).InfoS("Node filtered: Node does not support hami-core mode", "node", nodeInfo.Node.Name, "pod", pod.Name)
+	// Mode-agnostic Pods preserve their requested memory through admission.
+	// Resolve template memory only after the candidate node's mode is known.
+	// k is a per-Fit copy, so evaluating one candidate cannot affect another.
+	if vnpuMode == "" && !nodeSupportHamiCore && npu.config.MemoryAllocatable > 0 && k.Memreq > 0 {
+		trimmedMem, _ := npu.trimMemory(k.Memreq)
+		if trimmedMem <= 0 {
+			reason[common.CardInsufficientMemory] += len(devices)
 			return false, nil, common.GenReason(reason, len(devices))
-		} else if nodeSupportHamiCore && !isHAMiCore {
-			reason[common.ModeNotFit]++
-			klog.V(4).InfoS("Node filtered: Reserved for hami-core but pod is legacy vNPU", "node", nodeInfo.Node.Name, "pod", pod.Name)
-			return false, nil, common.GenReason(reason, len(devices))
+		}
+		k.Memreq = trimmedMem
+	}
+	if vnpuMode == "" && !nodeSupportHamiCore && k.Nums > 1 && k.Memreq > 0 && k.Memreq != npu.config.MemoryAllocatable {
+		return false, nil, "vNPU not supported for multiple devices"
+	}
+	effectiveMode := vnpuMode
+	if effectiveMode == "" {
+		if nodeSupportHamiCore {
+			effectiveMode = VNPUModeHamiCore
+		} else {
+			effectiveMode = VNPUModeTemplate
 		}
 	}
 	klog.V(4).InfoS("Fit: vnpu-mode annotation", "pod", pod.Name, "vnpuMode", vnpuMode)
@@ -478,10 +933,29 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 		klog.V(4).Infof("all devices have NetworkID. device CommonWord %s", npu.CommonWord())
 		needTopology = true
 	}
+	// Full module pair allocation only applies to SuperPod deployments, the
+	// same gate MutateAdmission uses. Split mode carves vNPUs out of single
+	// devices and must not be forced onto whole physical cards.
+	pair910C := k.Type == Ascend910CType && originReq > 1 && npu.config.SuperPod
 	for i, v := range slices.Backward(devices) {
 		dev := v
 		klog.V(4).InfoS("scoring pod", "pod", klog.KObj(pod), "device", dev.ID, "Memreq", k.Memreq, "MemPercentagereq", k.MemPercentagereq, "Coresreq", k.Coresreq, "Nums", k.Nums, "device index", i)
 
+		if !dev.Health {
+			reason[common.CardNotHealth]++
+			klog.V(5).InfoS(common.CardNotHealth, "pod", klog.KObj(pod), "device", dev.ID, "health", dev.Health)
+			continue
+		}
+		if isENPU && !npu.enpuPolicyCompatible(dev, pod, nodeSupportENPU) {
+			reason[common.ModeNotFit]++
+			klog.V(4).InfoS("Node filtered: ENPU scheduling policy conflicts with an existing workload", "pod", klog.KObj(pod), "device", dev.ID)
+			continue
+		}
+		if (isENPU || effectiveHamiCore) && !softSliceModeCompatible(dev, isENPU, nodeSupportHamiCore) {
+			reason[common.ModeNotFit]++
+			klog.V(4).InfoS("Node filtered: hami-core and ENPU cannot share one physical DIE", "pod", klog.KObj(pod), "device", dev.ID)
+			continue
+		}
 		_, found, numa := npu.checkType(pod.GetAnnotations(), *dev, k)
 		if !found {
 			reason[common.CardTypeMismatch]++
@@ -490,7 +964,7 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 		}
 		if numa && prevnuma != dev.Numa {
 			if k.Nums != originReq {
-				reason[common.NumaNotFit] += len(tmpDevs)
+				reason[common.NumaNotFit] += len(tmpDevs[k.Type])
 				klog.V(5).InfoS(common.NumaNotFit, "pod", klog.KObj(pod), "device", dev.ID, "k.nums", k.Nums, "numa", numa, "prevnuma", prevnuma, "device numa", dev.Numa)
 			}
 			k.Nums = originReq
@@ -503,16 +977,16 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 			continue
 		}
 
-		memreq := int32(0)
+		memreq := int64(0)
 		if dev.Count <= dev.Used {
 			reason[common.CardTimeSlicingExhausted]++
 			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used)
 			continue
 		}
-		if k.Coresreq > 100 {
-			klog.ErrorS(nil, "core limit can't exceed 100", "pod", klog.KObj(pod), "device", dev.ID)
-			k.Coresreq = 100
-			//return false, tmpDevs
+		if isMutex && dev.Used > 0 {
+			reason[common.ExclusiveDeviceAllocateConflict]++
+			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used)
+			continue
 		}
 		if k.Memreq > 0 {
 			memreq = k.Memreq
@@ -526,47 +1000,90 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 			klog.V(5).InfoS(common.CardInsufficientMemory, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "device total memory", dev.Totalmem, "device used memory", dev.Usedmem, "request memory", memreq)
 			continue
 		}
-		// Set dev.Totalcore to 100 if vnpuMode is hami-core
-		effectiveTotalCore := dev.Totalcore
-		if isHAMiCore {
-			effectiveTotalCore = 100
-		}
-
-		if effectiveTotalCore-dev.Usedcores < k.Coresreq {
+		// Inventory already holds the percentage budget on hami-core nodes
+		// (GetNodeDevices rewrites physical AICore to 100 and keeps advertised
+		// oversell above the base). Fit compares against that stored Totalcore.
+		if dev.Totalcore-dev.Usedcores < k.Coresreq {
 			reason[common.CardInsufficientCore]++
-			klog.V(5).InfoS(common.CardInsufficientCore, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "device total core", effectiveTotalCore, "device used core", dev.Usedcores, "request cores", k.Coresreq)
+			klog.V(5).InfoS(common.CardInsufficientCore, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "device total core", dev.Totalcore, "device used core", dev.Usedcores, "request cores", k.Coresreq)
 			continue
 		}
-		// Coresreq=100 indicates it want this card exclusively
-		if effectiveTotalCore == 100 && k.Coresreq == 100 && dev.Used > 0 {
+		// Coresreq at the percentage base stays exclusive for hami-core even when
+		// the plugin advertises an oversold budget. A pod that declares no mode
+		// used to keep physical Totalcore as its budget; after inventory
+		// normalization a hami-core node already stores 100/150, so gate on the
+		// node as well.
+		if k.Coresreq == hamiCorePercentBase && dev.Used > 0 &&
+			(isHAMiCore || nodeSupportHamiCore || dev.Totalcore == hamiCorePercentBase) {
 			reason[common.ExclusiveDeviceAllocateConflict]++
 			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used)
 			continue
 		}
 		// You can't allocate core=0 job to an already full GPU
-		if effectiveTotalCore != 0 && dev.Usedcores == effectiveTotalCore && k.Coresreq == 0 {
+		if dev.Totalcore != 0 && dev.Usedcores == dev.Totalcore && k.Coresreq == 0 {
 			reason[common.CardComputeUnitsExhausted]++
 			klog.V(5).InfoS(common.CardComputeUnitsExhausted, "pod", klog.KObj(pod), "device", dev.ID, "device index", i)
 			continue
 		}
+		// A card whose full-core occupancy belongs to one pod rejects every later
+		// request. Oversell lifts the budget above that occupant's share, so the
+		// check above no longer recognizes the card as full. Running after it keeps
+		// the non-oversold rejection reason as CardComputeUnitsExhausted. The
+		// requesting pod's own mode is irrelevant: only hami-core pods on
+		// non-hami-core nodes are filtered out, so a legacy vNPU pod still reaches
+		// an oversold card. dev.Used == 1 covers usage rebuilt without pod detail;
+		// hamiCoreExclusiveOccupant covers the multi-slot collapsed entry an
+		// init-container reservation produces.
+		if dev.Usedcores >= hamiCorePercentBase && (dev.Used == 1 || hamiCoreExclusiveOccupant(dev)) {
+			reason[common.ExclusiveDeviceAllocateConflict]++
+			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used, "usedcores", dev.Usedcores)
+			continue
+		}
+		// Incoming pods use the same occupant rule. Fit is per container, so a
+		// pod that reaches the base across several of its own concurrent
+		// requests must not share an oversold card once another tenant is
+		// already there. Sequential ordinary init containers have already
+		// exited; a sidecar stays counted through the app phase.
+		if (isHAMiCore || nodeSupportHamiCore || dev.Totalcore >= hamiCorePercentBase) &&
+			hamiCoreIncomingExclusive(dev, pod, incomingHamiCoreOnDevice(dev.ID, allocated, tmpDevs, pod), k.Coresreq) {
+			reason[common.ExclusiveDeviceAllocateConflict]++
+			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used, "usedcores", dev.Usedcores, "request cores", k.Coresreq)
+			continue
+		}
 		if k.Nums > 0 {
 			klog.V(5).InfoS("find fit device", "pod", klog.KObj(pod), "device", dev.ID)
-			if !needTopology {
+			if !needTopology && !pair910C {
 				k.Nums--
 			}
+			customInfo := make(map[string]any, len(dev.CustomInfo)+1)
+			maps.Copy(customInfo, dev.CustomInfo)
+			customInfo[effectiveVNPUModeKey] = effectiveMode
 			tmpDevs[k.Type] = append(tmpDevs[k.Type], device.ContainerDevice{
 				Idx:        int(dev.Index),
 				UUID:       dev.ID,
 				Type:       k.Type,
 				Usedmem:    memreq,
 				Usedcores:  k.Coresreq,
-				CustomInfo: dev.CustomInfo,
+				CustomInfo: customInfo,
 			})
 		}
-		if k.Nums == 0 && !needTopology {
+		if k.Nums == 0 && !needTopology && !pair910C {
 			klog.V(4).InfoS("device allocate success", "pod", klog.KObj(pod), "allocate device", tmpDevs)
 			return true, tmpDevs, ""
 		}
+	}
+
+	if pair910C {
+		// Ascend 910C requires full module-pair allocation (2 NPUs per physical card).
+		combination := npu.computeBestCombination910C(nodeInfo, int(originReq), tmpDevs[k.Type])
+		if len(combination) != int(originReq) {
+			reason[common.AllocatedCardsInsufficientRequest] = len(combination)
+			klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(combination))
+			return false, tmpDevs, common.GenReason(reason, int(originReq))
+		}
+		tmpDevs[k.Type] = combination
+		klog.V(5).InfoS("device allocate success", "pod", klog.KObj(pod), "best device combination", tmpDevs)
+		return true, tmpDevs, ""
 	}
 
 	if needTopology {
@@ -578,13 +1095,7 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 				tmpDevs[k.Type] = device.ContainerDevices{tmpDevs[k.Type][0]}
 			} else {
 				// If requesting multiple devices, select the best combination of cards.
-				var combination device.ContainerDevices
-				if k.Type == Ascend910CType {
-					// Use topology-aware allocation for Ascend910C: only select full modules (2 NPUs per card).
-					combination = npu.computeBestCombination910C(nodeInfo, int(originReq), tmpDevs[k.Type])
-				} else {
-					combination = npu.computeBestCombination(nodeInfo, int(originReq), tmpDevs[k.Type])
-				}
+				combination := npu.computeBestCombination(nodeInfo, int(originReq), tmpDevs[k.Type])
 				tmpDevs[k.Type] = combination
 			}
 			klog.V(5).InfoS("device allocate success", "pod", klog.KObj(pod), "best device combination", tmpDevs)
@@ -592,9 +1103,9 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 		}
 	}
 
-	if len(tmpDevs) > 0 {
-		reason[common.AllocatedCardsInsufficientRequest] = len(tmpDevs)
-		klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(tmpDevs))
+	if len(tmpDevs[k.Type]) > 0 {
+		reason[common.AllocatedCardsInsufficientRequest] = len(tmpDevs[k.Type])
+		klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(tmpDevs[k.Type]))
 	}
 	return false, tmpDevs, common.GenReason(reason, len(devices))
 }
@@ -658,11 +1169,10 @@ func (npudev *Devices) computeBestCombination(nodeInfo *device.NodeInfo, reqNum 
 }
 
 func (npudev *Devices) computeBestCombination910C(nodeInfo *device.NodeInfo, reqNum int, containerDevices device.ContainerDevices) device.ContainerDevices {
-	// Build a mapping from NPU index to device object for quick lookup.
 	indexToDevice := make(map[int]device.ContainerDevice)
 	var npuIndices []int
 	for _, dev := range containerDevices {
-		idx := int(dev.Idx)
+		idx := dev.Idx
 		indexToDevice[idx] = dev
 		npuIndices = append(npuIndices, idx)
 	}
@@ -670,22 +1180,19 @@ func (npudev *Devices) computeBestCombination910C(nodeInfo *device.NodeInfo, req
 	// Each physical card hosts exactly 2 NPUs (Ascend 910C module design).
 	const MaxCardNPUNum = 2
 
-	// Group NPU indices by the module and Sort
 	cardTopology := make(map[int][]int)
 	for _, idx := range npuIndices {
 		cardId := idx / MaxCardNPUNum
 		cardTopology[cardId] = append(cardTopology[cardId], idx)
 	}
 
-	// Convert the card topology map into a slice for sorting.
 	cardTopSlice := make([][]int, 0, len(cardTopology))
 	for _, card := range cardTopology {
 		cardTopSlice = append(cardTopSlice, card)
 	}
 
-	// Sort cards by the number of available NPUs in ascending order.
 	sort.Slice(cardTopSlice, func(i, j int) bool {
-		return len(cardTopSlice[i]) < len(cardTopSlice[j])
+		return len(cardTopSlice[i]) > len(cardTopSlice[j])
 	})
 
 	// Select NPUs card by card, preferring full cards.

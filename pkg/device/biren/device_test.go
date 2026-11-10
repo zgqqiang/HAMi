@@ -1,0 +1,985 @@
+/*
+Copyright 2026 The HAMi Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package biren
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+
+	"gotest.tools/v3/assert"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/klog/v2"
+
+	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/util/client"
+	"github.com/Project-HAMi/HAMi/pkg/util/nodelock"
+)
+
+func Test_MutateAdmission(t *testing.T) {
+	config := BirenConfig{
+		ResourceCountName: "birentech.com/gpu",
+	}
+	InitBirenDevice(config)
+	tests := []struct {
+		name string
+		args struct {
+			ctr *corev1.Container
+			p   *corev1.Pod
+		}
+		want bool
+		err  error
+	}{
+		{
+			name: "set to resource limits",
+			args: struct {
+				ctr *corev1.Container
+				p   *corev1.Pod
+			}{
+				ctr: &corev1.Container{
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							"birentech.com/gpu": resource.MustParse("1"),
+						},
+					},
+				},
+				p: &corev1.Pod{},
+			},
+			want: true,
+			err:  nil,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dev := BirenDevices{}
+			result, err := dev.MutateAdmission(test.args.ctr, test.args.p)
+			if err != test.err {
+				klog.InfoS("set to resource limits failed")
+			}
+			assert.Equal(t, result, test.want)
+		})
+	}
+}
+
+func Test_GetNodeDevices(t *testing.T) {
+	dev := BirenDevices{}
+	tests := []struct {
+		name string
+		args corev1.Node
+		want []*device.DeviceInfo
+		err  error
+	}{
+		{
+			name: "no annotation",
+			args: corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{},
+				},
+			},
+			want: []*device.DeviceInfo{},
+			err:  errors.New("annos not found " + RegisterAnnos),
+		},
+		{
+			name: "exist biren device",
+			args: corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"hami.io/node-biren-register": "[{\"id\":\"7-0\",\"count\":1,\"devmem\":32768,\"type\":\"Biren\",\"health\":true,\"devicepairscore\":{}}]",
+					},
+				},
+			},
+			want: []*device.DeviceInfo{
+				{
+					ID:           "7-0",
+					Count:        int64(1),
+					Devmem:       int64(32768),
+					Devcore:      int64(100),
+					Type:         dev.CommonWord(),
+					Numa:         0,
+					Health:       true,
+					Index:        uint(0),
+					Mode:         "",
+					DeviceVendor: BirenCommonWord,
+				},
+			},
+			err: nil,
+		},
+		{
+			name: "no biren device",
+			args: corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"hami.io/node-biren-register": ":",
+					},
+				},
+			},
+			want: []*device.DeviceInfo{},
+			err:  errors.New("no gpu found on node"),
+		},
+		{
+			name: "node annotations not decode successfully",
+			args: corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						"hami.io/node-biren-register": "",
+					},
+				},
+			},
+			want: []*device.DeviceInfo{},
+			err:  errors.New("node annotations not decode successfully"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := dev.GetNodeDevices(test.args)
+			if err != nil {
+				klog.Errorf("got %v, want %v", err, test.err)
+			}
+			assert.DeepEqual(t, result, test.want)
+		})
+	}
+}
+
+func Test_CheckHealth(t *testing.T) {
+	const resourceName = "birentech.com/gpu"
+	previous := BirenResourceCount
+	t.Cleanup(func() { BirenResourceCount = previous })
+	BirenResourceCount = resourceName
+
+	node := func(name string, allocatable int64, registerAnno string) *corev1.Node {
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{}},
+			Status:     corev1.NodeStatus{Allocatable: corev1.ResourceList{}},
+		}
+		if allocatable > 0 {
+			n.Status.Allocatable[resourceName] = *resource.NewQuantity(allocatable, resource.DecimalSI)
+		}
+		if registerAnno != "" {
+			n.Annotations[RegisterAnnos] = registerAnno
+		}
+		return n
+	}
+
+	dev := BirenDevices{}
+
+	t.Run("no allocatable is unhealthy", func(t *testing.T) {
+		healthy, needUpdate := dev.CheckHealth(BirenDevice, node("biren-absent", 0, "anno"))
+		assert.Equal(t, healthy, false)
+		assert.Equal(t, needUpdate, false)
+	})
+
+	t.Run("allocatable present registers then stays cached", func(t *testing.T) {
+		n := node("biren-present", 8, "anno-v1")
+		healthy, needUpdate := dev.CheckHealth(BirenDevice, n)
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, true)
+
+		healthy, needUpdate = dev.CheckHealth(BirenDevice, n)
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, false)
+
+		healthy, needUpdate = dev.CheckHealth(BirenDevice, node("biren-present", 8, "anno-v2"))
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, true)
+	})
+}
+
+func Test_checkType(t *testing.T) {
+	tests := []struct {
+		name string
+		args struct {
+			annos map[string]string
+			d     device.DeviceUsage
+			n     device.ContainerDeviceRequest
+		}
+		want1 bool
+		want2 bool
+		want3 bool
+	}{
+		{
+			name: "the same type",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{},
+				d: device.DeviceUsage{
+					Type: "Biren",
+				},
+				n: device.ContainerDeviceRequest{
+					Type: "Biren",
+				},
+			},
+			want1: true,
+			want2: true,
+			want3: false,
+		},
+		{
+			name: "the different type",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{},
+				d: device.DeviceUsage{
+					Type: "Biren",
+				},
+				n: device.ContainerDeviceRequest{
+					Type: "test",
+				},
+			},
+			want1: false,
+			want2: false,
+			want3: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dev := BirenDevices{}
+			result1, result2, result3 := dev.checkType(test.args.annos, test.args.d, test.args.n)
+			assert.Equal(t, result1, test.want1)
+			assert.Equal(t, result2, test.want2)
+			assert.Equal(t, result3, test.want3)
+		})
+	}
+}
+
+func Test_PatchAnnotations(t *testing.T) {
+	tests := []struct {
+		name string
+		args struct {
+			annoinput *map[string]string
+			pd        device.PodDevices
+		}
+		want map[string]string
+	}{
+		{
+			name: "exist device",
+			args: struct {
+				annoinput *map[string]string
+				pd        device.PodDevices
+			}{
+				annoinput: &map[string]string{},
+				pd: device.PodDevices{
+					BirenDevice: device.PodSingleDevice{
+						[]device.ContainerDevice{
+							{
+								Idx:       1,
+								UUID:      "test1",
+								Type:      BirenDevice,
+								Usedmem:   int64(2048),
+								Usedcores: int64(1),
+							},
+						},
+					},
+				},
+			},
+			want: map[string]string{
+				device.InRequestDevices[BirenDevice]: "test1,Biren,2048,1:;",
+				device.SupportDevices[BirenDevice]:   "test1,Biren,2048,1:;",
+			},
+		},
+		{
+			name: "no device",
+			args: struct {
+				annoinput *map[string]string
+				pd        device.PodDevices
+			}{
+				annoinput: &map[string]string{},
+				pd:        device.PodDevices{},
+			},
+			want: map[string]string{},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dev := BirenDevices{}
+			result := dev.PatchAnnotations(&corev1.Pod{}, test.args.annoinput, test.args.pd)
+			assert.DeepEqual(t, result, test.want)
+		})
+	}
+}
+
+func Test_GenerateResourceRequests(t *testing.T) {
+	tests := []struct {
+		name string
+		args *corev1.Container
+		want device.ContainerDeviceRequest
+	}{
+		{
+			name: "don't set to limits and request",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits:   corev1.ResourceList{},
+					Requests: corev1.ResourceList{},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "set to limits and request",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"birentech.com/gpu": resource.MustParse("1"),
+					},
+					Requests: corev1.ResourceList{
+						"birentech.com/gpu": resource.MustParse("1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(1),
+				Type:             BirenDevice,
+				Memreq:           int64(0),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(0),
+			},
+		},
+		{
+			name: "only set to limits",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"birentech.com/gpu": resource.MustParse("1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(1),
+				Type:             BirenDevice,
+				Memreq:           int64(0),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(0),
+			},
+		},
+		{
+			name: "only set to request",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						"birentech.com/gpu": resource.MustParse("1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(1),
+				Type:             BirenDevice,
+				Memreq:           int64(0),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(0),
+			},
+		},
+		{
+			name: "zero count must not silently bypass quota",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"birentech.com/gpu": resource.MustParse("0"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "negative count must be rejected",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"birentech.com/gpu": resource.MustParse("-1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "negative count must be rejected",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"birentech.com/gpu": resource.MustParse("-1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "max int64 count is accepted",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"birentech.com/gpu": resource.MustParse("2147483647"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(2147483647),
+				Type:             BirenDevice,
+				Memreq:           int64(0),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(0),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dev := BirenDevices{}
+			result, _ := dev.GenerateResourceRequests(test.args)
+			assert.DeepEqual(t, result, test.want)
+		})
+	}
+}
+
+func TestDevices_LockNode(t *testing.T) {
+	tests := []struct {
+		name        string
+		node        *corev1.Node
+		pod         *corev1.Pod
+		hasLock     bool
+		expectError bool
+	}{
+		{
+			name:        "no containers — skip lock",
+			node:        &corev1.Node{},
+			pod:         &corev1.Pod{Spec: corev1.PodSpec{}},
+			hasLock:     false,
+			expectError: false,
+		},
+		{
+			name: "regular-container GPU request — acquires lock",
+			node: &corev1.Node{},
+			pod: &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				"birentech.com/gpu": resource.MustParse("1"),
+			}}}}}},
+			hasLock:     true,
+			expectError: false,
+		},
+		{
+			name: "init-container-only GPU request — acquires lock",
+			node: &corev1.Node{},
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					"birentech.com/gpu": resource.MustParse("1"),
+				}}}},
+				Containers: []corev1.Container{{Name: "cpu-app"}},
+			}},
+			hasLock:     true,
+			expectError: false,
+		},
+		{
+			name: "init+regular GPU request — acquires lock",
+			node: &corev1.Node{},
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					"birentech.com/gpu": resource.MustParse("1"),
+				}}}},
+				Containers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					"birentech.com/gpu": resource.MustParse("1"),
+				}}}},
+			}},
+			hasLock:     true,
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Initialize fake clientset and pre-load test data
+			client.KubeClient = fake.NewSimpleClientset()
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "testNode",
+					Annotations: map[string]string{"test-annotation-key": "test-annotation-value", device.InRequestDevices["Biren"]: "some-value"},
+				},
+			}
+
+			// Add the node to the fake clientset
+			_, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Failed to create test node: %v", err)
+			}
+
+			dev := InitBirenDevice(BirenConfig{
+				ResourceCountName: "birentech.com/gpu",
+			})
+			err = dev.LockNode(node, tt.pod)
+			if tt.expectError {
+				assert.Equal(t, err != nil, true)
+			} else {
+				assert.NilError(t, err)
+			}
+			node, err = client.KubeClient.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
+			assert.NilError(t, err)
+			fmt.Println(node.Annotations)
+			_, ok := node.Annotations[nodelock.NodeLockKey]
+			assert.Equal(t, ok, tt.hasLock)
+		})
+	}
+}
+
+func TestDevices_ReleaseNodeLock(t *testing.T) {
+	tests := []struct {
+		name        string
+		node        *corev1.Node
+		pod         *corev1.Pod
+		hasLock     bool
+		expectError bool
+	}{
+		{
+			name:        "Test with no containers",
+			node:        &corev1.Node{},
+			pod:         &corev1.Pod{Spec: corev1.PodSpec{}},
+			hasLock:     true,
+			expectError: false,
+		},
+		{
+			name: "Test with non-zero resource requests",
+			node: &corev1.Node{},
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name:      "nozerorr",
+				Namespace: "default",
+			}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				"birentech.com/gpu": resource.MustParse("1"),
+			}}}}}},
+			hasLock:     false,
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Initialize fake clientset and pre-load test data
+			client.KubeClient = fake.NewSimpleClientset()
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "testNode",
+					Annotations: map[string]string{"test-annotation-key": "test-annotation-value", device.InRequestDevices[BirenDevice]: "some-value", nodelock.NodeLockKey: "lock-values,default,nozerorr"},
+				},
+			}
+
+			// Add the node to the fake clientset
+			_, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Failed to create test node: %v", err)
+			}
+
+			dev := InitBirenDevice(BirenConfig{
+				ResourceCountName: "birentech.com/gpu",
+			})
+			err = dev.ReleaseNodeLock(node, tt.pod)
+			if tt.expectError {
+				assert.Equal(t, err != nil, true)
+			} else {
+				assert.NilError(t, err)
+			}
+			node, err = client.KubeClient.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
+			assert.NilError(t, err)
+			fmt.Println(node.Annotations)
+			_, ok := node.Annotations[nodelock.NodeLockKey]
+			assert.Equal(t, ok, tt.hasLock)
+		})
+	}
+}
+
+func TestDevices_Fit(t *testing.T) {
+	config := BirenConfig{
+		ResourceCountName: "birentech.com/gpu",
+	}
+	dev := InitBirenDevice(config)
+
+	tests := []struct {
+		name       string
+		devices    []*device.DeviceUsage
+		request    device.ContainerDeviceRequest
+		annos      map[string]string
+		wantFit    bool
+		wantLen    int
+		wantDevIDs []string
+		wantReason string
+	}{
+		{
+			name: "fit success",
+			devices: []*device.DeviceUsage{
+				{
+					ID:        "dev-0",
+					Index:     0,
+					Used:      0,
+					Count:     1,
+					Usedmem:   0,
+					Totalmem:  0,
+					Totalcore: 0,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      BirenDevice,
+					Health:    true,
+				},
+				{
+					ID:        "dev-1",
+					Index:     1,
+					Used:      0,
+					Count:     1,
+					Usedmem:   0,
+					Totalmem:  0,
+					Totalcore: 0,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      BirenDevice,
+					Health:    true,
+				},
+			},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           0,
+				MemPercentagereq: 0,
+				Coresreq:         0,
+				Type:             BirenDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    true,
+			wantLen:    1,
+			wantDevIDs: []string{"dev-1"},
+			wantReason: "",
+		},
+		{
+			name: "fit fail: type mismatch",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     1,
+				Usedmem:   0,
+				Totalmem:  0,
+				Totalcore: 0,
+				Usedcores: 0,
+				Numa:      0,
+				Health:    true,
+				Type:      BirenDevice,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Type:             "OtherType",
+				Memreq:           512,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardTypeMismatch",
+		},
+		{
+			name: "fit fail: user assign use uuid mismatch",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-1",
+				Index:     0,
+				Used:      0,
+				Count:     1,
+				Usedmem:   0,
+				Totalmem:  0,
+				Totalcore: 0,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      BirenDevice,
+				Health:    true,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           0,
+				MemPercentagereq: 0,
+				Coresreq:         0,
+				Type:             BirenDevice,
+			},
+			annos:      map[string]string{BirenUseUUID: "dev-0"},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardUuidMismatch",
+		},
+		{
+			name: "fit fail: user assign no use uuid match",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     1,
+				Usedmem:   0,
+				Totalmem:  0,
+				Totalcore: 0,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      BirenDevice,
+				Health:    true,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           0,
+				MemPercentagereq: 0,
+				Coresreq:         0,
+				Type:             BirenDevice,
+			},
+			annos:      map[string]string{BirenNoUseUUID: "dev-0"},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardUuidMismatch",
+		},
+		{
+			name: "fit fail: card overused",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      1,
+				Count:     1,
+				Usedmem:   0,
+				Totalmem:  0,
+				Totalcore: 0,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      BirenDevice,
+				Health:    true,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           0,
+				MemPercentagereq: 0,
+				Coresreq:         0,
+				Type:             BirenDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardTimeSlicingExhausted",
+		},
+		{
+			name: "fit fail:  AllocatedCardsInsufficientRequest",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     1,
+				Usedmem:   0,
+				Totalmem:  0,
+				Totalcore: 0,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      BirenDevice,
+				Health:    true,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             2,
+				Memreq:           0,
+				MemPercentagereq: 0,
+				Coresreq:         0,
+				Type:             BirenDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    1,
+			wantDevIDs: []string{},
+			wantReason: "1/1 AllocatedCardsInsufficientRequest",
+		},
+		{
+			name: "mutex policy rejects used device",
+			devices: []*device.DeviceUsage{
+				{
+					ID:        "dev-0",
+					Index:     0,
+					Used:      1,
+					Count:     2,
+					Usedmem:   0,
+					Totalmem:  0,
+					Totalcore: 0,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      BirenDevice,
+					Health:    true,
+				},
+			},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           0,
+				MemPercentagereq: 0,
+				Coresreq:         0,
+				Type:             BirenDevice,
+			},
+			annos:      map[string]string{"hami.io/gpu-scheduler-policy": "mutex"},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 ExclusiveDeviceAllocateConflict",
+		},
+		{
+			name: "fit fail: partial allocation AllocatedCardsInsufficientRequest for multiple cards",
+			devices: []*device.DeviceUsage{
+				{
+					ID:        "dev-0",
+					Index:     0,
+					Used:      0,
+					Count:     100,
+					Usedmem:   0,
+					Totalmem:  1280,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      BirenDevice,
+					Health:    true,
+				},
+				{
+					ID:        "dev-1",
+					Index:     1,
+					Used:      0,
+					Count:     100,
+					Usedmem:   0,
+					Totalmem:  1280,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      BirenDevice,
+					Health:    true,
+				},
+			},
+			request: device.ContainerDeviceRequest{
+				Nums:             3,
+				Memreq:           512,
+				MemPercentagereq: 0,
+				Coresreq:         20,
+				Type:             BirenDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    2,
+			wantDevIDs: []string{},
+			wantReason: "2/2 AllocatedCardsInsufficientRequest",
+		},
+		{
+			name: "fit fail: CardNotHealth",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     1,
+				Usedmem:   0,
+				Totalmem:  0,
+				Totalcore: 0,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      BirenDevice,
+				Health:    false,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           0,
+				MemPercentagereq: 0,
+				Coresreq:         0,
+				Type:             BirenDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardNotHealth",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			allocated := &device.PodDevices{}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: test.annos,
+				},
+			}
+			fit, result, reason := dev.Fit(test.devices, test.request, pod, &device.NodeInfo{}, allocated)
+			if fit != test.wantFit {
+				t.Errorf("Fit: got %v, want %v", fit, test.wantFit)
+			}
+			if len(result[BirenDevice]) != test.wantLen {
+				t.Errorf("expected len: %d, got len %d", test.wantLen, len(result[BirenDevice]))
+			}
+			if test.wantFit {
+				for idx, id := range test.wantDevIDs {
+					if id != result[BirenDevice][idx].UUID {
+						t.Errorf("expected device id: %s, got device id %s", id, result[BirenDevice][idx].UUID)
+					}
+				}
+			}
+
+			if reason != test.wantReason {
+				t.Errorf("expected reason: %s, got reason: %s", test.wantReason, reason)
+			}
+		})
+	}
+}
+
+func TestDevices_AddResourceUsage(t *testing.T) {
+	tests := []struct {
+		name        string
+		deviceUsage *device.DeviceUsage
+		ctr         *device.ContainerDevice
+		wantErr     bool
+		wantUsage   *device.DeviceUsage
+	}{
+		{
+			name: "test add resource usage",
+			deviceUsage: &device.DeviceUsage{
+				ID:        "dev-0",
+				Used:      1,
+				Usedcores: 0,
+				Usedmem:   0,
+			},
+			ctr: &device.ContainerDevice{
+				UUID:      "dev-0",
+				Usedcores: 0,
+				Usedmem:   0,
+			},
+			wantUsage: &device.DeviceUsage{
+				ID:        "dev-0",
+				Used:      2,
+				Usedcores: 0,
+				Usedmem:   0,
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dev := &BirenDevices{}
+			if err := dev.AddResourceUsage(&corev1.Pod{}, tt.deviceUsage, tt.ctr); (err != nil) != tt.wantErr {
+				t.Errorf("AddResourceUsage() error=%v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr {
+				if tt.deviceUsage.Usedcores != tt.wantUsage.Usedcores {
+					t.Errorf("expected used cores: %d, got used cores %d", tt.wantUsage.Usedcores, tt.deviceUsage.Usedcores)
+				}
+				if tt.deviceUsage.Usedmem != tt.wantUsage.Usedmem {
+					t.Errorf("expected used mem: %d, got used mem %d", tt.wantUsage.Usedmem, tt.deviceUsage.Usedmem)
+				}
+				if tt.deviceUsage.Used != tt.wantUsage.Used {
+					t.Errorf("expected used: %d, got used %d", tt.wantUsage.Used, tt.deviceUsage.Used)
+				}
+			}
+		})
+	}
+}

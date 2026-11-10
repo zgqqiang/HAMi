@@ -17,9 +17,11 @@ limitations under the License.
 package policy
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/util"
 
 	"gotest.tools/v3/assert"
 )
@@ -124,6 +126,7 @@ func TestDeviceUsageList_Less(t *testing.T) {
 	tests := []struct {
 		name         string
 		policy       string
+		numaBind     bool
 		deviceLists  []*DeviceListsScore
 		expectedLess bool
 	}{
@@ -137,7 +140,7 @@ func TestDeviceUsageList_Less(t *testing.T) {
 			expectedLess: true,
 		},
 		{
-			name:   "Binpack policy with different Numa true",
+			name:   "Binpack: score primary, lower score sorts first across NUMA",
 			policy: "binpack",
 			deviceLists: []*DeviceListsScore{
 				{Device: &device.DeviceUsage{Numa: 1, Used: 10}, Score: 10},
@@ -146,16 +149,34 @@ func TestDeviceUsageList_Less(t *testing.T) {
 			expectedLess: true,
 		},
 		{
-			name:   "Binpack policy with different Numa false",
+			name:   "Binpack: score primary, higher score sorts last even on lower NUMA",
 			policy: "binpack",
 			deviceLists: []*DeviceListsScore{
 				{Device: &device.DeviceUsage{Numa: 0, Used: 10}, Score: 10},
 				{Device: &device.DeviceUsage{Numa: 1, Used: 20}, Score: 20},
 			},
+			expectedLess: true,
+		},
+		{
+			name:   "Binpack: NUMA tiebreaker when scores equal",
+			policy: "binpack",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 15},
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 15},
+			},
+			expectedLess: true,
+		},
+		{
+			name:   "Binpack: score primary over NUMA, high-NUMA high-score sorts last",
+			policy: "binpack",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 20},
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 10},
+			},
 			expectedLess: false,
 		},
 		{
-			name:   "Spread policy with same Numa",
+			name:   "Spread: score primary, higher score sorts first",
 			policy: "spread",
 			deviceLists: []*DeviceListsScore{
 				{Device: &device.DeviceUsage{Numa: 0, Used: 10}, Score: 10},
@@ -164,7 +185,7 @@ func TestDeviceUsageList_Less(t *testing.T) {
 			expectedLess: false,
 		},
 		{
-			name:   "Spread policy with different Numa false",
+			name:   "Spread: score primary, lower score sorts last across NUMA",
 			policy: "spread",
 			deviceLists: []*DeviceListsScore{
 				{Device: &device.DeviceUsage{Numa: 1, Used: 10}, Score: 10},
@@ -173,11 +194,189 @@ func TestDeviceUsageList_Less(t *testing.T) {
 			expectedLess: false,
 		},
 		{
-			name:   "Spread policy with different Numa true",
+			name:   "Spread: score primary over NUMA, high-NUMA high-score sorts first",
 			policy: "spread",
 			deviceLists: []*DeviceListsScore{
-				{Device: &device.DeviceUsage{Numa: 0, Used: 10}, Score: 10},
-				{Device: &device.DeviceUsage{Numa: 1, Used: 20}, Score: 20},
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 20},
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 10},
+			},
+			expectedLess: true,
+		},
+		{
+			name:   "Spread: NUMA tiebreaker when scores equal",
+			policy: "spread",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 15},
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 15},
+			},
+			expectedLess: true,
+		},
+		// NumaBind=true: NUMA is primary, Score orders within a NUMA node.
+		{
+			name:     "Binpack+NumaBind: NUMA primary, higher NUMA sorts first regardless of Score",
+			policy:   "binpack",
+			numaBind: true,
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 5},
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 99},
+			},
+			expectedLess: true,
+		},
+		{
+			name:     "Binpack+NumaBind: same NUMA falls back to lower Score first",
+			policy:   "binpack",
+			numaBind: true,
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 10},
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 20},
+			},
+			expectedLess: true,
+		},
+		{
+			name:     "Spread+NumaBind: NUMA primary, lower NUMA sorts first regardless of Score",
+			policy:   "spread",
+			numaBind: true,
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 5},
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 99},
+			},
+			expectedLess: true,
+		},
+		{
+			name:     "Spread+NumaBind: same NUMA falls back to higher Score first",
+			policy:   "spread",
+			numaBind: true,
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 20},
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 10},
+			},
+			expectedLess: true,
+		},
+		{
+			name:   "Mutex: busy GPU sorts before idle GPU",
+			policy: "mutex",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Used: 2, Numa: 0}},
+				{Device: &device.DeviceUsage{Used: 0, Numa: 0}},
+			},
+			expectedLess: true,
+		},
+		{
+			name:   "Mutex: idle GPU sorts after busy GPU",
+			policy: "mutex",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Used: 0, Numa: 0}},
+				{Device: &device.DeviceUsage{Used: 1, Numa: 0}},
+			},
+			expectedLess: false,
+		},
+		{
+			name:   "Mutex: NUMA tiebreaker when both idle",
+			policy: "mutex",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Used: 0, Numa: 0}},
+				{Device: &device.DeviceUsage{Used: 0, Numa: 1}},
+			},
+			expectedLess: true,
+		},
+		{
+			name:   "Bare numa: NUMA is the sort key regardless of score",
+			policy: "numa",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 99},
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 5},
+			},
+			expectedLess: true,
+		},
+		{
+			name:   "Bare numa: same NUMA falls to deterministic Index tiebreak",
+			policy: "numa",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Index: 3, Numa: 0}, Score: 10},
+				{Device: &device.DeviceUsage{Index: 1, Numa: 0}, Score: 20},
+			},
+			expectedLess: false,
+		},
+		{
+			name:   "Chain binpack,numa: score primary, numa tiebreak when scores equal",
+			policy: "binpack,numa",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 15},
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 15},
+			},
+			expectedLess: true,
+		},
+		{
+			name:   "Chain spread,numa: score primary, numa tiebreak when scores equal",
+			policy: "spread,numa",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 15},
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 15},
+			},
+			expectedLess: true,
+		},
+		{
+			name:   "Chain numa,spread: numa primary regardless of score",
+			policy: "numa,spread",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 5},
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 99},
+			},
+			expectedLess: false,
+		},
+		{
+			name:   "Chain numa,spread: same NUMA falls back to spread (higher score first)",
+			policy: "numa,spread",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 20},
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 10},
+			},
+			expectedLess: true,
+		},
+		{
+			name:   "Chain mutex,spread: mutex is a Fit() filter, not a sort key; spread decides order",
+			policy: "mutex,spread",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Used: 5}, Score: 10},
+				{Device: &device.DeviceUsage{Used: 0}, Score: 20},
+			},
+			expectedLess: false,
+		},
+		{
+			name:   "Chain with only filter tokens (mutex,topology-aware) falls back to spread",
+			policy: "mutex,topology-aware",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 10},
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 20},
+			},
+			expectedLess: false,
+		},
+		{
+			name:   "Chain binpack,numa: deterministic Index tiebreak when score and numa both tie",
+			policy: "binpack,numa",
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Index: 5, Numa: 0}, Score: 10},
+				{Device: &device.DeviceUsage{Index: 2, Numa: 0}, Score: 10},
+			},
+			expectedLess: false,
+		},
+		{
+			name:     "Chain binpack,spread + NumaBind: numa forced primary to keep groups contiguous",
+			policy:   "binpack,spread",
+			numaBind: true,
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 99},
+				{Device: &device.DeviceUsage{Numa: 1}, Score: 5},
+			},
+			expectedLess: true,
+		},
+		{
+			name:     "Chain spread,numa + NumaBind: numa moved to front, spread breaks same-NUMA ties",
+			policy:   "spread,numa",
+			numaBind: true,
+			deviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 20},
+				{Device: &device.DeviceUsage{Numa: 0}, Score: 10},
 			},
 			expectedLess: true,
 		},
@@ -187,6 +386,7 @@ func TestDeviceUsageList_Less(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			l := DeviceUsageList{
 				Policy:      tt.policy,
+				NumaBind:    tt.numaBind,
 				DeviceLists: tt.deviceLists,
 			}
 			i, j := 0, 1
@@ -312,11 +512,12 @@ func TestComputeScore(t *testing.T) {
 		{
 			name: "Zero capacity device returns score 0 without panic",
 			device: &device.DeviceUsage{
-				ID:        "test-device",
-				Type:      "type1",
-				Count:     0,
-				Totalcore: 0,
-				Totalmem:  0,
+				ID:           "test-device",
+				Type:         "type1",
+				DeviceVendor: "type1",
+				Count:        0,
+				Totalcore:    0,
+				Totalmem:     0,
 			},
 			requests:      make(device.ContainerDeviceRequests),
 			expectedScore: 0,
@@ -324,11 +525,12 @@ func TestComputeScore(t *testing.T) {
 		{
 			name: "Partial zero capacity (Count=0) returns score 0 without panic",
 			device: &device.DeviceUsage{
-				ID:        "test-device",
-				Type:      "type1",
-				Count:     0,
-				Totalcore: 8,
-				Totalmem:  4096,
+				ID:           "test-device",
+				Type:         "type1",
+				DeviceVendor: "type1",
+				Count:        0,
+				Totalcore:    8,
+				Totalmem:     4096,
 			},
 			requests:      make(device.ContainerDeviceRequests),
 			expectedScore: 0,
@@ -336,14 +538,15 @@ func TestComputeScore(t *testing.T) {
 		{
 			name: "ContainerDeviceRequests has no data",
 			device: &device.DeviceUsage{
-				ID:        "test-device",
-				Type:      "type1",
-				Totalcore: 4,
-				Totalmem:  8192,
-				Count:     10,
-				Used:      2,
-				Usedcores: 1,
-				Usedmem:   2048,
+				ID:           "test-device",
+				Type:         "type1",
+				DeviceVendor: "type1",
+				Totalcore:    4,
+				Totalmem:     8192,
+				Count:        10,
+				Used:         2,
+				Usedcores:    1,
+				Usedmem:      2048,
 			},
 			requests:      make(device.ContainerDeviceRequests),
 			expectedScore: 7.0,
@@ -351,14 +554,15 @@ func TestComputeScore(t *testing.T) {
 		{
 			name: "Filter other device types and ignore Nums for slots",
 			device: &device.DeviceUsage{
-				ID:        "test-device",
-				Type:      "type1",
-				Totalcore: 4,
-				Totalmem:  8192,
-				Count:     10,
-				Used:      2,
-				Usedcores: 1,
-				Usedmem:   2048,
+				ID:           "test-device",
+				Type:         "type1",
+				DeviceVendor: "type1",
+				Totalcore:    4,
+				Totalmem:     8192,
+				Count:        10,
+				Used:         2,
+				Usedcores:    1,
+				Usedmem:      2048,
 			},
 			requests: device.ContainerDeviceRequests{
 				"type1": {
@@ -381,14 +585,15 @@ func TestComputeScore(t *testing.T) {
 		{
 			name: "MemPercentagereq calculation evaluates correctly",
 			device: &device.DeviceUsage{
-				ID:        "test-device",
-				Type:      "type1",
-				Totalcore: 10,
-				Totalmem:  10000,
-				Count:     10,
-				Used:      0,
-				Usedcores: 0,
-				Usedmem:   0,
+				ID:           "test-device",
+				Type:         "type1",
+				DeviceVendor: "type1",
+				Totalcore:    10,
+				Totalmem:     10000,
+				Count:        10,
+				Used:         0,
+				Usedcores:    0,
+				Usedmem:      0,
 			},
 			requests: device.ContainerDeviceRequests{
 				"type1": {
@@ -404,14 +609,15 @@ func TestComputeScore(t *testing.T) {
 		{
 			name: "Filter other device types and aggregate same device types",
 			device: &device.DeviceUsage{
-				ID:        "test-device",
-				Type:      "type1",
-				Totalcore: 10,
-				Totalmem:  10000,
-				Count:     10,
-				Used:      0,
-				Usedcores: 0,
-				Usedmem:   0,
+				ID:           "test-device",
+				Type:         "type1",
+				DeviceVendor: "type1",
+				Totalcore:    10,
+				Totalmem:     10000,
+				Count:        10,
+				Used:         0,
+				Usedcores:    0,
+				Usedmem:      0,
 			},
 			requests: device.ContainerDeviceRequests{
 				"container1": {
@@ -438,6 +644,223 @@ func TestComputeScore(t *testing.T) {
 			},
 			expectedScore: 8.0,
 		},
+		{
+			// Both gpumem and gpumem-percentage are set. Fit sizes the allocation
+			// from Memreq and only falls back to the percentage when Memreq is
+			// unset, so scoring has to resolve it in the same order: an 80GB card
+			// booked at 20000MB must not be scored as if it were handing out 10%
+			// (8192MB) of its memory.
+			name: "Memreq takes precedence over MemPercentagereq when both are set",
+			device: &device.DeviceUsage{
+				ID:           "gpu-0",
+				Type:         "NVIDIA A100-SXM4-80GB",
+				DeviceVendor: "NVIDIA",
+				Totalcore:    100,
+				Totalmem:     81920,
+				Count:        8,
+				Used:         0,
+				Usedcores:    0,
+				Usedmem:      0,
+			},
+			requests: device.ContainerDeviceRequests{
+				"container1": {
+					Nums:             1,
+					Type:             "NVIDIA",
+					Memreq:           20000,
+					MemPercentagereq: 10,
+					Coresreq:         0,
+				},
+			},
+			// slot 1/8 + core 0/100 + mem 20000/81920, weights 1/1/1, times util.Weight (10).
+			expectedScore: 3.69140625,
+		},
+		{
+			// Enflame sends a negative mode code (-1, request by spec) in
+			// MemPercentagereq. A pod that asks only for cores has Memreq 0, and the
+			// code must not be read as a percentage: -1% of a 32GB card would be
+			// counted as -327MB. It scores the same as an unset (101) request.
+			name: "Negative MemPercentagereq mode code counts no memory",
+			device: &device.DeviceUsage{
+				ID:           "gcu-0",
+				Type:         "Enflame",
+				DeviceVendor: "Enflame",
+				Totalcore:    100,
+				Totalmem:     32768,
+				Count:        8,
+				Used:         0,
+				Usedcores:    0,
+				Usedmem:      0,
+			},
+			requests: device.ContainerDeviceRequests{
+				"container1": {
+					Nums:             1,
+					Type:             "Enflame",
+					Memreq:           0,
+					MemPercentagereq: -1,
+					Coresreq:         50,
+				},
+			},
+			// slot 1/8 + core 50/100 + mem 0, weights 1/1/1, times util.Weight (10).
+			expectedScore: 6.25,
+		},
+		{
+			// The NVIDIA device plugin registers the card's model name as the
+			// device type, while the request carries the "NVIDIA" common word.
+			name: "Model named device type still counts the request",
+			device: &device.DeviceUsage{
+				ID:           "gpu-0",
+				Type:         "NVIDIA A100-SXM4-40GB",
+				DeviceVendor: "NVIDIA",
+				Totalcore:    100,
+				Totalmem:     40960,
+				Count:        10,
+			},
+			requests: device.ContainerDeviceRequests{
+				"NVIDIA": {
+					Nums:             1,
+					Type:             "NVIDIA",
+					Memreq:           20480,
+					MemPercentagereq: 101,
+					Coresreq:         30,
+				},
+			},
+			// slots 1/10 + cores 30/100 + memory 20480/40960
+			expectedScore: float32(util.Weight) * 0.9,
+		},
+		{
+			// Cambricon takes the device type off the node's Model label.
+			name: "Model named device type still counts the request for cambricon",
+			device: &device.DeviceUsage{
+				ID:           "mlu-0",
+				Type:         "MLU370-X8",
+				DeviceVendor: "MLU",
+				Totalcore:    100,
+				Totalmem:     40960,
+				Count:        10,
+			},
+			requests: device.ContainerDeviceRequests{
+				"MLU": {
+					Nums:             1,
+					Type:             "MLU",
+					Memreq:           20480,
+					MemPercentagereq: 101,
+					Coresreq:         30,
+				},
+			},
+			// slots 1/10 + cores 30/100 + memory 20480/40960
+			expectedScore: float32(util.Weight) * 0.9,
+		},
+		{
+			name: "Request of another vendor is not scored",
+			device: &device.DeviceUsage{
+				ID:           "gpu-0",
+				Type:         "NVIDIA A100-SXM4-40GB",
+				DeviceVendor: "NVIDIA",
+				Totalcore:    100,
+				Totalmem:     40960,
+				Count:        10,
+			},
+			requests: device.ContainerDeviceRequests{
+				"MLU": {
+					Nums:             1,
+					Type:             "MLU",
+					Memreq:           20480,
+					MemPercentagereq: 101,
+					Coresreq:         30,
+				},
+			},
+			expectedScore: 0,
+		},
+		{
+			// The chart ships both "Ascend910B4" and "Ascend910B4-1" as Ascend
+			// common words, so a device must only be scored against requests
+			// carrying its own vendor, never one whose name contains it.
+			name: "Vendors sharing a prefix are not mixed on the longer vendor",
+			device: &device.DeviceUsage{
+				ID:           "npu-0",
+				Type:         "Ascend910B4-1",
+				DeviceVendor: "Ascend910B4-1",
+				Totalcore:    100,
+				Totalmem:     40960,
+				Count:        10,
+			},
+			requests: device.ContainerDeviceRequests{
+				"Ascend910B4": {
+					Nums:             1,
+					Type:             "Ascend910B4",
+					Memreq:           8192,
+					MemPercentagereq: 101,
+					Coresreq:         10,
+				},
+				"Ascend910B4-1": {
+					Nums:             1,
+					Type:             "Ascend910B4-1",
+					Memreq:           4096,
+					MemPercentagereq: 101,
+					Coresreq:         20,
+				},
+			},
+			// slots 1/10 + cores 20/100 + memory 4096/40960
+			expectedScore: float32(util.Weight) * 0.4,
+		},
+		{
+			name: "Vendors sharing a prefix are not mixed on the shorter vendor",
+			device: &device.DeviceUsage{
+				ID:           "npu-1",
+				Type:         "Ascend910B4",
+				DeviceVendor: "Ascend910B4",
+				Totalcore:    100,
+				Totalmem:     40960,
+				Count:        10,
+			},
+			requests: device.ContainerDeviceRequests{
+				"Ascend910B4": {
+					Nums:             1,
+					Type:             "Ascend910B4",
+					Memreq:           8192,
+					MemPercentagereq: 101,
+					Coresreq:         10,
+				},
+				"Ascend910B4-1": {
+					Nums:             1,
+					Type:             "Ascend910B4-1",
+					Memreq:           4096,
+					MemPercentagereq: 101,
+					Coresreq:         20,
+				},
+			},
+			// slots 1/10 + cores 10/100 + memory 8192/40960
+			expectedScore: float32(util.Weight) * 0.4,
+		},
+		{
+			name: "Requests of one vendor accumulate on a model named device",
+			device: &device.DeviceUsage{
+				ID:           "gpu-0",
+				Type:         "NVIDIA A100-SXM4-40GB",
+				DeviceVendor: "NVIDIA",
+				Totalcore:    100,
+				Totalmem:     40960,
+				Count:        10,
+			},
+			requests: device.ContainerDeviceRequests{
+				"container1": {
+					Nums:             1,
+					Type:             "NVIDIA",
+					Memreq:           4096,
+					MemPercentagereq: 101,
+					Coresreq:         10,
+				},
+				"container2": {
+					Nums:             1,
+					Type:             "NVIDIA",
+					Memreq:           8192,
+					MemPercentagereq: 101,
+					Coresreq:         20,
+				},
+			},
+			// slots 2/10 + cores 30/100 + memory 12288/40960
+			expectedScore: float32(util.Weight) * 0.8,
+		},
 	}
 
 	for _, tt := range tests {
@@ -446,11 +869,133 @@ func TestComputeScore(t *testing.T) {
 				Device: tt.device,
 			}
 
-			ds.ComputeScore(tt.requests)
+			ds.ComputeScore(tt.requests, util.DefaultDeviceScoringWeights())
 
 			if ds.Score != tt.expectedScore {
 				t.Errorf("ComputeScore() = %v, want %v", ds.Score, tt.expectedScore)
 			}
 		})
+	}
+}
+
+func TestComputeScoreWithResourceWeights(t *testing.T) {
+	requests := device.ContainerDeviceRequests{
+		"request": {
+			Nums:             1,
+			Type:             "type1",
+			MemPercentagereq: 40,
+			Coresreq:         0,
+		},
+	}
+	newDeviceScore := func(id string, used, usedCores, usedMemory int64) *DeviceListsScore {
+		return &DeviceListsScore{Device: &device.DeviceUsage{
+			ID: id, Type: "type1", DeviceVendor: "type1", Count: 10, Totalcore: 100, Totalmem: 100,
+			Used: used, Usedcores: usedCores, Usedmem: usedMemory,
+		}}
+	}
+
+	t.Run("default weights preserve current score", func(t *testing.T) {
+		gpuA := newDeviceScore("gpu-a", 1, 90, 10)
+		gpuB := newDeviceScore("gpu-b", 7, 10, 20)
+
+		gpuA.ComputeScore(requests, util.DefaultDeviceScoringWeights())
+		gpuB.ComputeScore(requests, util.DefaultDeviceScoringWeights())
+
+		assert.Equal(t, gpuA.Score, float32(16))
+		assert.Equal(t, gpuB.Score, float32(15))
+	})
+
+	t.Run("memory weight changes the device preference", func(t *testing.T) {
+		gpuA := newDeviceScore("gpu-a", 1, 90, 10)
+		gpuB := newDeviceScore("gpu-b", 7, 10, 20)
+		weights := util.DeviceScoringWeights{Slot: 1, Core: 1, Memory: 3}
+
+		gpuA.ComputeScore(requests, weights)
+		gpuB.ComputeScore(requests, weights)
+
+		assert.Equal(t, gpuA.Score, float32(26))
+		assert.Equal(t, gpuB.Score, float32(27))
+
+		binpack := DeviceUsageList{Policy: util.GPUSchedulerPolicyBinpack.String(), DeviceLists: []*DeviceListsScore{gpuA, gpuB}}
+		sort.Sort(binpack)
+		assert.Equal(t, binpack.DeviceLists[len(binpack.DeviceLists)-1].Device.ID, "gpu-b")
+
+		spread := DeviceUsageList{Policy: util.GPUSchedulerPolicySpread.String(), DeviceLists: []*DeviceListsScore{gpuA, gpuB}}
+		sort.Sort(spread)
+		assert.Equal(t, spread.DeviceLists[len(spread.DeviceLists)-1].Device.ID, "gpu-a")
+	})
+
+	t.Run("core weight can independently change the device preference", func(t *testing.T) {
+		gpuA := newDeviceScore("gpu-a", 1, 90, 10)
+		gpuB := newDeviceScore("gpu-b", 7, 10, 20)
+		weights := util.DeviceScoringWeights{Slot: 1, Core: 3, Memory: 1}
+
+		gpuA.ComputeScore(requests, weights)
+		gpuB.ComputeScore(requests, weights)
+
+		assert.Equal(t, gpuA.Score, float32(34))
+		assert.Equal(t, gpuB.Score, float32(17))
+
+		binpack := DeviceUsageList{Policy: util.GPUSchedulerPolicyBinpack.String(), DeviceLists: []*DeviceListsScore{gpuA, gpuB}}
+		sort.Sort(binpack)
+		assert.Equal(t, binpack.DeviceLists[len(binpack.DeviceLists)-1].Device.ID, "gpu-a")
+	})
+
+	t.Run("NUMA ordering remains independent from weighted score", func(t *testing.T) {
+		gpuA := newDeviceScore("gpu-a", 1, 90, 10)
+		gpuB := newDeviceScore("gpu-b", 7, 10, 20)
+		gpuA.Device.Numa = 0
+		gpuB.Device.Numa = 1
+		weights := util.DeviceScoringWeights{Slot: 1, Core: 1, Memory: 3}
+
+		gpuA.ComputeScore(requests, weights)
+		gpuB.ComputeScore(requests, weights)
+
+		devices := DeviceUsageList{
+			Policy:      util.GPUSchedulerPolicyBinpack.String(),
+			NumaBind:    true,
+			DeviceLists: []*DeviceListsScore{gpuA, gpuB},
+		}
+		sort.Sort(devices)
+
+		// Fit consumes the list from the end. NUMA remains the primary key
+		// when NUMA binding is requested, even though gpu-b has a higher score.
+		assert.Equal(t, devices.DeviceLists[len(devices.DeviceLists)-1].Device.ID, "gpu-a")
+	})
+}
+
+// TestLessTrimsThePolicy covers a padded policy value. IsValidGPUSchedulerPolicy
+// accepts one, and Policy is also assigned straight from --gpu-scheduler-policy,
+// so Less has to reach the same branch it would for the trimmed form. Comparing
+// the untrimmed string matched no branch and sorted as spread, inverting the
+// order a binpack annotation asked for.
+func TestLessTrimsThePolicy(t *testing.T) {
+	newList := func(policy string) DeviceUsageList {
+		return DeviceUsageList{
+			Policy: policy,
+			DeviceLists: []*DeviceListsScore{
+				{Device: &device.DeviceUsage{ID: "low", Numa: 0}, Score: 1},
+				{Device: &device.DeviceUsage{ID: "high", Numa: 0}, Score: 9},
+			},
+		}
+	}
+
+	for _, policy := range []string{"binpack", " binpack ", "\tbinpack\n"} {
+		l := newList(policy)
+		// binpack ranks the lower score first; spread does the opposite.
+		assert.Equal(t, l.Less(0, 1), true, "policy %q", policy)
+	}
+
+	for _, policy := range []string{"spread", " spread "} {
+		l := newList(policy)
+		assert.Equal(t, l.Less(0, 1), false, "policy %q", policy)
+	}
+
+	// mutex is a whole-string branch too: it orders busy devices first.
+	for _, policy := range []string{"mutex", " mutex "} {
+		l := newList(policy)
+		l.DeviceLists[0].Device.Used = 0
+		l.DeviceLists[1].Device.Used = 3
+		assert.Equal(t, l.Less(0, 1), false, "policy %q", policy)
 	}
 }

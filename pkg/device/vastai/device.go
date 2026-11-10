@@ -98,28 +98,14 @@ func (dev *VastaiDevices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) 
 }
 
 func (dev *VastaiDevices) LockNode(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 	return nodelock.LockNode(n.Name, nodelock.NodeLockKey, p)
 }
 
 func (dev *VastaiDevices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 	return nodelock.ReleaseNodeLock(n.Name, nodelock.NodeLockKey, p, false)
@@ -137,10 +123,10 @@ func (dev *VastaiDevices) checkType(annos map[string]string, d device.DeviceUsag
 }
 
 func (dev *VastaiDevices) CheckHealth(devType string, n *corev1.Node) (bool, bool) {
-	return device.CheckHealth(devType, dev.GetResourceNames().ResourceCountName, n)
+	return device.CheckHealth(devType, dev.GetResourceNames().ResourceCountName, n, n.Annotations[RegisterAnnos])
 }
 
-func (dev *VastaiDevices) GenerateResourceRequests(ctr *corev1.Container) device.ContainerDeviceRequest {
+func (dev *VastaiDevices) GenerateResourceRequests(ctr *corev1.Container) (device.ContainerDeviceRequest, error) {
 	klog.V(5).Info("Start to count vastai devices for container ", ctr.Name)
 	vastaiResourceCount := corev1.ResourceName(VastaiResourceCount)
 	v, ok := ctr.Resources.Limits[vastaiResourceCount]
@@ -149,21 +135,36 @@ func (dev *VastaiDevices) GenerateResourceRequests(ctr *corev1.Container) device
 	}
 	if ok {
 		if n, ok := v.AsInt64(); ok {
+			if n == 0 {
+				// An explicit zero count means no device is requested,
+				// not an invalid request. See the nvidia backend.
+				return device.ContainerDeviceRequest{}, nil
+			}
+			if n < 0 {
+				klog.ErrorS(nil, "vastai device count request is out of range", "container", ctr.Name, "request", n)
+				return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "vastai", Reason: fmt.Sprintf("device count %d is out of range", n)}
+			}
 			klog.Info("Found vastai devices")
 			memnum := 0
-			corenum := int32(0)
+			corenum := int64(0)
 			mempnum := 100
 
 			return device.ContainerDeviceRequest{
-				Nums:             int32(n),
+				Nums:             n,
 				Type:             VastaiDevice,
-				Memreq:           int32(memnum),
-				MemPercentagereq: int32(mempnum),
+				Memreq:           int64(memnum),
+				MemPercentagereq: int64(mempnum),
 				Coresreq:         corenum,
-			}
+			}, nil
 		}
+		// A quantity the apiserver accepts as an integer can still be too
+		// large for int64 (1Ei, 1e19). Falling through would report the
+		// container as device-less, which is the fail-open this change
+		// exists to remove.
+		klog.ErrorS(nil, "vastai device count request is not a plain integer", "container", ctr.Name, "request", v.String())
+		return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "vastai", Reason: fmt.Sprintf("device count %s is not a plain integer", v.String())}
 	}
-	return device.ContainerDeviceRequest{}
+	return device.ContainerDeviceRequest{}, nil
 }
 
 func (dev *VastaiDevices) PatchAnnotations(pod *corev1.Pod, annoinput *map[string]string, pd device.PodDevices) map[string]string {
@@ -231,10 +232,29 @@ func (va *VastaiDevices) Fit(devices []*device.DeviceUsage, request device.Conta
 	klog.InfoS("Allocating device for container request", "pod", klog.KObj(pod), "card request", k)
 	tmpDevs := make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
+	isMutex := util.PolicyContains(util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod), util.GPUSchedulerPolicyMutex)
 	dieMode := isDieMode(devices)
+	// Under mutex a physical card (AIC) is exclusive: in die mode a card is made
+	// of several dies, so if any die on a card is in use none of its sibling dies
+	// may be allocated. Precompute the set of occupied AICs up front.
+	var occupiedAIC map[string]bool
+	if isMutex && dieMode {
+		occupiedAIC = make(map[string]bool)
+		for _, d := range devices {
+			if d.Used > 0 {
+				if aic, ok := aicID(d.CustomInfo); ok {
+					occupiedAIC[aic] = true
+				}
+			}
+		}
+	}
 	for i, dev := range slices.Backward(devices) {
 		klog.V(4).InfoS("scoring pod", "pod", klog.KObj(pod), "device", dev.ID, "Memreq", k.Memreq, "MemPercentagereq", k.MemPercentagereq, "Coresreq", k.Coresreq, "Nums", k.Nums, "device index", i)
-
+		if !dev.Health {
+			reason[common.CardNotHealth]++
+			klog.V(5).InfoS(common.CardNotHealth, "pod", klog.KObj(pod), "device", dev.ID, "health", dev.Health)
+			continue
+		}
 		_, found, _ := va.checkType(pod.GetAnnotations(), *dev, k)
 		if !found {
 			reason[common.CardTypeMismatch]++
@@ -251,6 +271,20 @@ func (va *VastaiDevices) Fit(devices []*device.DeviceUsage, request device.Conta
 			reason[common.CardTimeSlicingExhausted]++
 			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used)
 			continue
+		}
+		if isMutex {
+			conflict := dev.Used > 0
+			if !conflict && dieMode {
+				// reject an idle die that sits on a physically occupied card.
+				if aic, ok := aicID(dev.CustomInfo); ok && occupiedAIC[aic] {
+					conflict = true
+				}
+			}
+			if conflict {
+				reason[common.ExclusiveDeviceAllocateConflict]++
+				klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used)
+				continue
+			}
 		}
 		if k.Nums > 0 {
 			klog.V(5).InfoS("find fit device", "pod", klog.KObj(pod), "device", dev.ID)
@@ -287,9 +321,9 @@ func (va *VastaiDevices) Fit(devices []*device.DeviceUsage, request device.Conta
 			return true, tmpDevs, ""
 		}
 	}
-	if len(tmpDevs) > 0 {
-		reason[common.AllocatedCardsInsufficientRequest] = len(tmpDevs)
-		klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(tmpDevs))
+	if len(tmpDevs[k.Type]) > 0 {
+		reason[common.AllocatedCardsInsufficientRequest] = len(tmpDevs[k.Type])
+		klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(tmpDevs[k.Type]))
 	}
 	return false, tmpDevs, common.GenReason(reason, len(devices))
 }
@@ -338,6 +372,19 @@ func (dev *VastaiDevices) computeBestCombination(reqNum int, containerDevices de
 		}
 	}
 	return result
+}
+
+// aicID returns the physical card (AIC) identifier carried in a die's CustomInfo.
+func aicID(info map[string]any) (string, bool) {
+	if info == nil {
+		return "", false
+	}
+	if v, ok := info["AIC"]; ok {
+		if id, ok := v.(string); ok {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 func isDieMode(devices []*device.DeviceUsage) bool {

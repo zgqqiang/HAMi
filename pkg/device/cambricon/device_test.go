@@ -19,15 +19,20 @@ package cambricon
 import (
 	"context"
 	"flag"
-	"strings"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
 	"github.com/Project-HAMi/HAMi/pkg/util/client"
@@ -61,9 +66,69 @@ func Test_GetNodeDevices(t *testing.T) {
 				{
 					Index:        0,
 					ID:           "test-cambricon-mlu-0",
-					Count:        int32(100),
-					Devmem:       int32(25600),
-					Devcore:      int32(100),
+					Count:        int64(100),
+					Devmem:       int64(25600),
+					Devcore:      int64(100),
+					Type:         CambriconMLUDevice,
+					Numa:         0,
+					Health:       true,
+					DeviceVendor: CambriconMLUCommonWord,
+				},
+			},
+		},
+		{
+			name: "device plugin model label supplies the real MLU model",
+			args: corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+					Labels: map[string]string{
+						MLUModelLabel: "MLU370-X4",
+					},
+				},
+				Status: corev1.NodeStatus{
+					Capacity: corev1.ResourceList{
+						"cambricon.com/mlu.smlu.vcore":   *resource.NewQuantity(1, resource.DecimalSI),
+						"cambricon.com/mlu.smlu.vmemory": *resource.NewQuantity(1, resource.DecimalSI),
+					},
+				},
+			},
+			want: []*device.DeviceInfo{
+				{
+					Index:        0,
+					ID:           "test-cambricon-mlu-0",
+					Count:        int64(100),
+					Devmem:       int64(25600),
+					Devcore:      int64(100),
+					Type:         "MLU370-X4",
+					Numa:         0,
+					Health:       true,
+					DeviceVendor: CambriconMLUCommonWord,
+				},
+			},
+		},
+		{
+			name: "model label without MLU keeps the device schedulable",
+			args: corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test",
+					Labels: map[string]string{
+						MLUModelLabel: "370-X4",
+					},
+				},
+				Status: corev1.NodeStatus{
+					Capacity: corev1.ResourceList{
+						"cambricon.com/mlu.smlu.vcore":   *resource.NewQuantity(1, resource.DecimalSI),
+						"cambricon.com/mlu.smlu.vmemory": *resource.NewQuantity(1, resource.DecimalSI),
+					},
+				},
+			},
+			want: []*device.DeviceInfo{
+				{
+					Index:        0,
+					ID:           "test-cambricon-mlu-0",
+					Count:        int64(100),
+					Devmem:       int64(25600),
+					Devcore:      int64(100),
 					Type:         CambriconMLUDevice,
 					Numa:         0,
 					Health:       true,
@@ -77,13 +142,66 @@ func Test_GetNodeDevices(t *testing.T) {
 			dev := CambriconDevices{}
 			result, err := dev.GetNodeDevices(test.args)
 			if err != nil {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 			}
 			for k, v := range test.want {
 				assert.Equal(t, v, result[k])
 			}
 		})
 	}
+}
+
+func Test_CheckHealth(t *testing.T) {
+	InitMLUDevice(CambriconConfig{
+		ResourceMemoryName: "cambricon.com/mlu.smlu.vmemory",
+		ResourceCoreName:   "cambricon.com/mlu.smlu.vcore",
+	})
+	dev := &CambriconDevices{}
+
+	node := func(name string, allocatableCores, capacityCores, memory int64, model string) *corev1.Node {
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{}},
+			Status: corev1.NodeStatus{
+				Allocatable: corev1.ResourceList{},
+				Capacity:    corev1.ResourceList{},
+			},
+		}
+		if model != "" {
+			n.Labels[MLUModelLabel] = model
+		}
+		if allocatableCores > 0 {
+			n.Status.Allocatable[corev1.ResourceName(MLUResourceCores)] = *resource.NewQuantity(allocatableCores, resource.DecimalSI)
+		}
+		if capacityCores > 0 {
+			n.Status.Capacity[corev1.ResourceName(MLUResourceCores)] = *resource.NewQuantity(capacityCores, resource.DecimalSI)
+		}
+		if memory > 0 {
+			n.Status.Capacity[corev1.ResourceName(MLUResourceMemory)] = *resource.NewQuantity(memory, resource.DecimalSI)
+		}
+		return n
+	}
+
+	healthy, needUpdate := dev.CheckHealth(CambriconMLUCommonWord, node("mlu-health-absent", 0, 200, 1024, ""))
+	assert.False(t, healthy)
+	assert.False(t, needUpdate)
+
+	present := node("mlu-health-present", 100, 100, 1024, "MLU370-X4")
+	healthy, needUpdate = dev.CheckHealth(CambriconMLUCommonWord, present)
+	assert.True(t, healthy)
+	assert.True(t, needUpdate)
+	healthy, needUpdate = dev.CheckHealth(CambriconMLUCommonWord, present)
+	assert.True(t, healthy)
+	assert.False(t, needUpdate)
+
+	relabelled := node("mlu-health-present", 100, 100, 1024, "MLU370-X8")
+	healthy, needUpdate = dev.CheckHealth(CambriconMLUCommonWord, relabelled)
+	assert.True(t, healthy)
+	assert.True(t, needUpdate)
+
+	grown := node("mlu-health-present", 200, 200, 1024, "MLU370-X8")
+	healthy, needUpdate = dev.CheckHealth(CambriconMLUCommonWord, grown)
+	assert.True(t, healthy)
+	assert.True(t, needUpdate)
 }
 
 func Test_MutateAdmission(t *testing.T) {
@@ -125,7 +243,7 @@ func Test_MutateAdmission(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			dev := CambriconDevices{}
 			result, _ := dev.MutateAdmission(&test.args.ctr, &test.args.pod)
-			assert.Equal(t, result, test.want)
+			assert.Equal(t, test.want, result)
 		})
 	}
 }
@@ -191,6 +309,160 @@ func Test_checkType(t *testing.T) {
 			want1: false,
 			want2: false,
 		},
+		{
+			name: "use-mlutype allows the listed model",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUInUse: "MLU370"},
+				d:     device.DeviceUsage{Type: "MLU370-X4"},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: true,
+		},
+		{
+			name: "use-mlutype rejects a non-listed model",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUInUse: "MLU590"},
+				d:     device.DeviceUsage{Type: "MLU370-X4"},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: false,
+		},
+		{
+			name: "nouse-mlutype excludes the listed model",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUNoUse: "MLU370"},
+				d:     device.DeviceUsage{Type: "MLU370-X4"},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: false,
+		},
+		{
+			name: "nouse-mlutype ignores a non-listed model",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUNoUse: "MLU590"},
+				d:     device.DeviceUsage{Type: "MLU370-X4"},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: true,
+		},
+		{
+			name: "empty use-mlutype does not block scheduling",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUInUse: ""},
+				d:     device.DeviceUsage{Type: "MLU370-X4"},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: true,
+		},
+		{
+			name: "whitespace nouse-mlutype does not block scheduling",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUNoUse: "   "},
+				d:     device.DeviceUsage{Type: "MLU370-X4"},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: true,
+		},
+		{
+			name: "comma-separated use-mlutype matches one entry",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUInUse: "MLU290,MLU370"},
+				d:     device.DeviceUsage{Type: "MLU370-X4"},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: true,
+		},
+		{
+			name: "comma-separated use-mlutype matches no entry",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUInUse: "MLU290,MLU590"},
+				d:     device.DeviceUsage{Type: "MLU370-X4"},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: false,
+		},
+		{
+			name: "missing model annotations keep default behavior",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{},
+				d:     device.DeviceUsage{Type: "MLU370-X4"},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: true,
+		},
+		{
+			name: "use-mlutype rejects a device whose model is unknown",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUInUse: "MLU370"},
+				d:     device.DeviceUsage{Type: CambriconMLUDevice},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: false,
+		},
+		{
+			name: "nouse-mlutype rejects a device whose model is unknown",
+			args: struct {
+				annos map[string]string
+				d     device.DeviceUsage
+				n     device.ContainerDeviceRequest
+			}{
+				annos: map[string]string{MLUNoUse: "MLU370"},
+				d:     device.DeviceUsage{Type: CambriconMLUDevice},
+				n:     device.ContainerDeviceRequest{Type: CambriconMLUDevice},
+			},
+			want1: true,
+			want2: false,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -203,9 +475,11 @@ func Test_checkType(t *testing.T) {
 
 func Test_GenerateResourceRequests(t *testing.T) {
 	tests := []struct {
-		name string
-		args corev1.Container
-		want device.ContainerDeviceRequest
+		name        string
+		args        corev1.Container
+		want        device.ContainerDeviceRequest
+		wantErr     bool
+		errContains string
 	}{
 		{
 			name: "don't set to limits and request",
@@ -236,11 +510,49 @@ func Test_GenerateResourceRequests(t *testing.T) {
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(1),
+				Nums:             int64(1),
 				Type:             CambriconMLUDevice,
-				Memreq:           int32(256000),
-				MemPercentagereq: int32(0),
-				Coresreq:         int32(2),
+				Memreq:           int64(256000),
+				MemPercentagereq: int64(0),
+				Coresreq:         int64(2),
+			},
+		},
+		{
+			name: "a count above 1 takes whole MLUs and keeps the declared memory in the request",
+			args: corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"cambricon.com/mlu":              resource.MustParse("2"),
+						"cambricon.com/mlu.smlu.vmemory": resource.MustParse("1000"),
+						"cambricon.com/mlu.smlu.vcore":   resource.MustParse("2"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(2),
+				Type:             CambriconMLUDevice,
+				Memreq:           int64(256000),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(100),
+			},
+		},
+		{
+			name: "a count above 1 ignores memory and core values even out of range",
+			args: corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"cambricon.com/mlu":              resource.MustParse("2"),
+						"cambricon.com/mlu.smlu.vmemory": resource.MustParse("36028797018963968"),
+						"cambricon.com/mlu.smlu.vcore":   resource.MustParse("101"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(2),
+				Type:             CambriconMLUDevice,
+				Memreq:           int64(0),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(100),
 			},
 		},
 		{
@@ -258,11 +570,11 @@ func Test_GenerateResourceRequests(t *testing.T) {
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(1),
+				Nums:             int64(1),
 				Type:             CambriconMLUDevice,
-				Memreq:           int32(256000),
-				MemPercentagereq: int32(0),
-				Coresreq:         int32(100),
+				Memreq:           int64(256000),
+				MemPercentagereq: int64(0),
+				Coresreq:         int64(100),
 			},
 		},
 		{
@@ -280,11 +592,93 @@ func Test_GenerateResourceRequests(t *testing.T) {
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(1),
+				Nums:             int64(1),
 				Type:             CambriconMLUDevice,
-				Memreq:           int32(0),
-				MemPercentagereq: int32(100),
-				Coresreq:         int32(2),
+				Memreq:           int64(0),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(2),
+			},
+		},
+		{
+			name: "zero count is device-less, not invalid",
+			args: corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"cambricon.com/mlu": resource.MustParse("0"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "negative count must be rejected",
+			args: corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"cambricon.com/mlu": resource.MustParse("-1"),
+					},
+				},
+			},
+			want:        device.ContainerDeviceRequest{},
+			wantErr:     true,
+			errContains: "out of range",
+		},
+		{
+			name: "max int64 count is accepted",
+			args: corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"cambricon.com/mlu": resource.MustParse("2147483647"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             2147483647,
+				Type:             CambriconMLUDevice,
+				Memreq:           0,
+				MemPercentagereq: 100,
+				Coresreq:         100,
+			},
+		},
+		{
+			name: "zero count is device-less, not invalid",
+			args: corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"cambricon.com/mlu": resource.MustParse("0"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "negative count must be rejected",
+			args: corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"cambricon.com/mlu": resource.MustParse("-1"),
+					},
+				},
+			},
+			want:        device.ContainerDeviceRequest{},
+			wantErr:     true,
+			errContains: "out of range",
+		},
+		{
+			name: "max int64 count is accepted",
+			args: corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"cambricon.com/mlu": resource.MustParse("2147483647"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             2147483647,
+				Type:             CambriconMLUDevice,
+				Memreq:           0,
+				MemPercentagereq: 100,
+				Coresreq:         100,
 			},
 		},
 	}
@@ -297,8 +691,13 @@ func Test_GenerateResourceRequests(t *testing.T) {
 			}
 			InitMLUDevice(config)
 			dev := CambriconDevices{}
-			result := dev.GenerateResourceRequests(&test.args)
+			result, err := dev.GenerateResourceRequests(&test.args)
 			assert.Equal(t, test.want, result)
+			if test.wantErr {
+				assert.ErrorContains(t, err, test.errContains)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }
@@ -351,12 +750,42 @@ func Test_PatchAnnotations(t *testing.T) {
 			},
 			want: map[string]string{},
 		},
+		{
+			// First container has no MLU (padded empty), real device in the second; used to panic on devlist[0][0].
+			name: "leading container without device",
+			args: struct {
+				annoinput map[string]string
+				pd        device.PodDevices
+			}{
+				annoinput: map[string]string{},
+				pd: device.PodDevices{
+					CambriconMLUDevice: device.PodSingleDevice{
+						[]device.ContainerDevice{},
+						[]device.ContainerDevice{
+							{
+								Idx:       0,
+								UUID:      "device-0",
+								Type:      "MLU",
+								Usedcores: 1,
+								Usedmem:   256000,
+							},
+						},
+					},
+				},
+			},
+			want: map[string]string{
+				"CAMBRICON_DSMLU_ASSIGNED":                  "false",
+				"CAMBRICON_DSMLU_PROFILE":                   "0_1_1000",
+				"hami.io/cambricon-mlu-devices-to-allocate": ";device-0,MLU,256000,1:;",
+				"hami.io/cambricon-mlu-devices-allocated":   ";device-0,MLU,256000,1:;",
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			dev := CambriconDevices{}
 			result := dev.PatchAnnotations(&corev1.Pod{}, &test.args.annoinput, test.args.pd)
-			assert.Equal(t, len(test.want), len(result), "Expected length of result to match want")
+			assert.Len(t, result, len(test.want), "Expected length of result to match want")
 			for k, v := range test.want {
 				assert.Equal(t, v, result[k], "pod add annotation key [%s], values is [%s]", k, result[k])
 			}
@@ -365,76 +794,39 @@ func Test_PatchAnnotations(t *testing.T) {
 }
 
 func Test_setNodeLock(t *testing.T) {
-	tests := []struct {
-		name      string
-		node      corev1.Node
-		expectErr bool
-		expectMsg string
-	}{
-		{
-			name: "node is locked",
-			node: corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "node-01",
-					Annotations: map[string]string{
-						"cambricon.com/dsmlu.lock": "test123",
-					},
-				},
-			},
-			expectErr: true,
-			expectMsg: "node node-01 is locked",
-		},
-		{
-			name: "set node lock",
-			node: corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:        "node-02",
-					Annotations: map[string]string{},
-				},
-			},
-			expectErr: false,
+	client.KubeClient = fake.NewClientset()
+	k8sClient := client.GetClient()
+	if k8sClient == nil {
+		t.Skip("no k8s client available")
+	}
+
+	node := corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "node-set-lock",
+			Annotations: map[string]string{},
 		},
 	}
 
-	client.KubeClient = fake.NewClientset()
-	k8sClient := client.GetClient()
-	if k8sClient != nil {
+	ctx := context.Background()
+	_, err := k8sClient.CoreV1().Nodes().Create(ctx, &node, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer k8sClient.CoreV1().Nodes().Delete(ctx, node.Name, metav1.DeleteOptions{})
 
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				ctx := context.Background()
+	dev := CambriconDevices{}
+	err = dev.setNodeLock(&node)
+	if err != nil {
+		t.Errorf("did not expect error but got %v", err)
+	}
 
-				defer func() {
-					if tt.node.Name != "" {
-						// Delete the node to clean up
-						err := k8sClient.CoreV1().Nodes().Delete(ctx, tt.node.Name, metav1.DeleteOptions{})
-						if err != nil {
-							t.Errorf("failed to delete node %s: %v", tt.node.Name, err)
-						}
-					}
-				}()
-
-				_, err := k8sClient.CoreV1().Nodes().Create(ctx, &tt.node, metav1.CreateOptions{})
-				if err != nil {
-					t.Fatalf("failed to create node %s: %v", tt.node.Name, err)
-				}
-
-				dev := CambriconDevices{}
-				err = dev.setNodeLock(&tt.node)
-
-				if tt.expectErr {
-					if err == nil {
-						t.Errorf("expected error but got none")
-					} else if !strings.Contains(err.Error(), tt.expectMsg) {
-						t.Errorf("expected error to contain '%s' but got '%s'", tt.expectMsg, err.Error())
-					}
-				} else {
-					if err != nil {
-						t.Errorf("did not expect error but got %v", err)
-					}
-				}
-			})
-		}
+	// Verify the annotation was set on the apiserver.
+	fetchedNode, err := k8sClient.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to fetch node: %v", err)
+	}
+	if _, ok := fetchedNode.Annotations[DsmluLockTime]; !ok {
+		t.Error("Expected node to be locked but it wasn't")
 	}
 }
 
@@ -559,55 +951,226 @@ func Test_LockNode(t *testing.T) {
 }
 
 func Test_ReleaseNodeLock(t *testing.T) {
+	clientset := fake.NewClientset()
+	client.KubeClient = clientset
+	ctx := context.Background()
+
 	tests := []struct {
-		name string
-		args struct {
-			node corev1.Node
-			pod  corev1.Pod
-		}
-		err error
+		name              string
+		nodeName          string
+		annotations       map[string]string
+		callerAnnotations map[string]string
+		skipCreate        bool
+		wantErr           bool
 	}{
 		{
-			name: "no annation",
-			args: struct {
-				node corev1.Node
-				pod  corev1.Pod
-			}{
-				node: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "node-01",
-					},
-				},
-				pod: corev1.Pod{},
-			},
-			err: nil,
+			name:        "no annotation — lock not present",
+			nodeName:    "node-rel-01",
+			annotations: nil,
+			wantErr:     false,
 		},
 		{
-			name: "annation no lock value",
-			args: struct {
-				node corev1.Node
-				pod  corev1.Pod
-			}{
-				node: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "node-02",
-						Annotations: map[string]string{
-							"test": "test123",
-						},
-					},
-				},
-				pod: corev1.Pod{},
+			name:     "annotation without lock key",
+			nodeName: "node-rel-02",
+			annotations: map[string]string{
+				"test": "test123",
 			},
-			err: nil,
+			wantErr: false,
+		},
+		{
+			name:     "lock present — successfully released",
+			nodeName: "node-rel-03",
+			annotations: map[string]string{
+				DsmluLockTime: time.Now().Format(time.RFC3339),
+			},
+			wantErr: false,
+		},
+		{
+			name:     "stale caller — lock on server but not on caller node",
+			nodeName: "node-rel-04",
+			annotations: map[string]string{
+				DsmluLockTime: time.Now().Format(time.RFC3339),
+			},
+			callerAnnotations: map[string]string{},
+			wantErr:           false,
+		},
+		{
+			name:       "node not found",
+			nodeName:   "node-rel-nonexistent",
+			skipCreate: true,
+			wantErr:    true,
 		},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !tt.skipCreate {
+				node := &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        tt.nodeName,
+						Annotations: tt.annotations,
+					},
+				}
+				_, err := clientset.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+				if err != nil {
+					t.Fatalf("failed to create node %s: %v", tt.nodeName, err)
+				}
+				defer clientset.CoreV1().Nodes().Delete(ctx, tt.nodeName, metav1.DeleteOptions{})
+			}
+
+			callerNode := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: tt.nodeName,
+				},
+			}
+			if tt.callerAnnotations != nil {
+				callerNode.Annotations = tt.callerAnnotations
+			} else if tt.annotations != nil {
+				callerNode.Annotations = tt.annotations
+			}
+
 			dev := CambriconDevices{}
-			result := dev.ReleaseNodeLock(&test.args.node, &test.args.pod)
-			assert.Equal(t, test.err, result)
+			err := dev.ReleaseNodeLock(callerNode, &corev1.Pod{})
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ReleaseNodeLock() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			if !tt.wantErr && !tt.skipCreate && tt.annotations != nil {
+				if _, ok := tt.annotations[DsmluLockTime]; ok {
+					fetched, ferr := clientset.CoreV1().Nodes().Get(ctx, tt.nodeName, metav1.GetOptions{})
+					if ferr != nil {
+						t.Fatalf("failed to fetch node: %v", ferr)
+					}
+					if _, ok := fetched.Annotations[DsmluLockTime]; ok {
+						t.Error("Expected lock annotation to be removed but it's still present")
+					}
+				}
+			}
 		})
 	}
+
+	// Retry/conflict tests using PrependReactor.
+	t.Run("patch error — retry succeeds", func(t *testing.T) {
+		cs := fake.NewClientset()
+		client.KubeClient = cs
+
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "node-retry-01",
+				Annotations: map[string]string{
+					DsmluLockTime: time.Now().Format(time.RFC3339),
+				},
+			},
+		}
+		_, err := cs.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("failed to create node: %v", err)
+		}
+		defer cs.CoreV1().Nodes().Delete(ctx, "node-retry-01", metav1.DeleteOptions{})
+
+		patchFailCount := 0
+		cs.PrependReactor("patch", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			patchFailCount++
+			if patchFailCount <= 2 {
+				return true, nil, apierrors.NewInternalError(fmt.Errorf("patch error"))
+			}
+			return false, nil, nil
+		})
+
+		dev := CambriconDevices{}
+		err = dev.ReleaseNodeLock(node, &corev1.Pod{})
+		if err != nil {
+			t.Errorf("ReleaseNodeLock() unexpected error: %v", err)
+		}
+		if patchFailCount < 2 {
+			t.Errorf("expected at least 2 patch errors before success, got %d", patchFailCount)
+		}
+
+		fetched, _ := cs.CoreV1().Nodes().Get(ctx, "node-retry-01", metav1.GetOptions{})
+		if _, ok := fetched.Annotations[DsmluLockTime]; ok {
+			t.Error("Expected lock annotation to be removed after retries")
+		}
+	})
+
+	t.Run("lock already removed during retry", func(t *testing.T) {
+		cs := fake.NewClientset()
+		client.KubeClient = cs
+
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "node-retry-02",
+				Annotations: map[string]string{
+					DsmluLockTime: time.Now().Format(time.RFC3339),
+				},
+			},
+		}
+		_, err := cs.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("failed to create node: %v", err)
+		}
+		defer cs.CoreV1().Nodes().Delete(ctx, "node-retry-02", metav1.DeleteOptions{})
+
+		cs.PrependReactor("patch", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(fmt.Errorf("patch error"))
+		})
+
+		getCount := 0
+		cs.PrependReactor("get", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			getCount++
+			if getCount == 2 {
+				return true, &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        "node-retry-02",
+						Annotations: map[string]string{},
+					},
+				}, nil
+			}
+			return false, nil, nil
+		})
+
+		dev := CambriconDevices{}
+		err = dev.ReleaseNodeLock(node, &corev1.Pod{})
+		if err != nil {
+			t.Errorf("ReleaseNodeLock() unexpected error: %v", err)
+		}
+	})
+
+	t.Run("re-get fails during retry", func(t *testing.T) {
+		cs := fake.NewClientset()
+		client.KubeClient = cs
+
+		node := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "node-retry-03",
+				Annotations: map[string]string{
+					DsmluLockTime: time.Now().Format(time.RFC3339),
+				},
+			},
+		}
+		_, err := cs.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("failed to create node: %v", err)
+		}
+		defer cs.CoreV1().Nodes().Delete(ctx, "node-retry-03", metav1.DeleteOptions{})
+
+		cs.PrependReactor("patch", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(fmt.Errorf("patch error"))
+		})
+		getCount := 0
+		cs.PrependReactor("get", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			getCount++
+			if getCount == 2 {
+				return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "nodes"}, "node-retry-03")
+			}
+			return false, nil, nil
+		})
+
+		dev := CambriconDevices{}
+		err = dev.ReleaseNodeLock(node, &corev1.Pod{})
+		if err == nil {
+			t.Error("ReleaseNodeLock() expected error but got nil")
+		}
+	})
 }
 
 func TestDevices_Fit(t *testing.T) {
@@ -840,7 +1403,7 @@ func TestDevices_Fit(t *testing.T) {
 			wantReason: "1/1 CardTimeSlicingExhausted",
 		},
 		{
-			name: "fit success: but core limit can't exceed 100",
+			name: "fit fail: core limit out of range",
 			devices: []*device.DeviceUsage{{
 				ID:        "dev-0",
 				Index:     0,
@@ -862,10 +1425,10 @@ func TestDevices_Fit(t *testing.T) {
 				Type:             CambriconMLUDevice,
 			},
 			annos:      map[string]string{},
-			wantFit:    true,
-			wantLen:    1,
-			wantDevIDs: []string{"dev-0"},
-			wantReason: "",
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "core limit out of range",
 		},
 		{
 			name: "fit fail:  card exclusively",
@@ -947,7 +1510,7 @@ func TestDevices_Fit(t *testing.T) {
 			},
 			annos:      map[string]string{},
 			wantFit:    false,
-			wantLen:    0,
+			wantLen:    1,
 			wantDevIDs: []string{},
 			wantReason: "1/1 AllocatedCardsInsufficientRequest",
 		},
@@ -979,6 +1542,219 @@ func TestDevices_Fit(t *testing.T) {
 			wantDevIDs: []string{"dev-0"},
 			wantReason: "",
 		},
+		{
+			name: "mutex policy rejects used device",
+			devices: []*device.DeviceUsage{
+				{
+					ID:        "dev-0",
+					Index:     0,
+					Used:      1,
+					Count:     100,
+					Usedmem:   0,
+					Totalmem:  128,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      CambriconMLUDevice,
+					Health:    true,
+				},
+			},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           64,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+				Type:             CambriconMLUDevice,
+			},
+			annos:      map[string]string{"hami.io/gpu-scheduler-policy": "mutex"},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 ExclusiveDeviceAllocateConflict",
+		},
+		{
+			name: "fit fail: partial allocation AllocatedCardsInsufficientRequest for multiple cards",
+			devices: []*device.DeviceUsage{
+				{
+					ID:        "dev-0",
+					Index:     0,
+					Used:      0,
+					Count:     100,
+					Usedmem:   0,
+					Totalmem:  1280,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      CambriconMLUDevice,
+					Health:    true,
+				},
+				{
+					ID:        "dev-1",
+					Index:     1,
+					Used:      0,
+					Count:     100,
+					Usedmem:   0,
+					Totalmem:  1280,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      CambriconMLUDevice,
+					Health:    true,
+				},
+			},
+			request: device.ContainerDeviceRequest{
+				Nums:             3,
+				Memreq:           512,
+				MemPercentagereq: 0,
+				Coresreq:         20,
+				Type:             CambriconMLUDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    2,
+			wantDevIDs: []string{},
+			wantReason: "2/2 AllocatedCardsInsufficientRequest",
+		},
+		{
+			name: "fit fail: CardNotHealth",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     100,
+				Usedmem:   0,
+				Totalmem:  128,
+				Totalcore: 100,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      CambriconMLUDevice,
+				Health:    false,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           64,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+				Type:             CambriconMLUDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardNotHealth",
+		},
+		{
+			name: "model-aware fit: use-mlutype selects the matching model",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     100,
+				Usedmem:   0,
+				Totalmem:  128,
+				Totalcore: 100,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      "MLU370-X4",
+				Health:    true,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           64,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+				Type:             CambriconMLUDevice,
+			},
+			annos:      map[string]string{MLUInUse: "MLU370"},
+			wantFit:    true,
+			wantLen:    1,
+			wantDevIDs: []string{"dev-0"},
+			wantReason: "",
+		},
+		{
+			name: "model-aware fit fail: use-mlutype excludes a non-listed model",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     100,
+				Usedmem:   0,
+				Totalmem:  128,
+				Totalcore: 100,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      "MLU370-X4",
+				Health:    true,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           64,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+				Type:             CambriconMLUDevice,
+			},
+			annos:      map[string]string{MLUInUse: "MLU590"},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardTypeMismatch",
+		},
+		{
+			name: "model-aware fit fail: nouse-mlutype excludes the listed model",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     100,
+				Usedmem:   0,
+				Totalmem:  128,
+				Totalcore: 100,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      "MLU370-X4",
+				Health:    true,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           64,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+				Type:             CambriconMLUDevice,
+			},
+			annos:      map[string]string{MLUNoUse: "MLU370"},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardTypeMismatch",
+		},
+		{
+			name: "model-aware fit: empty use-mlutype does not block scheduling",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     100,
+				Usedmem:   0,
+				Totalmem:  128,
+				Totalcore: 100,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      "MLU370-X4",
+				Health:    true,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           64,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+				Type:             CambriconMLUDevice,
+			},
+			annos:      map[string]string{MLUInUse: ""},
+			wantFit:    true,
+			wantLen:    1,
+			wantDevIDs: []string{"dev-0"},
+			wantReason: "",
+		},
 	}
 
 	for _, test := range tests {
@@ -993,10 +1769,10 @@ func TestDevices_Fit(t *testing.T) {
 			if fit != test.wantFit {
 				t.Errorf("Fit: got %v, want %v", fit, test.wantFit)
 			}
+			if len(result[CambriconMLUDevice]) != test.wantLen {
+				t.Errorf("expected len: %d, got len %d", test.wantLen, len(result[CambriconMLUDevice]))
+			}
 			if test.wantFit {
-				if len(result[CambriconMLUDevice]) != test.wantLen {
-					t.Errorf("expected len: %d, got len %d", test.wantLen, len(result[CambriconMLUDevice]))
-				}
 				for idx, id := range test.wantDevIDs {
 					if id != result[CambriconMLUDevice][idx].UUID {
 						t.Errorf("expected device id: %s, got device id %s", id, result[CambriconMLUDevice][idx].UUID)
@@ -1008,6 +1784,157 @@ func TestDevices_Fit(t *testing.T) {
 				t.Errorf("expected reason: %s, got reason: %s", test.wantReason, reason)
 			}
 		})
+	}
+}
+
+// TestDevices_Fit_ResourceQuotaWholeCardRequest reproduces
+// https://github.com/Project-HAMi/HAMi/issues/2468: a pod that omits the
+// memory resource (which resolves to a MemPercentagereq of 100, i.e. a whole
+// card) carried a Memreq of 0, and Fit only checked device capacity, never
+// the namespace ResourceQuota. That let a single pod consume an entire card's
+// worth of quota while never being charged against it, so the ResourceQuota
+// was left permanently unusable for every other pod in the namespace. This
+// asserts Fit now denies the same request once it is resolved against the
+// quota, matching how a request carrying an equivalent explicit Memreq
+// already behaved.
+func TestDevices_Fit_ResourceQuotaWholeCardRequest(t *testing.T) {
+	config := CambriconConfig{
+		ResourceCountName:  "cambricon.com/mlu",
+		ResourceMemoryName: "cambricon.com/mlu.smlu.vmemory",
+		ResourceCoreName:   "cambricon.com/mlu.smlu.vcore",
+	}
+	dev := InitMLUDevice(config)
+	device.DevicesMap = map[string]device.Devices{CambriconMLUDevice: dev}
+
+	ns := "cambricon-quota-test-ns"
+	qm := device.NewQuotaManager()
+	qm.AddQuota(&corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "mlu-quota", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits.cambricon.com/mlu.smlu.vmemory"): resource.MustParse("50"),
+			},
+		},
+	})
+	t.Cleanup(func() {
+		qm.DelQuota(&corev1.ResourceQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "mlu-quota", Namespace: ns},
+			Spec: corev1.ResourceQuotaSpec{
+				Hard: corev1.ResourceList{
+					corev1.ResourceName("limits.cambricon.com/mlu.smlu.vmemory"): resource.MustParse("50"),
+				},
+			},
+		})
+	})
+
+	devices := []*device.DeviceUsage{{
+		ID:        "dev-0",
+		Index:     0,
+		Used:      0,
+		Count:     100,
+		Usedmem:   0,
+		Totalmem:  40960,
+		Totalcore: 100,
+		Usedcores: 0,
+		Numa:      0,
+		Type:      CambriconMLUDevice,
+		Health:    true,
+	}}
+	// No Memreq set: this is what GenerateResourceRequests returns for a pod
+	// that omits the memory field entirely, i.e. an implicit whole-card ask.
+	request := device.ContainerDeviceRequest{
+		Nums:             1,
+		Memreq:           0,
+		MemPercentagereq: 100,
+		Coresreq:         10,
+		Type:             CambriconMLUDevice,
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns}}
+
+	fit, _, reason := dev.Fit(devices, request, pod, &device.NodeInfo{}, &device.PodDevices{})
+	if fit {
+		t.Errorf("expected whole-card request exceeding the namespace's ResourceQuota to be denied, but Fit admitted it (reason=%q)", reason)
+	}
+	if reason != "1/1 ResourceQuotaNotFit" {
+		t.Errorf("expected reason %q, got %q", "1/1 ResourceQuotaNotFit", reason)
+	}
+}
+
+// A count above 1 allocates whole MLUs, so a declared memory below the card
+// size must not shrink what the allocation records as used.
+func TestDevices_Fit_MultiMLUAllocatesWholeCards(t *testing.T) {
+	dev := InitMLUDevice(CambriconConfig{
+		ResourceCountName:  "cambricon.com/mlu",
+		ResourceMemoryName: "cambricon.com/mlu.smlu.vmemory",
+		ResourceCoreName:   "cambricon.com/mlu.smlu.vcore",
+	})
+	device.DevicesMap = map[string]device.Devices{CambriconMLUDevice: dev}
+
+	devices := []*device.DeviceUsage{}
+	for i := range 2 {
+		devices = append(devices, &device.DeviceUsage{
+			ID: fmt.Sprintf("dev-%d", i), Index: uint(i), Count: 100,
+			Totalmem: 40960, Totalcore: 100, Type: CambriconMLUDevice, Health: true,
+		})
+	}
+	request := device.ContainerDeviceRequest{
+		Nums: 2, Type: CambriconMLUDevice, Memreq: 256000 / 100, MemPercentagereq: 100, Coresreq: 100,
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default"}}
+
+	fit, result, reason := dev.Fit(devices, request, pod, &device.NodeInfo{}, &device.PodDevices{})
+	if !fit {
+		t.Fatalf("expected the request to fit, got reason %q", reason)
+	}
+	for _, d := range result[CambriconMLUDevice] {
+		if d.Usedmem != 40960 {
+			t.Errorf("device %s Usedmem = %d, want the whole card 40960", d.UUID, d.Usedmem)
+		}
+	}
+}
+
+// A count above 1 takes whole MLUs, so a declared memory that fits the quota
+// must not admit a request whose whole cards exceed it.
+func TestDevices_Fit_MultiMLUQuotaCountsWholeCards(t *testing.T) {
+	dev := InitMLUDevice(CambriconConfig{
+		ResourceCountName:  "cambricon.com/mlu",
+		ResourceMemoryName: "cambricon.com/mlu.smlu.vmemory",
+		ResourceCoreName:   "cambricon.com/mlu.smlu.vcore",
+	})
+	device.DevicesMap = map[string]device.Devices{CambriconMLUDevice: dev}
+
+	ns := "cambricon-multi-quota-ns"
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "mlu-quota", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits.cambricon.com/mlu.smlu.vmemory"): resource.MustParse("50"),
+			},
+		},
+	}
+	qm := device.NewQuotaManager()
+	qm.AddQuota(quota)
+	t.Cleanup(func() { qm.DelQuota(quota) })
+
+	devices := []*device.DeviceUsage{}
+	for i := range 2 {
+		devices = append(devices, &device.DeviceUsage{
+			ID: fmt.Sprintf("dev-%d", i), Index: uint(i), Count: 100,
+			Totalmem: 40960, Totalcore: 100, Type: CambriconMLUDevice, Health: true,
+		})
+	}
+	request := device.ContainerDeviceRequest{
+		Nums: 2, Memreq: 10, MemPercentagereq: 101, Coresreq: 100, Type: CambriconMLUDevice,
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns}}
+
+	fit, result, reason := dev.Fit(devices, request, pod, &device.NodeInfo{}, &device.PodDevices{})
+	if fit {
+		t.Errorf("expected whole MLUs exceeding the namespace's ResourceQuota to be denied, but Fit admitted it (reason=%q)", reason)
+	}
+	// Every card is over quota on its own; none may be taken on the declared memory.
+	if got := len(result[CambriconMLUDevice]); got != 0 {
+		t.Errorf("expected no MLU to pass the quota check, got %d (reason=%q)", got, reason)
 	}
 }
 
@@ -1060,4 +1987,179 @@ func TestDevices_AddResourceUsage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_GenerateResourceRequests_CoresValidation(t *testing.T) {
+	dev := &CambriconDevices{}
+	fs := flag.FlagSet{}
+	ParseConfig(&fs)
+
+	tests := []struct {
+		name    string
+		cores   int64
+		wantReq bool
+	}{
+		{
+			name:    "cores 0 accepted",
+			cores:   0,
+			wantReq: true,
+		},
+		{
+			name:    "cores 50 accepted",
+			cores:   50,
+			wantReq: true,
+		},
+		{
+			name:    "cores 100 accepted",
+			cores:   100,
+			wantReq: true,
+		},
+		{
+			name:    "cores 101 rejected",
+			cores:   101,
+			wantReq: false,
+		},
+		{
+			name:    "cores 150 rejected",
+			cores:   150,
+			wantReq: false,
+		},
+		{
+			name:    "cores 200 rejected",
+			cores:   200,
+			wantReq: false,
+		},
+		{
+			name:    "negative cores -1 rejected",
+			cores:   -1,
+			wantReq: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctr := &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceName(MLUResourceCount):  resource.MustParse("1"),
+						corev1.ResourceName(MLUResourceCores):  *resource.NewQuantity(tt.cores, resource.DecimalSI),
+						corev1.ResourceName(MLUResourceMemory): resource.MustParse("1000"),
+					},
+				},
+			}
+			req, _ := dev.GenerateResourceRequests(ctr)
+			if tt.wantReq {
+				assert.Equal(t, int64(1), req.Nums)
+				assert.Equal(t, tt.cores, req.Coresreq)
+			} else {
+				assert.Equal(t, int64(0), req.Nums)
+			}
+		})
+	}
+}
+
+func TestFit_CoresValidation(t *testing.T) {
+	dev := &CambriconDevices{}
+	devices := []*device.DeviceUsage{
+		{
+			ID:        "dev-0",
+			Index:     0,
+			Count:     10,
+			Totalmem:  8000,
+			Totalcore: 100,
+			Used:      0,
+			Usedmem:   0,
+			Usedcores: 0,
+			Health:    true,
+			Type:      CambriconMLUDevice,
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+	}
+
+	tests := []struct {
+		name     string
+		coresreq int64
+		wantOk   bool
+	}{
+		{
+			name:     "cores 0 is accepted",
+			coresreq: 0,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 50 is accepted",
+			coresreq: 50,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 100 is accepted",
+			coresreq: 100,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 101 is rejected",
+			coresreq: 101,
+			wantOk:   false,
+		},
+		{
+			name:     "cores 150 is rejected and not converted to 100",
+			coresreq: 150,
+			wantOk:   false,
+		},
+		{
+			name:     "cores 200 is rejected",
+			coresreq: 200,
+			wantOk:   false,
+		},
+		{
+			name:     "negative cores -1 is rejected",
+			coresreq: -1,
+			wantOk:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := device.ContainerDeviceRequest{
+				Nums:     1,
+				Type:     CambriconMLUDevice,
+				Memreq:   1000,
+				Coresreq: tt.coresreq,
+			}
+			ok, _, _ := dev.Fit(devices, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+			assert.Equal(t, tt.wantOk, ok)
+		})
+	}
+
+	t.Run("empty devices with invalid coresreq returns out of range", func(t *testing.T) {
+		req := device.ContainerDeviceRequest{
+			Nums:     1,
+			Type:     CambriconMLUDevice,
+			Memreq:   1000,
+			Coresreq: 150,
+		}
+		ok, _, reason := dev.Fit([]*device.DeviceUsage{}, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+		assert.False(t, ok)
+		assert.Equal(t, "core limit out of range", reason)
+	})
+
+	t.Run("mismatched device type with invalid coresreq returns out of range", func(t *testing.T) {
+		req := device.ContainerDeviceRequest{
+			Nums:     1,
+			Type:     CambriconMLUDevice,
+			Memreq:   1000,
+			Coresreq: -1,
+		}
+		mismatchDevs := []*device.DeviceUsage{
+			{ID: "other-0", Type: "OtherType", Health: true},
+		}
+		ok, _, reason := dev.Fit(mismatchDevs, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+		assert.False(t, ok)
+		assert.Equal(t, "core limit out of range", reason)
+	})
 }

@@ -17,17 +17,21 @@ limitations under the License.
 package device
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"gotest.tools/v3/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/Project-HAMi/HAMi/pkg/util"
+	"github.com/Project-HAMi/HAMi/pkg/util/client"
 )
 
 var inRequestDevices map[string]string
@@ -43,6 +47,235 @@ func TestEmptyContainerDevicesCoding(t *testing.T) {
 	fmt.Println(s)
 	cd2, _ := DecodeContainerDevices(s)
 	assert.DeepEqual(t, cd1, cd2)
+}
+
+func TestDecodeContainerDevices(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		want        ContainerDevices
+		expectError bool
+	}{
+		{
+			name:        "empty string returns empty ContainerDevices",
+			input:       "",
+			want:        ContainerDevices{},
+			expectError: false,
+		},
+		{
+			name:        "trailing delimiters only returns empty ContainerDevices",
+			input:       ":::",
+			want:        ContainerDevices{},
+			expectError: false,
+		},
+		{
+			name:  "valid single device",
+			input: "GPU-8dcd427f-483b-b48f-d7e5-75fb19a52b76,NVIDIA,500,3:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-8dcd427f-483b-b48f-d7e5-75fb19a52b76",
+					Type:      "NVIDIA",
+					Usedmem:   500,
+					Usedcores: 3,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:  "valid single device with zero resources",
+			input: "GPU-zero,NVIDIA,0,0:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-zero",
+					Type:      "NVIDIA",
+					Usedmem:   0,
+					Usedcores: 0,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:  "multiple valid devices",
+			input: "GPU-1,NVIDIA,1000,10:GPU-2,Cambricon,2000,20:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-1",
+					Type:      "NVIDIA",
+					Usedmem:   1000,
+					Usedcores: 10,
+				},
+				{
+					UUID:      "GPU-2",
+					Type:      "Cambricon",
+					Usedmem:   2000,
+					Usedcores: 20,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:  "optional slots field is decoded",
+			input: "GPU-1,NVIDIA,1000,10,3:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-1",
+					Type:      "NVIDIA",
+					Usedmem:   1000,
+					Usedcores: 10,
+					Slots:     3,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:  "fields after slots are ignored",
+			input: "GPU-1,NVIDIA,1000,10,3,extra:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-1",
+					Type:      "NVIDIA",
+					Usedmem:   1000,
+					Usedcores: 10,
+					Slots:     3,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:        "invalid non-numeric slots is ignored",
+			input:       "GPU-1,NVIDIA,1000,10,invalid:",
+			want:        ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+			expectError: false,
+		},
+		{
+			name:        "negative slots value is ignored",
+			input:       "GPU-1,NVIDIA,1000,10,-1:",
+			want:        ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+			expectError: false,
+		},
+		{
+			name:  "existing valid fields preserved with extra optional fields",
+			input: "GPU-1,NVIDIA,1000,10,extra1,extra2:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-1",
+					Type:      "NVIDIA",
+					Usedmem:   1000,
+					Usedcores: 10,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:        "malformed segment without comma",
+			input:       "garbage",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "malformed segment without comma and with delimiter",
+			input:       "garbage:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "missing required fields (only 2 fields)",
+			input:       "GPU-1,NVIDIA:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "missing required fields (only 3 fields)",
+			input:       "GPU-1,NVIDIA,1000:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "empty device ID / UUID",
+			input:       ",NVIDIA,1000,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "empty device type",
+			input:       "GPU-1,,1000,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "negative memory value",
+			input:       "GPU-1,NVIDIA,-500,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "negative cores value",
+			input:       "GPU-1,NVIDIA,500,-1:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "invalid non-numeric memory",
+			input:       "GPU-1,NVIDIA,invalid,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "invalid non-numeric core",
+			input:       "GPU-1,NVIDIA,500,invalid:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "memory integer overflow",
+			input:       "GPU-1,NVIDIA,99999999999999999999999999,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "core integer overflow",
+			input:       "GPU-1,NVIDIA,500,99999999999999999999999999:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "valid device followed by malformed device fails entire decode",
+			input:       "GPU-1,NVIDIA,1000,10:malformed_segment:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "malformed device followed by valid device fails entire decode",
+			input:       "malformed_segment:GPU-1,NVIDIA,1000,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "valid device followed by negative resource fails entire decode",
+			input:       "GPU-1,NVIDIA,1000,10:GPU-2,NVIDIA,-100,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "negative resource followed by valid device fails entire decode",
+			input:       "GPU-1,NVIDIA,1000,-5:GPU-2,NVIDIA,1000,10:",
+			want:        nil,
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := DecodeContainerDevices(tt.input)
+			if tt.expectError {
+				assert.Assert(t, err != nil, "expected error for input %q, got nil", tt.input)
+				assert.Assert(t, got == nil, "expected nil devices on error, got %+v", got)
+			} else {
+				assert.NilError(t, err)
+				assert.DeepEqual(t, tt.want, got)
+			}
+		})
+	}
 }
 
 func TestEmptyPodDeviceCoding(t *testing.T) {
@@ -150,7 +383,7 @@ func TestPodDevicesCoding(t *testing.T) {
 			args: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 				},
 			},
@@ -158,7 +391,7 @@ func TestPodDevicesCoding(t *testing.T) {
 			want: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{},
 				},
@@ -169,10 +402,10 @@ func TestPodDevicesCoding(t *testing.T) {
 			args: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 				},
 			},
@@ -180,10 +413,10 @@ func TestPodDevicesCoding(t *testing.T) {
 			want: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{},
 				},
@@ -194,8 +427,8 @@ func TestPodDevicesCoding(t *testing.T) {
 			args: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
-						ContainerDevice{0, "UUID2", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
+						ContainerDevice{0, "UUID2", "Type1", 1000, 30, 0, nil},
 					},
 				},
 			},
@@ -203,8 +436,8 @@ func TestPodDevicesCoding(t *testing.T) {
 			want: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
-						ContainerDevice{0, "UUID2", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
+						ContainerDevice{0, "UUID2", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{},
 				},
@@ -295,9 +528,60 @@ func Test_DecodePodDevices(t *testing.T) {
 
 func TestDecodePodDevices_BadAnnotation(t *testing.T) {
 	checklist := map[string]string{"NVIDIA": "hami.io/vgpu-devices-to-allocate"}
-	annos := map[string]string{"hami.io/vgpu-devices-to-allocate": "uuid,type,100:;"}
-	_, err := DecodePodDevices(checklist, annos)
-	assert.Assert(t, err != nil)
+	badAnnos := []struct {
+		name string
+		anno string
+	}{
+		{
+			name: "missing required fields (only 3 fields)",
+			anno: "uuid,type,100:;",
+		},
+		{
+			name: "malformed non-empty segment without comma",
+			anno: "malformed_annotation:;",
+		},
+		{
+			name: "negative memory in first container",
+			anno: "GPU-1,NVIDIA,-500,10:;",
+		},
+		{
+			name: "negative cores in second container",
+			anno: "GPU-1,NVIDIA,500,10:;GPU-2,NVIDIA,500,-1:;",
+		},
+		{
+			name: "empty UUID",
+			anno: ",NVIDIA,500,10:;",
+		},
+		{
+			name: "empty type",
+			anno: "GPU-1,,500,10:;",
+		},
+	}
+
+	for _, tt := range badAnnos {
+		t.Run(tt.name, func(t *testing.T) {
+			annos := map[string]string{"hami.io/vgpu-devices-to-allocate": tt.anno}
+			got, err := DecodePodDevices(checklist, annos)
+			assert.Assert(t, err != nil, "expected error for bad annotation %q, got nil", tt.anno)
+			assert.DeepEqual(t, got, PodDevices{})
+		})
+	}
+}
+
+func TestResourceAccounting_NegativeDecodedProtection(t *testing.T) {
+	// Proves that malformed negative allocation annotations cannot be decoded,
+	// preventing negative resource values from improperly decreasing Usedmem/Usedcores.
+	malformedAnno := "GPU-1,NVIDIA,-1000,-10:"
+	devices, err := DecodeContainerDevices(malformedAnno)
+	assert.Assert(t, err != nil, "DecodeContainerDevices must reject negative values")
+	assert.Assert(t, devices == nil, "returned devices must be nil on failure")
+
+	// Ensure PodDevices decoding also fails closed
+	checklist := map[string]string{"NVIDIA": "hami.io/vgpu-devices-to-allocate"}
+	podAnnos := map[string]string{"hami.io/vgpu-devices-to-allocate": malformedAnno + ";"}
+	podDevs, err := DecodePodDevices(checklist, podAnnos)
+	assert.Assert(t, err != nil, "DecodePodDevices must reject negative values")
+	assert.DeepEqual(t, podDevs, PodDevices{})
 }
 
 func TestMarshalNodeDevices(t *testing.T) {
@@ -378,6 +662,21 @@ func TestMarshalNodeDevices(t *testing.T) {
 			assert.DeepEqual(t, gotDeviceInfo, wantDeviceInfo)
 		})
 	}
+}
+
+func TestMigProfileUsesCompactWireFormat(t *testing.T) {
+	raw, err := json.Marshal(MigProfile{
+		Name:          "1g.5gb",
+		MemoryMB:      4864,
+		Core:          15,
+		SliceCount:    1,
+		InstanceCount: 7,
+		Placements:    []MigPlacement{{Start: 6, Size: 1}},
+	})
+	assert.NilError(t, err)
+
+	want := `{"name":"1g.5gb","memoryMB":4864,"core":15,"sliceCount":1,"placements":[{"start":6,"size":1}]}`
+	assert.Equal(t, string(raw), want)
 }
 
 func TestUnMarshalNodeDevices(t *testing.T) {
@@ -462,7 +761,62 @@ func Test_DecodeNodeDevices(t *testing.T) {
 		}
 	}{
 		{
-			name: "args is invalid",
+			name: "args is empty",
+			args: "",
+			want: struct {
+				di  []*DeviceInfo
+				err error
+			}{
+				di:  nil,
+				err: errors.New("node annotation missing device separator"),
+			},
+		},
+		{
+			name: "args is only delimiter",
+			args: ":",
+			want: struct {
+				di  []*DeviceInfo
+				err error
+			}{
+				di:  nil,
+				err: nil,
+			},
+		},
+		{
+			name: "args is multiple delimiters",
+			args: "::",
+			want: struct {
+				di  []*DeviceInfo
+				err error
+			}{
+				di:  nil,
+				err: nil,
+			},
+		},
+		{
+			name: "args missing delimiter with comma",
+			args: ",",
+			want: struct {
+				di  []*DeviceInfo
+				err error
+			}{
+				di:  nil,
+				err: errors.New("node annotation missing device separator"),
+			},
+		},
+		{
+			name: "args has comma and delimiter but empty fields",
+			args: ",:",
+			want: struct {
+				di  []*DeviceInfo
+				err error
+			}{
+				di:  nil,
+				err: errors.New("unexpected field count 2 in node annotation"),
+			},
+		},
+		{
+			name: "args is invalid format missing split symbol",
 			args: "a",
 			want: struct {
 				di  []*DeviceInfo
@@ -472,6 +826,7 @@ func Test_DecodeNodeDevices(t *testing.T) {
 				err: errors.New("node annotation missing device separator"),
 			},
 		},
+
 		{
 			name: "str is old format",
 			args: "GPU-ebe7c3f7-303d-558d-435e-99a160631fe4,10,7680,100,NVIDIA-Tesla P4,0,true:",
@@ -681,199 +1036,127 @@ func Test_EncodeNodeDevices(t *testing.T) {
 }
 
 func Test_CheckHealth(t *testing.T) {
-	util.HandshakeAnnos["huawei.com/Ascend910"] = "hami.io/node-handshake-ascend"
-	tests := []struct {
-		name string
-		args struct {
-			devType           string
-			resourceCountName string
-			n                 corev1.Node
+	const (
+		devType      = "huawei.com/Ascend910"
+		resourceName = "huawei.com/Ascend910"
+		registerKey  = "hami.io/node-register-Ascend910"
+	)
+
+	node := func(name string, allocatable int64, registerAnno string) *corev1.Node {
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{}},
+			Status:     corev1.NodeStatus{Allocatable: corev1.ResourceList{}},
 		}
-		want1 bool
-		want2 bool
-	}{
-		{
-			name: "Requesting state",
-			args: struct {
-				devType           string
-				resourceCountName string
-				n                 corev1.Node
-			}{
-				devType: "huawei.com/Ascend910",
-				n: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["huawei.com/Ascend910"]: "Requesting_2128-12-02 00:00:00",
-						},
-					},
-				},
-			},
-			want1: true,
-			want2: false,
-		},
-		{
-			name: "Deleted state",
-			args: struct {
-				devType           string
-				resourceCountName string
-				n                 corev1.Node
-			}{
-				devType: "huawei.com/Ascend910",
-				n: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["huawei.com/Ascend910"]: "Deleted",
-						},
-					},
-				},
-			},
-			want1: true,
-			want2: false,
-		},
-		{
-			// Inside the 60-second deletedCooldown window — keep the conservative
-			// path; the scheduler should not yet re-add the node to its cache.
-			// The far-future timestamp (year 2128) ensures the cooldown has not
-			// elapsed regardless of when the test runs.
-			name: "Deleted state within cooldown",
-			args: struct {
-				devType           string
-				resourceCountName string
-				n                 corev1.Node
-			}{
-				devType: "huawei.com/Ascend910",
-				n: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["huawei.com/Ascend910"]: "Deleted_2128-12-02 00:00:00",
-						},
-					},
-				},
-			},
-			want1: true,
-			want2: false,
-		},
-		{
-			// Stale Deleted_ — the recovery path is taken but util.GetNode
-			// fails outside a real cluster, so the function falls back to
-			// (true, false). Behaviour matches the existing "Unknown state"
-			// case which exercises the same util.GetNode failure path.
-			name: "Deleted state stale",
-			args: struct {
-				devType           string
-				resourceCountName string
-				n                 corev1.Node
-			}{
-				devType: "huawei.com/Ascend910",
-				n: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["huawei.com/Ascend910"]: "Deleted_2024-01-02 00:00:00",
-						},
-					},
-				},
-			},
-			want1: true,
-			want2: false,
-		},
-		{
-			// Unparsable timestamp must keep the conservative (true, false)
-			// path — never recover from a malformed value.
-			name: "Deleted state with unparsable timestamp",
-			args: struct {
-				devType           string
-				resourceCountName string
-				n                 corev1.Node
-			}{
-				devType: "huawei.com/Ascend910",
-				n: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["huawei.com/Ascend910"]: "Deleted_not-a-timestamp",
-						},
-					},
-				},
-			},
-			want1: true,
-			want2: false,
-		},
-		{
-			name: "Unknown state",
-			args: struct {
-				devType           string
-				resourceCountName string
-				n                 corev1.Node
-			}{
-				devType: "huawei.com/Ascend910",
-				n: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["huawei.com/Ascend910"]: "Unknown",
-						},
-					},
-				},
-			},
-			want1: true,
-			want2: false,
-		},
-		{
-			// Expired Requesting_ and no Allocatable resources: the device-plugin
-			// is truly gone, so NodeCleanUp should be triggered → (false, false).
-			name: "Requesting state expired, no allocatable",
-			args: struct {
-				devType           string
-				resourceCountName string
-				n                 corev1.Node
-			}{
-				devType:           "huawei.com/Ascend910",
-				resourceCountName: "huawei.com/Ascend910",
-				n: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["huawei.com/Ascend910"]: "Requesting_2024-01-02 00:00:00",
-						},
-					},
-				},
-			},
-			want1: false,
-			want2: false,
-		},
-		{
-			// Expired Requesting_ but Allocatable still has the resource: the
-			// device-plugin gRPC stream is alive. Handshake is refreshed and the
-			// node stays healthy → (true, false).
-			name: "Requesting state expired, allocatable present",
-			args: struct {
-				devType           string
-				resourceCountName string
-				n                 corev1.Node
-			}{
-				devType:           "huawei.com/Ascend910",
-				resourceCountName: "huawei.com/Ascend910",
-				n: corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["huawei.com/Ascend910"]: "Requesting_2024-01-02 00:00:00",
-						},
-					},
-					Status: corev1.NodeStatus{
-						Allocatable: corev1.ResourceList{
-							"huawei.com/Ascend910": resource.MustParse("8"),
-						},
-					},
-				},
-			},
-			want1: true,
-			want2: false,
-		},
+		if allocatable > 0 {
+			n.Status.Allocatable[resourceName] = *resource.NewQuantity(allocatable, resource.DecimalSI)
+		}
+		if registerAnno != "" {
+			n.Annotations[registerKey] = registerAnno
+		}
+		return n
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			result1, result2 := CheckHealth(test.args.devType, test.args.resourceCountName, &test.args.n)
-			assert.Equal(t, result1, test.want1)
-			assert.Equal(t, result2, test.want2)
-		})
-	}
+
+	t.Run("no allocatable is unhealthy even with a register annotation", func(t *testing.T) {
+		healthy, needUpdate := CheckHealth(devType, resourceName, node("absent", 0, "anno"), "anno")
+		assert.Equal(t, healthy, false)
+		assert.Equal(t, needUpdate, false)
+	})
+
+	t.Run("unknown resource name keeps the node", func(t *testing.T) {
+		healthy, needUpdate := CheckHealth(devType, "", node("no-resource-name", 0, ""), "")
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, true)
+	})
+
+	t.Run("unchanged register annotation needs no update", func(t *testing.T) {
+		n := node("cached", 8, "anno-v1")
+		healthy, needUpdate := CheckHealth(devType, resourceName, n, "anno-v1")
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, true)
+
+		healthy, needUpdate = CheckHealth(devType, resourceName, n, "anno-v1")
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, false)
+
+		healthy, needUpdate = CheckHealth(devType, resourceName, n, "anno-v2")
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, true)
+	})
+
+	t.Run("devices returning after an outage are registered afresh", func(t *testing.T) {
+		const nodeName = "flapping"
+		healthy, needUpdate := CheckHealth(devType, resourceName, node(nodeName, 8, "anno"), "anno")
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, true)
+
+		healthy, _ = CheckHealth(devType, resourceName, node(nodeName, 0, "anno"), "anno")
+		assert.Equal(t, healthy, false)
+
+		// Same annotation as before the outage: the node must still be re-read.
+		healthy, needUpdate = CheckHealth(devType, resourceName, node(nodeName, 8, "anno"), "anno")
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, true)
+	})
+
+	t.Run("obsolete handshake annotation is removed", func(t *testing.T) {
+		const nodeName = "stale-handshake"
+		handshakeKey := "hami.io/node-handshake-ascend"
+		previous := util.HandshakeAnnos[devType]
+		t.Cleanup(func() { util.HandshakeAnnos[devType] = previous })
+		util.HandshakeAnnos[devType] = handshakeKey
+
+		prevClient := client.KubeClient
+		t.Cleanup(func() { client.KubeClient = prevClient })
+		client.KubeClient = fake.NewClientset()
+
+		n := node(nodeName, 8, "anno")
+		n.Annotations[handshakeKey] = "Requesting_2024-01-02 00:00:00"
+		_, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), n, metav1.CreateOptions{})
+		assert.NilError(t, err)
+
+		CheckHealth(devType, resourceName, n, "anno")
+
+		updated, err := client.KubeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+		assert.NilError(t, err)
+		_, present := updated.Annotations[handshakeKey]
+		assert.Equal(t, present, false)
+	})
+}
+
+func Test_AllocatableHealth(t *testing.T) {
+	const (
+		devType  = "test-allocatable-health"
+		nodeName = "node-alloc-health"
+	)
+
+	healthy, needUpdate := AllocatableHealth(devType, nodeName, 0, 2, "anno")
+	assert.Equal(t, healthy, false)
+	assert.Equal(t, needUpdate, false)
+
+	healthy, needUpdate = AllocatableHealth(devType, nodeName, 4, 2, "anno")
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+
+	healthy, needUpdate = AllocatableHealth(devType, nodeName, 4, 2, "anno")
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, false)
+
+	healthy, needUpdate = AllocatableHealth(devType, nodeName, 4, 3, "anno")
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+
+	healthy, needUpdate = AllocatableHealth(devType, nodeName, 4, 3, "anno-v2")
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+
+	healthy, needUpdate = AllocatableHealth(devType, nodeName, 0, 3, "anno-v2")
+	assert.Equal(t, healthy, false)
+	assert.Equal(t, needUpdate, false)
+
+	// The zero above forgot the registration, so the same cards must be read again.
+	healthy, needUpdate = AllocatableHealth(devType, nodeName, 4, 3, "anno-v2")
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
 }
 func TestDecodeNodeDevices(t *testing.T) {
 	pairScore := "[{\"uuid\":\"GPU-0\",\"score\":{\"GPU-1\":50,\"GPU-2\":20,\"GPU-3\":20}}]"
@@ -1014,6 +1297,69 @@ func TestGetDevicesUUIDList(t *testing.T) {
 		})
 	}
 }
+
+// TestEncodeDecodeContainerDevicesSlots covers the optional slots field: it is
+// only written when it exceeds 1, so single-slot entries keep the 4-field form.
+func TestEncodeDecodeContainerDevicesSlots(t *testing.T) {
+	tests := []struct {
+		name        string
+		cd          ContainerDevices
+		wantEncoded string
+		wantDecoded ContainerDevices
+	}{
+		{
+			name:        "multi slot entry encodes the slots field",
+			cd:          ContainerDevices{{UUID: "GPU-1", Type: "Enflame", Usedmem: 20480, Usedcores: 50, Slots: 3}},
+			wantEncoded: "GPU-1,Enflame,20480,50,3:",
+			wantDecoded: ContainerDevices{{UUID: "GPU-1", Type: "Enflame", Usedmem: 20480, Usedcores: 50, Slots: 3}},
+		},
+		{
+			name:        "single slot entry keeps the legacy four fields",
+			cd:          ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10, Slots: 1}},
+			wantEncoded: "GPU-1,NVIDIA,1000,10:",
+			wantDecoded: ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+		},
+		{
+			name:        "unset slots keeps the legacy four fields",
+			cd:          ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+			wantEncoded: "GPU-1,NVIDIA,1000,10:",
+			wantDecoded: ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+		},
+		{
+			name: "values above MaxInt32 survive the round trip",
+			cd: ContainerDevices{{
+				UUID: "GPU-1", Type: "Enflame", Usedmem: 1 << 32, Usedcores: 1 << 32, Slots: 1 << 32,
+			}},
+			wantEncoded: "GPU-1,Enflame,4294967296,4294967296,4294967296:",
+			wantDecoded: ContainerDevices{{
+				UUID: "GPU-1", Type: "Enflame", Usedmem: 1 << 32, Usedcores: 1 << 32, Slots: 1 << 32,
+			}},
+		},
+		{
+			name: "mixed entries in one container",
+			cd: ContainerDevices{
+				{UUID: "GPU-1", Type: "Enflame", Usedmem: 20480, Usedcores: 50, Slots: 3},
+				{UUID: "GPU-2", Type: "Enflame", Usedmem: 6144, Usedcores: 17},
+			},
+			wantEncoded: "GPU-1,Enflame,20480,50,3:GPU-2,Enflame,6144,17:",
+			wantDecoded: ContainerDevices{
+				{UUID: "GPU-1", Type: "Enflame", Usedmem: 20480, Usedcores: 50, Slots: 3},
+				{UUID: "GPU-2", Type: "Enflame", Usedmem: 6144, Usedcores: 17},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := EncodeContainerDevices(tt.cd)
+			assert.Equal(t, encoded, tt.wantEncoded)
+			decoded, err := DecodeContainerDevices(encoded)
+			assert.NilError(t, err)
+			assert.DeepEqual(t, tt.wantDecoded, decoded)
+		})
+	}
+}
+
 func TestEncodeContainerDeviceType(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1071,14 +1417,14 @@ func (m *mockDevices) GetNodeDevices(_ corev1.Node) ([]*DeviceInfo, error) {
 }
 func (m *mockDevices) LockNode(_ *corev1.Node, _ *corev1.Pod) error        { return nil }
 func (m *mockDevices) ReleaseNodeLock(_ *corev1.Node, _ *corev1.Pod) error { return nil }
-func (m *mockDevices) GenerateResourceRequests(ctr *corev1.Container) ContainerDeviceRequest {
+func (m *mockDevices) GenerateResourceRequests(ctr *corev1.Container) (ContainerDeviceRequest, error) {
 	// Return the mock request only if the container has the resource annotation we look for
 	for rName := range ctr.Resources.Limits {
 		if string(rName) == "nvidia.com/gpu" {
-			return m.resourceRequest
+			return m.resourceRequest, nil
 		}
 	}
-	return ContainerDeviceRequest{}
+	return ContainerDeviceRequest{}, nil
 }
 func (m *mockDevices) PatchAnnotations(_ *corev1.Pod, _ *map[string]string, _ PodDevices) map[string]string {
 	return nil
@@ -1128,11 +1474,11 @@ func TestResourcereqs_OnlyRegularContainers(t *testing.T) {
 		},
 	}
 
-	counts := Resourcereqs(pod)
+	counts, _ := Resourcereqs(pod)
 
 	// No init containers, so length == number of regular containers
 	assert.Equal(t, len(counts), 1)
-	assert.Equal(t, counts[0]["NVIDIA"].Nums, int32(1))
+	assert.Equal(t, counts[0]["NVIDIA"].Nums, int64(1))
 }
 
 func TestResourcereqs_WithInitContainers(t *testing.T) {
@@ -1185,7 +1531,7 @@ func TestResourcereqs_WithInitContainers(t *testing.T) {
 		},
 	}
 
-	counts := Resourcereqs(pod)
+	counts, _ := Resourcereqs(pod)
 
 	assert.Equal(t, len(counts), 3, "Should have 3 container request maps")
 
@@ -1195,23 +1541,23 @@ func TestResourcereqs_WithInitContainers(t *testing.T) {
 	t.Run("Check Init Container GPU reqs", func(t *testing.T) {
 		req, ok := counts[1]["NVIDIA"]
 		assert.Assert(t, ok, "Container 1 should have NVIDIA requests")
-		assert.Equal(t, req.Nums, int32(1))
-		assert.Equal(t, req.Memreq, int32(1000))
-		assert.Equal(t, req.Coresreq, int32(10))
+		assert.Equal(t, req.Nums, int64(1))
+		assert.Equal(t, req.Memreq, int64(1000))
+		assert.Equal(t, req.Coresreq, int64(10))
 	})
 
 	t.Run("Check Main Container GPU reqs", func(t *testing.T) {
 		req, ok := counts[2]["NVIDIA"]
 		assert.Assert(t, ok, "Container 2 should have NVIDIA requests")
-		assert.Equal(t, req.Nums, int32(1))
-		assert.Equal(t, req.Memreq, int32(1000))
-		assert.Equal(t, req.Coresreq, int32(10))
+		assert.Equal(t, req.Nums, int64(1))
+		assert.Equal(t, req.Memreq, int64(1000))
+		assert.Equal(t, req.Coresreq, int64(10))
 	})
 }
 
 func TestResourcereqs_EmptyPod(t *testing.T) {
 	pod := &corev1.Pod{Spec: corev1.PodSpec{}}
-	counts := Resourcereqs(pod)
+	counts, _ := Resourcereqs(pod)
 	assert.Equal(t, len(counts), 0)
 }
 
@@ -1255,7 +1601,7 @@ func TestResourcereqs_NoDeviceRequests(t *testing.T) {
 		},
 	}
 
-	counts := Resourcereqs(pod)
+	counts, _ := Resourcereqs(pod)
 
 	// Total = 1 init + 1 regular = 2
 	assert.Equal(t, len(counts), 2)
@@ -1324,23 +1670,23 @@ func TestResourcereqs_MultipleInitAndRegularContainers(t *testing.T) {
 		},
 	}
 
-	counts := Resourcereqs(pod)
+	counts, _ := Resourcereqs(pod)
 
 	// Total = 2 init + 2 regular = 4
 	assert.Equal(t, len(counts), 4)
 
 	// Index 0: init1 with GPU
-	assert.Equal(t, counts[0]["NVIDIA"].Nums, int32(2))
+	assert.Equal(t, counts[0]["NVIDIA"].Nums, int64(2))
 
 	// Index 1: init2 without GPU
 	_, hasNvidia1 := counts[1]["NVIDIA"]
 	assert.Equal(t, hasNvidia1, false)
 
 	// Index 2: main1 with GPU (offset=2)
-	assert.Equal(t, counts[2]["NVIDIA"].Nums, int32(2))
+	assert.Equal(t, counts[2]["NVIDIA"].Nums, int64(2))
 
 	// Index 3: main2 with GPU (offset=2)
-	assert.Equal(t, counts[3]["NVIDIA"].Nums, int32(2))
+	assert.Equal(t, counts[3]["NVIDIA"].Nums, int64(2))
 }
 
 func TestCheckUUID(t *testing.T) {
@@ -1390,12 +1736,147 @@ func TestCheckUUID(t *testing.T) {
 			id:   "1abc",
 			want: true,
 		},
+		{
+			name: "both GPUUseUUID and GPUNoUseUUID set, device in use list but also in nouse list",
+			annos: map[string]string{
+				GPUUseUUID:   "abc,123",
+				GPUNoUseUUID: "abc",
+			},
+			id:   "abc",
+			want: false,
+		},
+		{
+			name: "both GPUUseUUID and GPUNoUseUUID set, device in use list and not in nouse list",
+			annos: map[string]string{
+				GPUUseUUID:   "abc,123",
+				GPUNoUseUUID: "456",
+			},
+			id:   "abc",
+			want: true,
+		},
+		{
+			name: "use list with spaces around uuids, device matches after trim",
+			annos: map[string]string{
+				GPUUseUUID: " abc , 123 ",
+			},
+			id:   "abc",
+			want: true,
+		},
+		{
+			name: "empty GPUUseUUID annotation should not filter out any device",
+			annos: map[string]string{
+				GPUUseUUID: "",
+			},
+			id:   "abc",
+			want: true,
+		},
+		{
+			name: "whitespace-only GPUUseUUID annotation should not filter out any device",
+			annos: map[string]string{
+				GPUUseUUID: "   ",
+			},
+			id:   "abc",
+			want: true,
+		},
+		{
+			name: "empty GPUNoUseUUID annotation should not exclude any device",
+			annos: map[string]string{
+				GPUNoUseUUID: "",
+			},
+			id:   "abc",
+			want: true,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := CheckUUID(test.annos, test.id, GPUUseUUID, GPUNoUseUUID, "NVIDIA")
 			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestCheckType(t *testing.T) {
+	useKey := "example.com/use-gputype"
+	noUseKey := "example.com/nouse-gputype"
+	tests := []struct {
+		name     string
+		annos    map[string]string
+		cardType string
+		want     bool
+	}{
+		{
+			name:     "no annotation is no constraint",
+			annos:    map[string]string{},
+			cardType: "NVIDIA-A100",
+			want:     true,
+		},
+		{
+			name:     "use list matches by substring",
+			annos:    map[string]string{useKey: "A100,V100"},
+			cardType: "NVIDIA-A100",
+			want:     true,
+		},
+		{
+			name:     "use list does not match",
+			annos:    map[string]string{useKey: "V100"},
+			cardType: "NVIDIA-A100",
+			want:     false,
+		},
+		{
+			name:     "nouse list matches excludes the device",
+			annos:    map[string]string{noUseKey: "A100"},
+			cardType: "NVIDIA-A100",
+			want:     false,
+		},
+		{
+			name:     "nouse list does not match keeps the device",
+			annos:    map[string]string{noUseKey: "V100"},
+			cardType: "NVIDIA-A100",
+			want:     true,
+		},
+		{
+			name:     "empty use value is no constraint",
+			annos:    map[string]string{useKey: ""},
+			cardType: "NVIDIA-A100",
+			want:     true,
+		},
+		{
+			name:     "whitespace-only nouse value excludes nothing",
+			annos:    map[string]string{noUseKey: "   "},
+			cardType: "NVIDIA-A100",
+			want:     true,
+		},
+		{
+			name:     "use satisfied and nouse matches still excludes",
+			annos:    map[string]string{useKey: "A100", noUseKey: "A100"},
+			cardType: "NVIDIA-A100",
+			want:     false,
+		},
+		// Regression: a trailing/leading/double comma leaves an empty split member, and
+		// strings.Contains(cardType, "") is always true, so it must not match every card.
+		{
+			name:     "nouse with trailing comma only excludes named type",
+			annos:    map[string]string{noUseKey: "V100,"},
+			cardType: "NVIDIA-A100",
+			want:     true,
+		},
+		{
+			name:     "nouse with leading comma only excludes named type",
+			annos:    map[string]string{noUseKey: ",V100"},
+			cardType: "NVIDIA-A100",
+			want:     true,
+		},
+		{
+			name:     "use with trailing comma matches named type only",
+			annos:    map[string]string{useKey: "V100,"},
+			cardType: "NVIDIA-A100",
+			want:     false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, CheckType(test.annos, test.cardType, useKey, noUseKey))
 		})
 	}
 }
@@ -1436,9 +1917,10 @@ func TestDeviceUsageDeepCopy(t *testing.T) {
 						{Name: "1g.5gb", Core: 1, Memory: 5, InUse: false},
 					},
 				},
-				Numa:   0,
-				Type:   "NVIDIA",
-				Health: true,
+				Numa:         0,
+				Type:         "NVIDIA A100-SXM4-40GB",
+				DeviceVendor: "NVIDIA",
+				Health:       true,
 				PodInfos: []*PodInfo{
 					{
 						Pod: &corev1.Pod{
@@ -1455,7 +1937,6 @@ func TestDeviceUsageDeepCopy(t *testing.T) {
 								},
 							},
 						},
-						CtrIDs: []string{"ctr1"},
 					},
 				},
 				CustomInfo: map[string]any{
@@ -1498,12 +1979,10 @@ func TestDeviceUsageDeepCopy(t *testing.T) {
 			}
 
 			if len(copy.PodInfos) > 0 {
-				originalNodeID := tt.original.PodInfos[0].NodeID
-				originalCtrIDsLen := len(tt.original.PodInfos[0].CtrIDs)
-				copy.PodInfos[0].NodeID = "mutated-node"
-				copy.PodInfos[0].CtrIDs = append(copy.PodInfos[0].CtrIDs, "ctr2")
-				assert.Equal(t, tt.original.PodInfos[0].NodeID, originalNodeID)
-				assert.Equal(t, len(tt.original.PodInfos[0].CtrIDs), originalCtrIDsLen)
+				assert.Assert(t, tt.original.PodInfos[0] == copy.PodInfos[0], "PodInfos entries should be shared with the copy")
+				originalEntry := tt.original.PodInfos[0]
+				copy.PodInfos[0] = &PodInfo{NodeID: "replacement-node"}
+				assert.Assert(t, tt.original.PodInfos[0] == originalEntry, "replacing a copied slice entry must not affect the original")
 			}
 
 			if copy.CustomInfo != nil {
@@ -1553,6 +2032,291 @@ func TestMigInUseDeepCopy(t *testing.T) {
 				copy.UsageList[0].Name = "mutated"
 				assert.Equal(t, tt.original.UsageList[0].Name, originalName)
 			}
+		})
+	}
+}
+
+func FuzzDecodeContainerDevices(f *testing.F) {
+	f.Add("")
+	f.Add("GPU-uuid,NVIDIA,1024,10:")
+	f.Add("GPU-uuid,NVIDIA,1024,10:GPU-uuid2,NVIDIA,2048,20:")
+	f.Add(",,,")
+	f.Fuzz(func(t *testing.T, str string) {
+		// Must never panic on arbitrary pod-annotation input.
+		_, _ = DecodeContainerDevices(str)
+	})
+}
+
+func FuzzEncodeDecodeContainerDevices(f *testing.F) {
+	f.Add("GPU-uuid", "NVIDIA", int64(1024), int64(10), int64(0))
+	f.Add("GPU-uuid2", "Cambricon", int64(0), int64(0), int64(1))
+	f.Add("GPU-boundary", "NVIDIA", int64(2147483647), int64(2147483647), int64(2147483647))
+	f.Fuzz(func(t *testing.T, uuid, deviceType string, usedmem, usedcores, slots int64) {
+		if strings.ContainsAny(uuid, ",:;") || strings.ContainsAny(deviceType, ",:;") {
+			t.Skip()
+		}
+		if uuid == "" || deviceType == "" || usedmem < 0 || usedcores < 0 || slots < 0 {
+			t.Skip()
+		}
+		// Slots below 2 is not encoded, so it always decodes back as unset.
+		if slots < 2 {
+			slots = 0
+		}
+
+		want := ContainerDevices{{
+			UUID:      uuid,
+			Type:      deviceType,
+			Usedmem:   usedmem,
+			Usedcores: usedcores,
+			Slots:     slots,
+		}}
+		encoded := EncodeContainerDevices(want)
+		got, err := DecodeContainerDevices(encoded)
+		assert.NilError(t, err)
+		assert.DeepEqual(t, want, got)
+	})
+}
+
+func FuzzDecodeNodeDevices(f *testing.F) {
+	f.Add("")
+	f.Add("GPU-00552014-5c87-89ac-b1a6-7b53aa24b0ec,10,32768,100,NVIDIA-Tesla V100-PCIE-32GB,0,true:")
+	f.Add("GPU-ebe7c3f7-303d-558d-435e-99a160631fe4,10,7680,100,NVIDIA-Tesla P4,0,true,1,hami-core:")
+	f.Add("garbage:")
+	f.Add(",,,,,:")
+	f.Fuzz(func(t *testing.T, str string) {
+		// Must never panic on arbitrary node-annotation input.
+		_, _ = DecodeNodeDevices(str)
+	})
+}
+
+func FuzzDecodePodDevices(f *testing.F) {
+	checklist := map[string]string{"NVIDIA": "hami.io/vgpu-devices-to-allocate"}
+	f.Add("")
+	f.Add("GPU-0fc3eda5-e98b-a25b-5b0d-cf5c855d1448,NVIDIA,3000,0:;")
+	f.Add("GPU-0fc3eda5-e98b-a25b-5b0d-cf5c855d1448,NVIDIA,3000,0:;GPU-0fc3eda5-e98b-a25b-5b0d-cf5c855d1448,NVIDIA,5000,0:;")
+	f.Add("uuid,type,100:;")
+	f.Add(",,,;")
+	f.Fuzz(func(t *testing.T, annoValue string) {
+		// Must never panic on arbitrary pod-annotation input.
+		annos := map[string]string{checklist["NVIDIA"]: annoValue}
+		_, _ = DecodePodDevices(checklist, annos)
+	})
+}
+
+func TestEncodeDecodeNodeDevicesRoundtrip(t *testing.T) {
+	tests := []struct {
+		name  string
+		dlist []*DeviceInfo
+	}{
+		{
+			name: "single device, index 0",
+			dlist: []*DeviceInfo{
+				{
+					ID:      "GPU-ebe7c3f7-303d-558d-435e-99a160631fe4",
+					Index:   0,
+					Count:   10,
+					Devmem:  7680,
+					Devcore: 100,
+					Type:    "NVIDIA-Tesla P4",
+					Mode:    "hami-core",
+					Numa:    0,
+					Health:  true,
+				},
+			},
+		},
+		{
+			name: "single device, index 1",
+			dlist: []*DeviceInfo{
+				{
+					ID:      "GPU-ebe7c3f7-303d-558d-435e-99a160631fe4",
+					Index:   1,
+					Count:   10,
+					Devmem:  7680,
+					Devcore: 100,
+					Type:    "NVIDIA-Tesla P4",
+					Mode:    "hami-core",
+					Numa:    0,
+					Health:  true,
+				},
+			},
+		},
+		{
+			name: "multiple devices",
+			dlist: []*DeviceInfo{
+				{
+					ID:      "GPU-00552014-5c87-89ac-b1a6-7b53aa24b0ec",
+					Index:   0,
+					Count:   10,
+					Devmem:  32768,
+					Devcore: 100,
+					Type:    "NVIDIA-Tesla V100-PCIE-32GB",
+					Mode:    "hami-core",
+					Numa:    0,
+					Health:  true,
+				},
+				{
+					ID:      "GPU-0fc3eda5-e98b-a25b-5b0d-cf5c855d1448",
+					Index:   1,
+					Count:   10,
+					Devmem:  32768,
+					Devcore: 100,
+					Type:    "NVIDIA-Tesla V100-PCIE-32GB",
+					Mode:    "hami-core",
+					Numa:    0,
+					Health:  true,
+				},
+			},
+		},
+		{
+			name: "values above MaxInt32 survive the round trip",
+			dlist: []*DeviceInfo{
+				{
+					ID:      "GPU-wide",
+					Index:   0,
+					Count:   1 << 32,
+					Devmem:  1 << 32,
+					Devcore: 1 << 32,
+					Type:    "NVIDIA",
+					Mode:    "hami-core",
+					Numa:    0,
+					Health:  true,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := EncodeNodeDevices(tt.dlist)
+			decoded, err := DecodeNodeDevices(encoded)
+			assert.NilError(t, err)
+			assert.DeepEqual(t, tt.dlist, decoded)
+		})
+	}
+}
+
+// TestDecodeNodeDevicesLegacyFormat exercises the legacy 7-field decode branch
+// directly. EncodeNodeDevices always writes the 9-field form, so the encode ->
+// decode roundtrip above never reaches this path. A literal 7-field annotation
+// must decode successfully and receive the default Index (0) and Mode
+// ("hami-core") values.
+func TestDecodeNodeDevicesLegacyFormat(t *testing.T) {
+	decoded, err := DecodeNodeDevices("GPU-ebe7c3f7-303d-558d-435e-99a160631fe4,10,7680,100,NVIDIA-Tesla P4,0,true:")
+	assert.NilError(t, err)
+	assert.DeepEqual(t, []*DeviceInfo{
+		{
+			ID:      "GPU-ebe7c3f7-303d-558d-435e-99a160631fe4",
+			Index:   0,
+			Count:   10,
+			Devmem:  7680,
+			Devcore: 100,
+			Type:    "NVIDIA-Tesla P4",
+			Mode:    "hami-core",
+			Numa:    0,
+			Health:  true,
+		},
+	}, decoded)
+}
+
+func TestPodRequiresDevice(t *testing.T) {
+	mockDev := &mockDevices{
+		resourceRequest: ContainerDeviceRequest{
+			Nums:     1,
+			Type:     "NVIDIA",
+			Memreq:   1000,
+			Coresreq: 10,
+		},
+	}
+
+	gpuCtr := corev1.Container{
+		Name: "gpu-ctr",
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"nvidia.com/gpu": resource.MustParse("1"),
+			},
+		},
+	}
+	noGpuCtr := corev1.Container{
+		Name: "no-gpu-ctr",
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"cpu": resource.MustParse("1"),
+			},
+		},
+	}
+
+	tests := []struct {
+		name string
+		dev  Devices
+		pod  *corev1.Pod
+		want bool
+	}{
+		{
+			name: "nil pod returns false",
+			dev:  mockDev,
+			pod:  nil,
+			want: false,
+		},
+		{
+			name: "nil dev returns false",
+			dev:  nil,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{gpuCtr},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "no device request in init or regular containers",
+			dev:  mockDev,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{noGpuCtr},
+					Containers:     []corev1.Container{noGpuCtr},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "regular-container-only request",
+			dev:  mockDev,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{noGpuCtr},
+					Containers:     []corev1.Container{gpuCtr},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "init-container-only request",
+			dev:  mockDev,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{gpuCtr},
+					Containers:     []corev1.Container{noGpuCtr},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "init and regular container requests",
+			dev:  mockDev,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{gpuCtr},
+					Containers:     []corev1.Container{gpuCtr},
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := PodRequiresDevice(tt.dev, tt.pod)
+			assert.Equal(t, got, tt.want)
 		})
 	}
 }

@@ -19,17 +19,24 @@ package config
 import (
 	"flag"
 	"fmt"
+	"maps"
+	"math"
 	"os"
 	"reflect"
+	"slices"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v2"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
 	"github.com/Project-HAMi/HAMi/pkg/device/amd"
 	"github.com/Project-HAMi/HAMi/pkg/device/ascend"
 	"github.com/Project-HAMi/HAMi/pkg/device/awsneuron"
+	"github.com/Project-HAMi/HAMi/pkg/device/biren"
 	"github.com/Project-HAMi/HAMi/pkg/device/cambricon"
 	"github.com/Project-HAMi/HAMi/pkg/device/enflame"
 	"github.com/Project-HAMi/HAMi/pkg/device/hygon"
@@ -38,6 +45,7 @@ import (
 	"github.com/Project-HAMi/HAMi/pkg/device/metax"
 	"github.com/Project-HAMi/HAMi/pkg/device/mthreads"
 	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
+	"github.com/Project-HAMi/HAMi/pkg/device/remotegpu"
 	"github.com/Project-HAMi/HAMi/pkg/device/vastai"
 	"github.com/Project-HAMi/HAMi/pkg/util"
 )
@@ -50,18 +58,29 @@ var (
 	SchedulerName      string
 	MetricsBindAddress string
 
-	DefaultMem         int32
-	DefaultCores       int32
-	DefaultResourceNum int32
+	// ExtenderBind is where /filter and /bind are served. They are the
+	// scheduler extender's own endpoints, called by the kube-scheduler
+	// container sharing this pod's network namespace, so they are kept off
+	// HTTPBind: that address also serves /webhook and /refit and must stay
+	// reachable from the rest of the cluster.
+	ExtenderBind string
 
 	// NodeSchedulerPolicy is config this scheduler node to use `binpack` or `spread`. default value is binpack.
 	NodeSchedulerPolicy = util.NodeSchedulerPolicyBinpack.String()
+
+	// NodeAffinityScoreWeight is the bonus added to a node's score when it matches the pod's preferred nodeAffinity,
+	// scaled by the matched weight ratio. 0 (the default) disables the bonus.
+	NodeAffinityScoreWeight float32
 
 	// NodeLabelSelector is scheduler filter node by node label.
 	NodeLabelSelector map[string]string
 
 	// NodeLockTimeout is the timeout for node locks.
 	NodeLockTimeout time.Duration
+
+	// NodeLockRetryTimeout is how long Bind retries LockNode when contended by
+	// another PodGroup member. Zero disables retry (fail-fast).
+	NodeLockRetryTimeout time.Duration
 
 	// If set to false, When Pod.Spec.SchedulerName equals to the const DefaultSchedulerName in k8s.io/api/core/v1 package, webhook will not overwrite it, default value is true.
 	ForceOverwriteDefaultScheduler bool
@@ -70,6 +89,14 @@ var (
 	LeaderElect                  bool
 	LeaderElectResourceName      string
 	LeaderElectResourceNamespace string
+
+	// DevicePluginNamespace and DevicePluginServiceAccount identify the
+	// device-plugin's bound ServiceAccount. The /refit endpoint authenticates
+	// callers by TokenReview and only accepts a token whose username is
+	// exactly system:serviceaccount:<DevicePluginNamespace>:<DevicePluginServiceAccount>.
+	// See issue #2878.
+	DevicePluginNamespace      string
+	DevicePluginServiceAccount string
 )
 
 type Config struct {
@@ -84,6 +111,8 @@ type Config struct {
 	AWSNeuronConfig awsneuron.AWSNeuronConfig `yaml:"awsneuron"`
 	AMDGPUConfig    amd.AMDConfig             `yaml:"amd"`
 	VastaiConfig    vastai.VastaiConfig       `yaml:"vastai"`
+	BirenConfig     biren.BirenConfig         `yaml:"biren"`
+	RemoteGPUConfig remotegpu.RemoteGPUConfig `yaml:"remotegpu"`
 	VNPUs           ascend.VNPUs              `yaml:"vnpus"`
 }
 
@@ -141,12 +170,12 @@ func InitDevicesWithConfig(config *Config) error {
 			}
 			return cambricon.InitMLUDevice(cambriconConfig), nil
 		}, config.CambriconConfig},
-		{hygon.HygonDCUDevice, hygon.HygonDCUCommonWord, func(cfg any) (device.Devices, error) {
+		{hygon.HygonHCUDevice, hygon.HygonHCUCommonWord, func(cfg any) (device.Devices, error) {
 			hygonConfig, ok := cfg.(hygon.HygonConfig)
 			if !ok {
-				return nil, fmt.Errorf("invalid configuration for %s", hygon.HygonDCUCommonWord)
+				return nil, fmt.Errorf("invalid configuration for %s", hygon.HygonHCUCommonWord)
 			}
-			return hygon.InitDCUDevice(hygonConfig), nil
+			return hygon.InitHCUDevice(hygonConfig), nil
 		}, config.HygonConfig},
 		{enflame.EnflameGCUDevice, enflame.EnflameGCUCommonWord, func(cfg any) (device.Devices, error) {
 			enflameConfig, ok := cfg.(enflame.EnflameConfig)
@@ -218,6 +247,20 @@ func InitDevicesWithConfig(config *Config) error {
 			}
 			return vastai.InitVastaiDevice(vastaiConfig), nil
 		}, config.VastaiConfig},
+		{biren.BirenDevice, biren.BirenCommonWord, func(cfg any) (device.Devices, error) {
+			birenConfig, ok := cfg.(biren.BirenConfig)
+			if !ok {
+				return nil, fmt.Errorf("invalid configuration for %s", biren.BirenCommonWord)
+			}
+			return biren.InitBirenDevice(birenConfig), nil
+		}, config.BirenConfig},
+		{remotegpu.RemoteGPUDevice, remotegpu.RemoteGPUCommonWord, func(cfg any) (device.Devices, error) {
+			remoteGPUConfig, ok := cfg.(remotegpu.RemoteGPUConfig)
+			if !ok {
+				return nil, fmt.Errorf("invalid configuration for %s", remotegpu.RemoteGPUCommonWord)
+			}
+			return remotegpu.InitRemoteGPUDevice(remoteGPUConfig), nil
+		}, config.RemoteGPUConfig},
 	}
 
 	// Initialize all devices using the wrapped functions
@@ -245,13 +288,18 @@ func InitDevicesWithConfig(config *Config) error {
 		return fmt.Errorf("errors occurred during initialization: %v", initErrors)
 	}
 
+	if err := validateRegisteredDevices(device.DevicesMap); err != nil {
+		return fmt.Errorf("invalid device configuration: %w", err)
+	}
+
 	klog.Info("All devices initialized successfully")
 	return nil
 }
 
-// validateConfig validates the configuration object to ensure it is complete.
-func validateConfig(config *Config) error {
-	if !reflect.DeepEqual(config.NvidiaConfig, nvidia.NvidiaConfig{}) ||
+// anyDeviceConfigured reports whether at least one backend has been given a
+// configuration block.
+func anyDeviceConfigured(config *Config) bool {
+	return !reflect.DeepEqual(config.NvidiaConfig, nvidia.NvidiaConfig{}) ||
 		!reflect.DeepEqual(config.CambriconConfig, cambricon.CambriconConfig{}) ||
 		!reflect.DeepEqual(config.HygonConfig, hygon.HygonConfig{}) ||
 		len(config.IluvatarConfig) > 0 ||
@@ -261,10 +309,100 @@ func validateConfig(config *Config) error {
 		!reflect.DeepEqual(config.AWSNeuronConfig, awsneuron.AWSNeuronConfig{}) ||
 		!reflect.DeepEqual(config.EnflameConfig, enflame.EnflameConfig{}) ||
 		!reflect.DeepEqual(config.AMDGPUConfig, amd.AMDConfig{}) ||
-		len(config.VNPUs.Configs) > 0 {
-		return nil
+		!reflect.DeepEqual(config.VastaiConfig, vastai.VastaiConfig{}) ||
+		!reflect.DeepEqual(config.BirenConfig, biren.BirenConfig{}) ||
+		!reflect.DeepEqual(config.RemoteGPUConfig, remotegpu.RemoteGPUConfig{}) ||
+		len(config.VNPUs.Configs) > 0
+}
+
+// validateConfig validates the configuration object to ensure it is complete.
+//
+// It checks only the values that no backend can reinterpret later. Resource
+// names are deliberately left to validateRegisteredDevices, which reads them
+// back after each backend has applied its own defaults.
+func validateConfig(config *Config) error {
+	if !anyDeviceConfigured(config) {
+		return fmt.Errorf("all configurations are empty")
 	}
-	return fmt.Errorf("all configurations are empty")
+
+	var errs []error
+	// defaultCores is injected as a percentage of one GPU, so a value outside
+	// 0-100 can never be satisfied. Zero is valid and means "do not inject".
+	if config.NvidiaConfig.DefaultCores < 0 || config.NvidiaConfig.DefaultCores > 100 {
+		errs = append(errs, fmt.Errorf("nvidia: defaultCores is a percentage and must be between 0 and 100, got %d", config.NvidiaConfig.DefaultCores))
+	}
+	if config.NvidiaConfig.DefaultMemory < 0 {
+		errs = append(errs, fmt.Errorf("nvidia: defaultMemory must not be negative, got %d", config.NvidiaConfig.DefaultMemory))
+	}
+	return utilerrors.NewAggregate(errs)
+}
+
+// validateRegisteredDevices checks the resource names the backends advertise
+// once initialization has applied each backend's own defaults.
+//
+// Reading the names back through GetResourceNames keeps this uniform across
+// backends whose configuration structs differ, covers the ones that register
+// more than one device from a single configuration block, and sees the value a
+// backend substituted for an empty field rather than the empty field itself.
+//
+// An empty name is not an error: it means the backend does not offer that
+// dimension, or has not been configured at all, and the default configuration
+// registers several backends in exactly that state.
+func validateRegisteredDevices(devices map[string]device.Devices) error {
+	var errs []error
+	owners := make(map[string]string, len(devices))
+	memoryOwners := make(map[string]string, len(devices))
+	memoryFactors := make(map[string]int64, len(devices))
+
+	for _, commonWord := range slices.Sorted(maps.Keys(devices)) {
+		dev := devices[commonWord]
+		if dev == nil {
+			continue
+		}
+		names := dev.GetResourceNames()
+
+		for _, named := range []struct{ field, value string }{
+			{"resourceCountName", names.ResourceCountName},
+			{"resourceMemoryName", names.ResourceMemoryName},
+			{"resourceCoreName", names.ResourceCoreName},
+		} {
+			if named.value == "" {
+				continue
+			}
+			// A malformed name is reported rather than rejected: it cannot
+			// match a node resource, but it is the operator's name to choose
+			// and failing startup over it would be a breaking change.
+			if reasons := validation.IsQualifiedName(named.value); len(reasons) > 0 {
+				klog.ErrorS(nil, "Device resource name is not a valid Kubernetes qualified name and can never match a node resource",
+					"device", commonWord, "field", named.field, "value", named.value, "reason", strings.Join(reasons, "; "))
+			}
+		}
+
+		if names.MemoryFactor < 0 {
+			errs = append(errs, fmt.Errorf("%s: memoryFactor must not be negative, got %d", commonWord, names.MemoryFactor))
+		}
+
+		if names.ResourceMemoryName != "" {
+			factor := max(names.MemoryFactor, 1)
+			if previous, taken := memoryOwners[names.ResourceMemoryName]; !taken {
+				memoryOwners[names.ResourceMemoryName] = commonWord
+				memoryFactors[names.ResourceMemoryName] = factor
+			} else if memoryFactors[names.ResourceMemoryName] != factor {
+				errs = append(errs, fmt.Errorf("%s and %s both claim memory resource %q with different memoryFactor values; its quota limit cannot be scaled for both", previous, commonWord, names.ResourceMemoryName))
+			}
+		}
+
+		if names.ResourceCountName == "" {
+			continue
+		}
+		if previous, taken := owners[names.ResourceCountName]; taken {
+			errs = append(errs, fmt.Errorf("%s and %s both claim resource %q; a container requesting it would be allocated devices by both", previous, commonWord, names.ResourceCountName))
+			continue
+		}
+		owners[names.ResourceCountName] = commonWord
+	}
+
+	return utilerrors.NewAggregate(errs)
 }
 
 func InitDevices() {
@@ -301,9 +439,9 @@ cambricon:
   resourceMemoryName: "cambricon.com/mlu.smlu.vmemory"
   resourceCoreName: "cambricon.com/mlu.smlu.vcore"
 hygon:
-  resourceCountName: "hygon.com/dcunum"
-  resourceMemoryName: "hygon.com/dcumem"
-  resourceCoreName: "hygon.com/dcucores"
+  resourceCountName: "hygon.com/hcunum"
+  resourceMemoryName: "hygon.com/hcumem"
+  resourceCoreName: "hygon.com/hcucores"
 metax:
   resourceCountName: "metax-tech.com/gpu"
 mthreads:
@@ -316,11 +454,21 @@ iluvatars:
     resourceCountName: iluvatar.ai/MR-V100-vgpu
     resourceMemoryName: iluvatar.ai/MR-V100.vMem
     resourceCoreName: iluvatar.ai/MR-V100.vCore
+  - chipName: MR-V100A
+    commonWord: MR-V100A
+    resourceCountName: iluvatar.ai/MR-V100A-vgpu
+    resourceMemoryName: iluvatar.ai/MR-V100A.vMem
+    resourceCoreName: iluvatar.ai/MR-V100A.vCore
   - chipName: MR-V50
     commonWord: MR-V50
     resourceCountName: iluvatar.ai/MR-V50-vgpu
     resourceMemoryName: iluvatar.ai/MR-V50.vMem
     resourceCoreName: iluvatar.ai/MR-V50.vCore
+  - chipName: MR-V50A
+    commonWord: MR-V50A
+    resourceCountName: iluvatar.ai/MR-V50A-vgpu
+    resourceMemoryName: iluvatar.ai/MR-V50A.vMem
+    resourceCoreName: iluvatar.ai/MR-V50A.vCore
   - chipName: BI-V150
     commonWord: BI-V150
     resourceCountName: iluvatar.ai/BI-V150-vgpu
@@ -341,7 +489,7 @@ awsneuron:
 amd:
   resourceCountName: "amd.com/gpu"
 vnpus:
-  hamiVnpuCore: false
+  hamiVnpuMode: template
   configs:
   - chipName: "910A"
     commonWord: "Ascend910A"
@@ -438,7 +586,15 @@ vnpus:
       - name: "vir04"
         memory: 12288
         aiCore: 4
-        aiCPU: 4`
+        aiCPU: 4
+  # Ascend950DT 9582 whole-card configuration. One count request uses the full device memory.
+  - chipName: "Ascend950DT"
+    commonWord: "Ascend950DT"
+    resourceName: "huawei.com/Ascend950DT"
+    memoryAllocatable: 98304
+    memoryCapacity: 98304
+    aiCore: 32
+`
 
 	var yamlData Config
 	err := yaml.Unmarshal([]byte(configMapdata), &yamlData)
@@ -478,9 +634,20 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	var yamlData Config
-	if err := yaml.Unmarshal(data, &yamlData); err != nil {
+	if err := yaml.UnmarshalStrict(data, &yamlData); err != nil {
 		return nil, err
 	}
 	klog.Info("Successfully read and parsed config file")
 	return &yamlData, nil
+}
+
+// ValidateNodeAffinityScoreWeight rejects a --node-affinity-score-weight that
+// would corrupt node ordering: a negative weight turns the preferred-node bonus
+// into a penalty, and NaN or Inf make every score comparison meaningless.
+func ValidateNodeAffinityScoreWeight(weight float32) error {
+	w := float64(weight)
+	if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 {
+		return fmt.Errorf("--node-affinity-score-weight must be a finite number >= 0, got %v", weight)
+	}
+	return nil
 }

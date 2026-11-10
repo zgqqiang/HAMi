@@ -17,13 +17,193 @@ limitations under the License.
 package kunlun
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"gotest.tools/v3/assert"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/device/common"
 )
+
+func Test_KunlunDevices_CheckHealth(t *testing.T) {
+	KunlunResourceCount = "kunlunxin.com/xpu"
+	dev := &KunlunDevices{}
+
+	node := func(name string, allocatable, capacity int64) *corev1.Node {
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: corev1.NodeStatus{
+				Allocatable: corev1.ResourceList{},
+				Capacity:    corev1.ResourceList{},
+			},
+		}
+		if allocatable > 0 {
+			n.Status.Allocatable[corev1.ResourceName(KunlunResourceCount)] = *resource.NewQuantity(allocatable, resource.DecimalSI)
+		}
+		if capacity > 0 {
+			n.Status.Capacity[corev1.ResourceName(KunlunResourceCount)] = *resource.NewQuantity(capacity, resource.DecimalSI)
+		}
+		return n
+	}
+
+	healthy, needUpdate := dev.CheckHealth(KunlunGPUCommonWord, node("kunlun-health-absent", 0, 8))
+	assert.Equal(t, healthy, false)
+	assert.Equal(t, needUpdate, false)
+
+	present := node("kunlun-health-present", 8, 8)
+	healthy, needUpdate = dev.CheckHealth(KunlunGPUCommonWord, present)
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+	healthy, needUpdate = dev.CheckHealth(KunlunGPUCommonWord, present)
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, false)
+
+	// Allocatable is unchanged, but Capacity is what the device list is built from.
+	resized := node("kunlun-health-present", 8, 4)
+	healthy, needUpdate = dev.CheckHealth(KunlunGPUCommonWord, resized)
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+}
+
+func Test_KunlunDevices_GenerateResourceRequests(t *testing.T) {
+	KunlunResourceCount = "kunlunxin.com/xpu"
+
+	tests := []struct {
+		name string
+		args *corev1.Container
+		want device.ContainerDeviceRequest
+	}{
+		{
+			name: "nothing requested",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits:   corev1.ResourceList{},
+					Requests: corev1.ResourceList{},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "valid positive count",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceName(KunlunResourceCount): resource.MustParse("1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(1),
+				Type:             KunlunGPUDevice,
+				Memreq:           0,
+				MemPercentagereq: 100,
+				Coresreq:         0,
+			},
+		},
+		{
+			name: "zero count must not silently bypass quota",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceName(KunlunResourceCount): resource.MustParse("0"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "negative count must be rejected",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceName(KunlunResourceCount): resource.MustParse("-1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "max int64 count is accepted",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceName(KunlunResourceCount): resource.MustParse("2147483647"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(2147483647),
+				Type:             KunlunGPUDevice,
+				Memreq:           0,
+				MemPercentagereq: 100,
+				Coresreq:         0,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dev := KunlunDevices{}
+			result, _ := dev.GenerateResourceRequests(test.args)
+			assert.DeepEqual(t, result, test.want)
+		})
+	}
+}
+
+func TestKunlunVDevices_Fit_Mutex(t *testing.T) {
+	dev := &KunlunVDevices{}
+	// 8 shareable VXPU devices, each already used but memory-matching, so
+	// FitVXPU would accept them for sharing.
+	devices := make([]*device.DeviceUsage, 8)
+	for i := range devices {
+		devices[i] = &device.DeviceUsage{Index: uint(i), Used: 1, Usedmem: 24576, Totalmem: 98304, Health: true}
+	}
+	req := device.ContainerDeviceRequest{Nums: 1, Memreq: 24576}
+	nodeInfo := &device.NodeInfo{}
+	allocated := &device.PodDevices{}
+
+	// Default policy shares a used device.
+	fit, _, _ := dev.Fit(devices, req, &corev1.Pod{}, nodeInfo, allocated)
+	assert.Equal(t, fit, true)
+
+	// Mutex policy has no idle device to use, so it must be rejected.
+	mutexPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{"hami.io/gpu-scheduler-policy": "mutex"},
+	}}
+	fit, _, reason := dev.Fit(devices, req, mutexPod, nodeInfo, allocated)
+	assert.Equal(t, fit, false)
+	assert.Equal(t, reason, "8/8 "+common.ExclusiveDeviceAllocateConflict)
+}
+
+func TestKunlunVDevices_Fit_NumaNotFit(t *testing.T) {
+	dev := &KunlunVDevices{}
+	devices := make([]*device.DeviceUsage, 8)
+	for i := range devices {
+		devices[i] = &device.DeviceUsage{Index: uint(i), Used: 0, Usedmem: 0, Totalmem: 1024}
+	}
+	req := device.ContainerDeviceRequest{Nums: 1, Memreq: 2048}
+
+	fit, _, reason := dev.Fit(devices, req, &corev1.Pod{}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, reason, "1/8 "+common.NumaNotFit)
+}
+
+func TestKunlunDevices_Fit_NumaNotFit(t *testing.T) {
+	dev := &KunlunDevices{}
+	devices := make([]*device.DeviceUsage, 8)
+	for i := range devices {
+		devices[i] = &device.DeviceUsage{Index: uint(i), Used: 1}
+	}
+	req := device.ContainerDeviceRequest{Nums: 1, Type: KunlunGPUDevice}
+
+	fit, _, reason := dev.Fit(devices, req, &corev1.Pod{}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, reason, "1/8 "+common.NumaNotFit)
+}
 
 func Test_graphSelect(t *testing.T) {
 	tests := []struct {
@@ -41,14 +221,14 @@ func Test_graphSelect(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0},
-					{Index: 1, Used: 0},
-					{Index: 2, Used: 0},
-					{Index: 3, Used: 0},
-					{Index: 4, Used: 0},
-					{Index: 5, Used: 0},
-					{Index: 6, Used: 0},
-					{Index: 7, Used: 0},
+					{Index: 0, Used: 0, Health: true},
+					{Index: 1, Used: 0, Health: true},
+					{Index: 2, Used: 0, Health: true},
+					{Index: 3, Used: 0, Health: true},
+					{Index: 4, Used: 0, Health: true},
+					{Index: 5, Used: 0, Health: true},
+					{Index: 6, Used: 0, Health: true},
+					{Index: 7, Used: 0, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 8},
 			},
@@ -61,14 +241,14 @@ func Test_graphSelect(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0},
-					{Index: 1, Used: 0},
-					{Index: 2, Used: 0},
-					{Index: 3, Used: 0},
-					{Index: 4, Used: 0},
-					{Index: 5, Used: 1},
-					{Index: 6, Used: 0},
-					{Index: 7, Used: 0},
+					{Index: 0, Used: 0, Health: true},
+					{Index: 1, Used: 0, Health: true},
+					{Index: 2, Used: 0, Health: true},
+					{Index: 3, Used: 0, Health: true},
+					{Index: 4, Used: 0, Health: true},
+					{Index: 5, Used: 1, Health: true},
+					{Index: 6, Used: 0, Health: true},
+					{Index: 7, Used: 0, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 8},
 			},
@@ -81,14 +261,14 @@ func Test_graphSelect(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0},
-					{Index: 1, Used: 0},
-					{Index: 2, Used: 0},
-					{Index: 3, Used: 0},
-					{Index: 4, Used: 0},
-					{Index: 5, Used: 1},
-					{Index: 6, Used: 0},
-					{Index: 7, Used: 0},
+					{Index: 0, Used: 0, Health: true},
+					{Index: 1, Used: 0, Health: true},
+					{Index: 2, Used: 0, Health: true},
+					{Index: 3, Used: 0, Health: true},
+					{Index: 4, Used: 0, Health: true},
+					{Index: 5, Used: 1, Health: true},
+					{Index: 6, Used: 0, Health: true},
+					{Index: 7, Used: 0, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 2},
 			},
@@ -101,14 +281,14 @@ func Test_graphSelect(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0},
-					{Index: 1, Used: 0},
-					{Index: 2, Used: 0},
-					{Index: 3, Used: 0},
-					{Index: 4, Used: 0},
-					{Index: 5, Used: 1},
-					{Index: 6, Used: 0},
-					{Index: 7, Used: 0},
+					{Index: 0, Used: 0, Health: true},
+					{Index: 1, Used: 0, Health: true},
+					{Index: 2, Used: 0, Health: true},
+					{Index: 3, Used: 0, Health: true},
+					{Index: 4, Used: 0, Health: true},
+					{Index: 5, Used: 1, Health: true},
+					{Index: 6, Used: 0, Health: true},
+					{Index: 7, Used: 0, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 1},
 			},
@@ -121,14 +301,14 @@ func Test_graphSelect(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0},
-					{Index: 1, Used: 0},
-					{Index: 2, Used: 0},
-					{Index: 3, Used: 0},
-					{Index: 4, Used: 0},
-					{Index: 5, Used: 0},
-					{Index: 6, Used: 1},
-					{Index: 7, Used: 1},
+					{Index: 0, Used: 0, Health: true},
+					{Index: 1, Used: 0, Health: true},
+					{Index: 2, Used: 0, Health: true},
+					{Index: 3, Used: 0, Health: true},
+					{Index: 4, Used: 0, Health: true},
+					{Index: 5, Used: 0, Health: true},
+					{Index: 6, Used: 1, Health: true},
+					{Index: 7, Used: 1, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 1},
 			},
@@ -141,14 +321,14 @@ func Test_graphSelect(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 1},
-					{Index: 1, Used: 1},
-					{Index: 2, Used: 1},
-					{Index: 3, Used: 0},
-					{Index: 4, Used: 1},
-					{Index: 5, Used: 1},
-					{Index: 6, Used: 1},
-					{Index: 7, Used: 0},
+					{Index: 0, Used: 1, Health: true},
+					{Index: 1, Used: 1, Health: true},
+					{Index: 2, Used: 1, Health: true},
+					{Index: 3, Used: 0, Health: true},
+					{Index: 4, Used: 1, Health: true},
+					{Index: 5, Used: 1, Health: true},
+					{Index: 6, Used: 1, Health: true},
+					{Index: 7, Used: 0, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 2},
 			},
@@ -161,14 +341,14 @@ func Test_graphSelect(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0},
-					{Index: 1, Used: 0},
-					{Index: 2, Used: 1},
-					{Index: 3, Used: 1},
-					{Index: 4, Used: 0},
-					{Index: 5, Used: 0},
-					{Index: 6, Used: 0},
-					{Index: 7, Used: 1},
+					{Index: 0, Used: 0, Health: true},
+					{Index: 1, Used: 0, Health: true},
+					{Index: 2, Used: 1, Health: true},
+					{Index: 3, Used: 1, Health: true},
+					{Index: 4, Used: 0, Health: true},
+					{Index: 5, Used: 0, Health: true},
+					{Index: 6, Used: 0, Health: true},
+					{Index: 7, Used: 1, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 4},
 			},
@@ -181,14 +361,14 @@ func Test_graphSelect(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0},
-					{Index: 1, Used: 0},
-					{Index: 2, Used: 0},
-					{Index: 3, Used: 1},
-					{Index: 4, Used: 0},
-					{Index: 5, Used: 0},
-					{Index: 6, Used: 1},
-					{Index: 7, Used: 0},
+					{Index: 0, Used: 0, Health: true},
+					{Index: 1, Used: 0, Health: true},
+					{Index: 2, Used: 0, Health: true},
+					{Index: 3, Used: 1, Health: true},
+					{Index: 4, Used: 0, Health: true},
+					{Index: 5, Used: 0, Health: true},
+					{Index: 6, Used: 1, Health: true},
+					{Index: 7, Used: 0, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 4},
 			},
@@ -201,14 +381,14 @@ func Test_graphSelect(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0},
-					{Index: 1, Used: 0},
-					{Index: 2, Used: 1},
-					{Index: 3, Used: 0},
-					{Index: 4, Used: 0},
-					{Index: 5, Used: 0},
-					{Index: 6, Used: 1},
-					{Index: 7, Used: 0},
+					{Index: 0, Used: 0, Health: true},
+					{Index: 1, Used: 0, Health: true},
+					{Index: 2, Used: 1, Health: true},
+					{Index: 3, Used: 0, Health: true},
+					{Index: 4, Used: 0, Health: true},
+					{Index: 5, Used: 0, Health: true},
+					{Index: 6, Used: 1, Health: true},
+					{Index: 7, Used: 0, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 4},
 			},
@@ -239,14 +419,14 @@ func Test_graphSelectVXPU(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 1, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 2, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 3, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 5, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 6, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304},
+					{Index: 0, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 1, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 2, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 3, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 5, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 6, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 8, Memreq: 24576},
 			},
@@ -259,14 +439,14 @@ func Test_graphSelectVXPU(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 1, Used: 1, Usedmem: 24576, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 2, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 3, Used: 2, Usedmem: 49152, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 5, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 6, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304},
+					{Index: 0, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 1, Used: 1, Usedmem: 24576, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 2, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 3, Used: 2, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 5, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 6, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 4, Memreq: 24576},
 			},
@@ -279,14 +459,14 @@ func Test_graphSelectVXPU(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 1, Used: 2, Usedmem: 49152, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 2, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 3, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 5, Used: 1, Usedmem: 24576, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 6, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304},
+					{Index: 0, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 1, Used: 2, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 2, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 3, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 5, Used: 1, Usedmem: 24576, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 6, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 4, Memreq: 24576},
 			},
@@ -299,14 +479,14 @@ func Test_graphSelectVXPU(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 1, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 2, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 3, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 4, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 5, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 6, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 7, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
+					{Index: 0, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 1, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 2, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 3, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 4, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 5, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 6, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 7, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
 				},
 				c: device.ContainerDeviceRequest{Nums: 2, Memreq: 24576},
 			},
@@ -319,14 +499,14 @@ func Test_graphSelectVXPU(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 1, Usedmem: 24576, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 1, Used: 1, Usedmem: 24576, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 2, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 3, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 5, Used: 1, Usedmem: 24576, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 6, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304},
+					{Index: 0, Used: 1, Usedmem: 24576, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 1, Used: 1, Usedmem: 24576, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 2, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 3, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 5, Used: 1, Usedmem: 24576, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 6, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 1, Memreq: 24576},
 			},
@@ -339,14 +519,14 @@ func Test_graphSelectVXPU(t *testing.T) {
 				c device.ContainerDeviceRequest
 			}{
 				d: []*device.DeviceUsage{
-					{Index: 0, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 1, Used: 2, Usedmem: 49152, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 2, Used: 1, Usedmem: 24576, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 3, Used: 1, Usedmem: 49152, Totalmem: 98304}, // avgMem = 49152, doesn't match request
-					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 5, Used: 0, Usedmem: 0, Totalmem: 98304},
-					{Index: 6, Used: 1, Usedmem: 24576, Totalmem: 98304}, // avgMem = 24576, matches request
-					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304},
+					{Index: 0, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 1, Used: 2, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 2, Used: 1, Usedmem: 24576, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 3, Used: 1, Usedmem: 49152, Totalmem: 98304, Health: true}, // avgMem = 49152, doesn't match request
+					{Index: 4, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 5, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
+					{Index: 6, Used: 1, Usedmem: 24576, Totalmem: 98304, Health: true}, // avgMem = 24576, matches request
+					{Index: 7, Used: 0, Usedmem: 0, Totalmem: 98304, Health: true},
 				},
 				c: device.ContainerDeviceRequest{Nums: 2, Memreq: 24576},
 			},
@@ -457,4 +637,140 @@ func Test_ScoreNode(t *testing.T) {
 			assert.DeepEqual(t, result, test.want)
 		})
 	}
+}
+
+// hami.io/use-kunlun-uuid and nouse-kunlun-uuid were defined but never consulted, so
+// a pod asking for a specific XPU was scheduled onto any of them.
+func TestKunlunDevices_Fit_UseUUID(t *testing.T) {
+	dev := &KunlunDevices{}
+	devices := make([]*device.DeviceUsage, 8)
+	for i := range devices {
+		devices[i] = &device.DeviceUsage{
+			Index:     uint(i),
+			ID:        fmt.Sprintf("xpu-%d", i),
+			Count:     1,
+			Totalmem:  KunlunMaxMemory,
+			Totalcore: 100,
+			Health:    true,
+		}
+	}
+	req := device.ContainerDeviceRequest{Nums: 1, Type: KunlunGPUDevice}
+
+	podWith := func(annos map[string]string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: annos}}
+	}
+
+	// Test legacy annotation
+	fit, res, _ := dev.Fit(devices, req, podWith(map[string]string{
+		KunlunUseUUID: "xpu-5",
+	}), &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, true)
+	assert.Equal(t, len(res[KunlunGPUDevice]), 1)
+	assert.Equal(t, res[KunlunGPUDevice][0].UUID, "xpu-5")
+
+	// Test new standard annotation
+	fit, res, _ = dev.Fit(devices, req, podWith(map[string]string{
+		UseUUIDAnno: "xpu-3",
+	}), &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, true)
+	assert.Equal(t, len(res[KunlunGPUDevice]), 1)
+	assert.Equal(t, res[KunlunGPUDevice][0].UUID, "xpu-3")
+
+	// the literal key, so a rename of the constant cannot silently stop the
+	// physical path from reading what vdevice.go documents.
+	fit, res, _ = dev.Fit(devices, req, podWith(map[string]string{
+		"hami.io/use-xpu-uuid": "xpu-6",
+	}), &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, true)
+	assert.Equal(t, len(res[KunlunGPUDevice]), 1)
+	assert.Equal(t, res[KunlunGPUDevice][0].UUID, "xpu-6")
+
+	// asking for a card that is not on the node must not fall back to another
+	fit, _, reason := dev.Fit(devices, req, podWith(map[string]string{
+		UseUUIDAnno: "xpu-99",
+	}), &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Assert(t, strings.Contains(reason, common.CardUUIDMismatch))
+}
+
+func TestKunlunDevices_Fit_NoUseUUID(t *testing.T) {
+	dev := &KunlunDevices{}
+	devices := make([]*device.DeviceUsage, 8)
+	for i := range devices {
+		devices[i] = &device.DeviceUsage{
+			Index:     uint(i),
+			ID:        fmt.Sprintf("xpu-%d", i),
+			Count:     1,
+			Totalmem:  KunlunMaxMemory,
+			Totalcore: 100,
+			Health:    true,
+		}
+	}
+	req := device.ContainerDeviceRequest{Nums: 1, Type: KunlunGPUDevice}
+
+	// exclude every card and nothing should be allocatable (using legacy annotation)
+	all := make([]string, 0, 8)
+	for i := range devices {
+		all = append(all, fmt.Sprintf("xpu-%d", i))
+	}
+	fit, _, reason := dev.Fit(devices, req, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			KunlunNoUseUUID: strings.Join(all, ","),
+		}},
+	}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Assert(t, strings.Contains(reason, common.CardUUIDMismatch))
+
+	// exclude every card and nothing should be allocatable (using new standard annotation)
+	fit, _, reason = dev.Fit(devices, req, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			NoUseUUIDAnno: strings.Join(all, ","),
+		}},
+	}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Assert(t, strings.Contains(reason, common.CardUUIDMismatch))
+}
+
+func TestKunlunVDevices_Fit_UUIDAnnotations(t *testing.T) {
+	dev := &KunlunVDevices{}
+	devices := make([]*device.DeviceUsage, 8)
+	for i := range devices {
+		devices[i] = &device.DeviceUsage{
+			Index:     uint(i),
+			ID:        fmt.Sprintf("xpu-%d", i),
+			Count:     10,
+			Totalmem:  KunlunMaxMemory,
+			Totalcore: 100,
+			Health:    true,
+		}
+	}
+	req := device.ContainerDeviceRequest{Nums: 1, Type: XPUDevice, Memreq: KunlunMaxMemory}
+
+	// Test standard hami annotation
+	fit, res, _ := dev.Fit(devices, req, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{UseUUIDAnno: "xpu-3"}},
+	}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, true)
+	assert.Equal(t, res[XPUDevice][0].UUID, "xpu-3")
+
+	// Test legacy baidu annotation (backward compatibility)
+	fit, res, _ = dev.Fit(devices, req, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{KunlunUseUUID: "xpu-2"}},
+	}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, true)
+	assert.Equal(t, res[XPUDevice][0].UUID, "xpu-2")
+
+	// Test standard hami nouse annotation
+	fit, _, reason := dev.Fit(devices, req, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{NoUseUUIDAnno: "xpu-0,xpu-1,xpu-2,xpu-3,xpu-4,xpu-5,xpu-6,xpu-7"}},
+	}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Assert(t, strings.Contains(reason, common.CardUUIDMismatch))
+
+	// Test legacy baidu nouse annotation
+	fit, _, reason = dev.Fit(devices, req, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{KunlunNoUseUUID: "xpu-0,xpu-1,xpu-2,xpu-3,xpu-4,xpu-5,xpu-6,xpu-7"}},
+	}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Assert(t, strings.Contains(reason, common.CardUUIDMismatch))
 }

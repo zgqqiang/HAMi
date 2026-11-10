@@ -18,20 +18,35 @@ package scheduler
 
 import (
 	"context"
+	"errors"
+	"flag"
+	"net/http"
+	"strings"
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/device/ascend"
+	"github.com/Project-HAMi/HAMi/pkg/device/awsneuron"
+	"github.com/Project-HAMi/HAMi/pkg/device/cambricon"
+	"github.com/Project-HAMi/HAMi/pkg/device/hygon"
 	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
+	"github.com/Project-HAMi/HAMi/pkg/device/remotegpu"
 	"github.com/Project-HAMi/HAMi/pkg/scheduler/config"
+	"github.com/Project-HAMi/HAMi/pkg/util"
+	"github.com/Project-HAMi/HAMi/pkg/util/client"
 )
 
 func TestHandle(t *testing.T) {
@@ -262,14 +277,14 @@ func TestFitResourceQuota(t *testing.T) {
 		klog.Fatalf("Failed to initialize devices with config: %v", err)
 	}
 
-	qm := device.NewQuotaManager()
 	ns := "default"
 	memName := "nvidia.com/gpumem"
 	coreName := "nvidia.com/gpucores"
+	qm := device.NewQuotaManager()
 
 	qm.Quotas[ns] = &device.DeviceQuota{
-		memName:  &device.Quota{Used: 1000, Limit: 2000},
-		coreName: &device.Quota{Used: 200, Limit: 400},
+		memName:  &device.Quota{Used: 1000, Limit: 2000, LimitSet: true},
+		coreName: &device.Quota{Used: 200, Limit: 400, LimitSet: true},
 	}
 
 	testCases := []struct {
@@ -356,7 +371,117 @@ func TestFitResourceQuota(t *testing.T) {
 					},
 				},
 			},
+			fit: false,
+		},
+		{
+			name: "request multiple gpus within quota",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod",
+					Namespace: "default",
+				},
+				Spec: corev1.PodSpec{
+					SchedulerName: "hami-scheduler",
+					Containers: []corev1.Container{
+						{
+							Name: "container1",
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: nil,
+							},
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									"nvidia.com/gpu":    resource.MustParse("2"),
+									"nvidia.com/gpumem": resource.MustParse("400"),
+								},
+							},
+						},
+					},
+				},
+			},
 			fit: true,
+		},
+		{
+			name: "InitContainers run sequentially: max init fits quota, but simple sum would exceed",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod-init-fit",
+					Namespace: "default",
+				},
+				Spec: corev1.PodSpec{
+					SchedulerName: "hami-scheduler",
+					// Two init containers each asking for 800. Max = 800.
+					InitContainers: []corev1.Container{
+						{
+							Name: "init1",
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									"nvidia.com/gpu":    resource.MustParse("1"),
+									"nvidia.com/gpumem": resource.MustParse("800"),
+								},
+							},
+						},
+						{
+							Name: "init2",
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									"nvidia.com/gpu":    resource.MustParse("1"),
+									"nvidia.com/gpumem": resource.MustParse("800"),
+								},
+							},
+						},
+					},
+					// App container asking for 500. Total effective requirement = max(800, 500) = 800.
+					// 800 is less than the available 1000 limit, so it should fit.
+					// If the quota manager wrongly sums everything (800+800+500=2100), this test will catch it by failing.
+					Containers: []corev1.Container{
+						{
+							Name: "app1",
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									"nvidia.com/gpu":    resource.MustParse("1"),
+									"nvidia.com/gpumem": resource.MustParse("500"),
+								},
+							},
+						},
+					},
+				},
+			},
+			fit: true,
+		},
+		{
+			name: "InitContainer request exceeds quota directly",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-pod-init-fail",
+					Namespace: "default",
+				},
+				Spec: corev1.PodSpec{
+					SchedulerName: "hami-scheduler",
+					InitContainers: []corev1.Container{
+						{
+							Name: "init-massive",
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									"nvidia.com/gpu":    resource.MustParse("1"),
+									"nvidia.com/gpumem": resource.MustParse("1500"), // 1500 > 1000 available limit
+								},
+							},
+						},
+					},
+					Containers: []corev1.Container{
+						{
+							Name: "app1",
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									"nvidia.com/gpu":    resource.MustParse("1"),
+									"nvidia.com/gpumem": resource.MustParse("100"),
+								},
+							},
+						},
+					},
+				},
+			},
+			fit: false,
 		},
 		{
 			name: "request ascend",
@@ -389,11 +514,343 @@ func TestFitResourceQuota(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			result := fitResourceQuota(tc.pod)
-			if tc.fit != result {
-				t.Errorf("Expected %v, but got %v", tc.fit, result)
+			err := fitResourceQuota(tc.pod)
+			if (err == nil) != tc.fit {
+				t.Errorf("Expected fit=%v, but got error: %v", tc.fit, err)
 			}
 		})
+	}
+}
+
+// mluPod builds a pod requesting one MLU with the given vmemory and vcore.
+func mluPod(ns string, vmemory, vcore string) *corev1.Pod {
+	limits := corev1.ResourceList{
+		"cambricon.com/mlu":              resource.MustParse("1"),
+		"cambricon.com/mlu.smlu.vmemory": resource.MustParse(vmemory),
+	}
+	if vcore != "" {
+		limits["cambricon.com/mlu.smlu.vcore"] = resource.MustParse(vcore)
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "mlu-pod", Namespace: ns},
+		Spec: corev1.PodSpec{
+			SchedulerName: "hami-scheduler",
+			Containers: []corev1.Container{{
+				Name:      "container1",
+				Resources: corev1.ResourceRequirements{Limits: limits},
+			}},
+		},
+	}
+}
+
+func addQuota(t *testing.T, qm *device.QuotaManager, ns, resourceName, limit string) {
+	t.Helper()
+
+	rq := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "limits", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{
+			corev1.ResourceName("limits." + resourceName): resource.MustParse(limit),
+		}},
+	}
+	qm.AddQuota(rq)
+	t.Cleanup(func() {
+		qm.DelQuota(rq)
+		delete(qm.Quotas, ns)
+	})
+}
+
+// Quota used to be checked for NVIDIA only, so a namespace limit on any other
+// vendor's memory or cores was silently ignored.
+func TestFitResourceQuotaNonNvidia(t *testing.T) {
+	config.SchedulerName = "hami-scheduler"
+
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultGPUNum:                1,
+			MemoryFactor:                 1,
+		},
+		CambriconConfig: cambricon.CambriconConfig{
+			ResourceCountName:  "cambricon.com/mlu",
+			ResourceMemoryName: "cambricon.com/mlu.smlu.vmemory",
+			ResourceCoreName:   "cambricon.com/mlu.smlu.vcore",
+		},
+		HygonConfig: hygon.HygonConfig{
+			ResourceCountName:  "hygon.com/hcunum",
+			ResourceMemoryName: "hygon.com/hcumem",
+			ResourceCoreName:   "hygon.com/hcucores",
+			// Hygon scales the requested memory by this before recording it.
+			MemoryFactor: 2,
+		},
+	}
+	if err := config.InitDevicesWithConfig(sConfig); err != nil {
+		t.Fatalf("failed to initialize devices: %v", err)
+	}
+
+	qm := device.NewQuotaManager()
+
+	// One MLU vmemory unit is 256 MiB, so a limit of 100 units leaves room for
+	// 25600 MiB. Comparing the request against the raw 100 would deny every pod.
+	addQuota(t, qm, "mlu-mem", "cambricon.com/mlu.smlu.vmemory", "100")
+	qm.Quotas["mlu-core"] = &device.DeviceQuota{
+		"cambricon.com/mlu.smlu.vcore": &device.Quota{Used: 20, Limit: 50, LimitSet: true},
+	}
+	addQuota(t, qm, "hcu-mem", "hygon.com/hcumem", "1000")
+	t.Cleanup(func() { delete(qm.Quotas, "mlu-core") })
+
+	hcuPod := func(ns, hcumem string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "hcu-pod", Namespace: ns},
+			Spec: corev1.PodSpec{
+				SchedulerName: "hami-scheduler",
+				Containers: []corev1.Container{{
+					Name: "container1",
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							"hygon.com/hcunum": resource.MustParse("1"),
+							"hygon.com/hcumem": resource.MustParse(hcumem),
+						},
+					},
+				}},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name string
+		pod  *corev1.Pod
+		fit  bool
+	}{
+		{
+			name: "mlu memory within quota",
+			pod:  mluPod("mlu-mem", "50", ""),
+			fit:  true,
+		},
+		{
+			name: "mlu memory over quota",
+			pod:  mluPod("mlu-mem", "200", ""),
+			fit:  false,
+		},
+		{
+			name: "mlu cores over quota",
+			pod:  mluPod("mlu-core", "1", "60"),
+			fit:  false,
+		},
+		{
+			name: "mlu in a namespace with no quota",
+			pod:  mluPod("unquotaed", "10000", ""),
+			fit:  true,
+		},
+		{
+			name: "hcu memory within quota once the factor is applied",
+			pod:  hcuPod("hcu-mem", "800"),
+			fit:  true,
+		},
+		{
+			name: "hcu memory over quota",
+			pod:  hcuPod("hcu-mem", "1200"),
+			fit:  false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := fitResourceQuota(tc.pod); (err == nil) != tc.fit {
+				t.Errorf("fitResourceQuota() error = %v, want fit %v", err, tc.fit)
+			}
+		})
+	}
+}
+
+func TestFitResourceQuotaAWSNeuronCoreRequest(t *testing.T) {
+	if err := config.InitDevicesWithConfig(&config.Config{AWSNeuronConfig: awsneuron.AWSNeuronConfig{
+		ResourceCountName: "aws.amazon.com/neuron",
+		ResourceCoreName:  "aws.amazon.com/neuroncore",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	quota := device.NewQuotaManager()
+	quota.Quotas["neuron-core-limit"] = &device.DeviceQuota{
+		"aws.amazon.com/neuroncore": &device.Quota{Limit: 5, LimitSet: true},
+	}
+	t.Cleanup(func() { delete(quota.Quotas, "neuron-core-limit") })
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "neuron-core-limit"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+				"aws.amazon.com/neuroncore": resource.MustParse("6"),
+			}},
+		}}},
+	}
+	if err := fitResourceQuota(pod); err == nil {
+		t.Fatal("six requested NeuronCores must exceed a five-core quota")
+	}
+	pod.Spec.Containers[0].Resources.Limits["aws.amazon.com/neuroncore"] = resource.MustParse("4")
+	if err := fitResourceQuota(pod); err != nil {
+		t.Fatal("four requested NeuronCores should fit a five-core quota")
+	}
+	quota.AddUsage(pod, device.PodDevices{awsneuron.AWSNeuronDevice: {{
+		{Usedcores: 1}, {Usedcores: 2}, {Usedcores: 4}, {Usedcores: 8},
+	}}})
+	if used := (*quota.Quotas["neuron-core-limit"])["aws.amazon.com/neuroncore"].Used; used != 4 {
+		t.Fatalf("quota used = %d, want 4 allocated NeuronCores", used)
+	}
+}
+
+// A pod asking for two MLUs consumes twice the per-device memory.
+func TestFitResourceQuotaCountsEveryDevice(t *testing.T) {
+	config.SchedulerName = "hami-scheduler"
+
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultGPUNum:                1,
+			MemoryFactor:                 1,
+		},
+		CambriconConfig: cambricon.CambriconConfig{
+			ResourceCountName:  "cambricon.com/mlu",
+			ResourceMemoryName: "cambricon.com/mlu.smlu.vmemory",
+			ResourceCoreName:   "cambricon.com/mlu.smlu.vcore",
+		},
+	}
+	if err := config.InitDevicesWithConfig(sConfig); err != nil {
+		t.Fatalf("failed to initialize devices: %v", err)
+	}
+
+	qm := device.NewQuotaManager()
+	// 60 units is 15360 MiB of headroom.
+	addQuota(t, qm, "mlu-multi", "cambricon.com/mlu.smlu.vmemory", "60")
+
+	pod := mluPod("mlu-multi", "40", "")
+	pod.Spec.Containers[0].Resources.Limits["cambricon.com/mlu"] = resource.MustParse("2")
+
+	// 2 x 40 units is 80, past the 60 unit limit, even though one device fits.
+	if err := fitResourceQuota(pod); err == nil {
+		t.Errorf("fitResourceQuota() = nil error, want a denial: two devices should each count against the quota: %v", err)
+	}
+}
+
+// A count of zero is how a workload says "no device", not a malformed request,
+// so admission has to let it through. The webhook runs fitResourceQuota on
+// every pod it sees, so treating zero as invalid here would deny ordinary CPU
+// pods whose chart renders the GPU count as 0.
+func TestFitResourceQuotaAllowsZeroCount(t *testing.T) {
+	config.SchedulerName = "hami-scheduler"
+
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultGPUNum:                1,
+			MemoryFactor:                 1,
+		},
+	}
+	if err := config.InitDevicesWithConfig(sConfig); err != nil {
+		t.Fatalf("failed to initialize devices: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "zero-gpu", Namespace: "zero-gpu-ns"},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: "app",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu": *resource.NewQuantity(0, resource.BinarySI),
+					},
+				},
+			}},
+		},
+	}
+
+	if err := fitResourceQuota(pod); err != nil {
+		t.Errorf("fitResourceQuota() = %v, want nil: a zero count means no device is requested, not an invalid request", err)
+	}
+}
+
+// Ascend applies a configurable factor to the memory it records, so the limit
+// has to be raised by the same factor or pods that are within quota get denied.
+func TestFitResourceQuotaAscendMemoryFactor(t *testing.T) {
+	config.SchedulerName = "hami-scheduler"
+
+	fs := flag.NewFlagSet("ascend-quota-test", flag.ContinueOnError)
+	ascend.ParseConfig(fs)
+	if err := fs.Parse([]string{"--enable-ascend=true"}); err != nil {
+		t.Fatalf("failed to enable the ascend backend: %v", err)
+	}
+	t.Cleanup(func() {
+		restore := flag.NewFlagSet("ascend-quota-restore", flag.ContinueOnError)
+		ascend.ParseConfig(restore)
+		_ = restore.Parse([]string{"--enable-ascend=false"})
+	})
+
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultGPUNum:                1,
+			MemoryFactor:                 1,
+		},
+		VNPUs: ascend.VNPUs{
+			Configs: []ascend.VNPUConfig{{
+				CommonWord:         "Ascend910B",
+				ResourceName:       "huawei.com/Ascend910B",
+				ResourceMemoryName: "huawei.com/Ascend910B-memory",
+				ResourceCoreName:   "huawei.com/Ascend910B-core",
+				MemoryCapacity:     65536,
+				MemoryAllocatable:  65536,
+				MemoryFactor:       4,
+			}},
+		},
+	}
+	if err := config.InitDevicesWithConfig(sConfig); err != nil {
+		t.Fatalf("failed to initialize devices: %v", err)
+	}
+	if _, ok := device.GetDevices()["Ascend910B"]; !ok {
+		t.Fatal("the ascend backend was not registered, the test would pass vacuously")
+	}
+
+	qm := device.NewQuotaManager()
+	addQuota(t, qm, "ascend", "huawei.com/Ascend910B-memory", "8192")
+
+	// Requesting -core keeps the raw scaled value instead of rounding to a
+	// template, which makes the arithmetic here easy to follow.
+	ascendPod := func(mem string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "ascend-pod", Namespace: "ascend"},
+			Spec: corev1.PodSpec{
+				SchedulerName: "hami-scheduler",
+				Containers: []corev1.Container{{
+					Name: "container1",
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							"huawei.com/Ascend910B":        resource.MustParse("1"),
+							"huawei.com/Ascend910B-memory": resource.MustParse(mem),
+							"huawei.com/Ascend910B-core":   resource.MustParse("1"),
+						},
+					},
+				}},
+			},
+		}
+	}
+
+	// 4096 x factor 4 is 16384, against a limit of 8192 x 4 = 32768.
+	if err := fitResourceQuota(ascendPod("4096")); err != nil {
+		t.Errorf("fitResourceQuota() = %v, want nil: the limit must be scaled by the same factor as the request", err)
+	}
+	// 8192 x 4 is 32768 used against 32768 available, and 8193 pushes it over.
+	if err := fitResourceQuota(ascendPod("8193")); err == nil {
+		t.Error("fitResourceQuota() = nil error, want a denial: the request exceeds the scaled limit")
 	}
 }
 
@@ -613,5 +1070,911 @@ func TestSchedulerNameEmptyNoOverwrite(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("Expected schedulerName patch to %q, got patches: %+v", config.SchedulerName, resp.Patches)
+	}
+}
+
+func TestFitResourceQuota_InitContainerPeakSequence(t *testing.T) {
+	config.SchedulerName = "hami-scheduler"
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultMemory:                0,
+			DefaultCores:                 0,
+			DefaultGPUNum:                1,
+			MemoryFactor:                 1,
+		},
+	}
+	if err := config.InitDevicesWithConfig(sConfig); err != nil {
+		t.Fatalf("Failed to initialize devices with config: %v", err)
+	}
+
+	ns := "default"
+	qm := device.NewQuotaManager()
+
+	// initial quota: 30000 limit, 0 used
+	qm.Quotas[ns] = &device.DeviceQuota{
+		"nvidia.com/gpumem":   &device.Quota{Used: 0, Limit: 30000, LimitSet: true},
+		"nvidia.com/gpucores": &device.Quota{Used: 0, Limit: 0},
+	}
+	t.Cleanup(func() { delete(qm.Quotas, ns) })
+
+	makePod := func(name string, initMem, appMem int64) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: ns,
+			},
+			Spec: corev1.PodSpec{
+				SchedulerName: "hami-scheduler",
+				InitContainers: []corev1.Container{
+					{
+						Name:  "init",
+						Image: "busybox",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								"nvidia.com/gpu":    resource.MustParse("1"),
+								"nvidia.com/gpumem": *resource.NewQuantity(initMem, resource.DecimalSI),
+							},
+						},
+					},
+				},
+				Containers: []corev1.Container{
+					{
+						Name:  "app",
+						Image: "busybox",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								"nvidia.com/gpu":    resource.MustParse("1"),
+								"nvidia.com/gpumem": *resource.NewQuantity(appMem, resource.DecimalSI),
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	// Step 1: Pod1 (init 20000, app 10000) should be allowed
+	pod1 := makePod("pod1", 20000, 10000)
+	if err := fitResourceQuota(pod1); err != nil {
+		t.Fatalf("Step 1 failed: pod1 should be allowed (peak 20000 ≤ 30000): %v", err)
+	}
+
+	// Simulate pod1 scheduled → record its peak usage (20000)
+	if dq, ok := qm.Quotas[ns]; ok {
+		if q, ok := (*dq)["nvidia.com/gpumem"]; ok {
+			q.Used = 20000
+		} else {
+			(*dq)["nvidia.com/gpumem"] = &device.Quota{Used: 20000, Limit: 30000, LimitSet: true}
+		}
+	}
+
+	// Step 2: Pod2 (same) must be DENIED
+	pod2 := makePod("pod2", 20000, 10000)
+	if err := fitResourceQuota(pod2); err == nil {
+		t.Fatal("Step 2 failed: pod2 should be denied (total used 20000 + request 20000 > 30000)")
+	}
+
+	// Step 3: Pod1 init finished → usage drops to app only (10000)
+	if dq, ok := qm.Quotas[ns]; ok {
+		if q, ok := (*dq)["nvidia.com/gpumem"]; ok {
+			q.Used = 10000
+		}
+	}
+
+	// Now pod2 should be allowed
+	if err := fitResourceQuota(pod2); err != nil {
+		t.Fatalf("Step 3 failed: pod2 should be allowed after pod1 init finished (total 10000+20000=30000): %v", err)
+	}
+}
+
+func TestFitResourceQuota_SidecarOrdering(t *testing.T) {
+	config.SchedulerName = "hami-scheduler"
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultMemory:                0,
+			DefaultCores:                 0,
+			DefaultGPUNum:                1,
+			MemoryFactor:                 1,
+		},
+	}
+	if err := config.InitDevicesWithConfig(sConfig); err != nil {
+		t.Fatalf("Failed to initialize devices with config: %v", err)
+	}
+
+	qm := device.NewQuotaManager()
+	qm.Quotas["sc-order"] = &device.DeviceQuota{
+		"nvidia.com/gpumem":   &device.Quota{Used: 0, Limit: 10000, LimitSet: true},
+		"nvidia.com/gpucores": &device.Quota{Used: 0, Limit: 100, LimitSet: true},
+	}
+	// Headroom 7500 mem: sits between the ordered interleaved peak (7000)
+	// and the order-blind value (8000), and below the sidecar+app steady
+	// state (8000) of the design case.
+	qm.Quotas["sc-order-tight"] = &device.DeviceQuota{
+		"nvidia.com/gpumem": &device.Quota{Used: 0, Limit: 7500, LimitSet: true},
+	}
+	t.Cleanup(func() {
+		delete(qm.Quotas, "sc-order")
+		delete(qm.Quotas, "sc-order-tight")
+	})
+
+	always := corev1.ContainerRestartPolicyAlways
+	gpuInit := func(name string, mem, cores int64, sidecar bool) corev1.Container {
+		c := corev1.Container{
+			Name:  name,
+			Image: "busybox",
+			Resources: corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					"nvidia.com/gpu":    resource.MustParse("1"),
+					"nvidia.com/gpumem": *resource.NewQuantity(mem, resource.DecimalSI),
+				},
+			},
+		}
+		if cores > 0 {
+			c.Resources.Limits["nvidia.com/gpucores"] = *resource.NewQuantity(cores, resource.DecimalSI)
+		}
+		if sidecar {
+			c.RestartPolicy = &always
+		}
+		return c
+	}
+	makePod := func(name, ns string, inits []corev1.Container, appMem int64) *corev1.Pod {
+		app := corev1.Container{Name: "app", Image: "busybox"}
+		if appMem > 0 {
+			app.Resources = corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					"nvidia.com/gpu":    resource.MustParse("1"),
+					"nvidia.com/gpumem": *resource.NewQuantity(appMem, resource.DecimalSI),
+				},
+			}
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: corev1.PodSpec{
+				SchedulerName:  "hami-scheduler",
+				InitContainers: inits,
+				Containers:     []corev1.Container{app},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name string
+		pod  *corev1.Pod
+		fit  bool
+	}{
+		{
+			// test1 has exited before test2 starts: peak is
+			// max(5000, 8000) = 8000 mem and max(50, 80) = 80 cores.
+			name: "regular then sidecar never overlap (review case)",
+			pod: makePod("review-case", "sc-order", []corev1.Container{
+				gpuInit("test1", 5000, 50, false),
+				gpuInit("test2", 8000, 80, true),
+			}, 0),
+			fit: true,
+		},
+		{
+			// Same containers, opposite order: the sidecar is still
+			// running while the regular init runs, so 13000/130 is
+			// correctly charged and exceeds the quota.
+			name: "sidecar then regular overlap and are denied",
+			pod: makePod("review-case-reversed", "sc-order", []corev1.Container{
+				gpuInit("test2", 8000, 80, true),
+				gpuInit("test1", 5000, 50, false),
+			}, 0),
+			fit: false,
+		},
+		{
+			name: "interleaved inits use the running sidecar sum",
+			pod: makePod("interleaved", "sc-order-tight", []corev1.Container{
+				gpuInit("init-a", 5000, 0, false),
+				gpuInit("sc", 3000, 0, true),
+				gpuInit("init-b", 4000, 0, false),
+			}, 1000),
+			fit: true,
+		},
+		{
+			// Steady state must SUM sidecar and app (design case):
+			// 4000 + 4000 = 8000 > 7500. A max() here would wrongly admit.
+			name: "sidecar plus app steady state is summed",
+			pod: makePod("steady-sum", "sc-order-tight", []corev1.Container{
+				gpuInit("sc", 4000, 0, true),
+			}, 4000),
+			fit: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := fitResourceQuota(tc.pod); (err == nil) != tc.fit {
+				t.Errorf("fitResourceQuota() error = %v, want fit %v", err, tc.fit)
+			}
+		})
+	}
+}
+
+func TestHandleNumaAlignmentAnnotation(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		wantDenied bool
+	}{
+		{name: "best-effort is admitted", value: "best-effort", wantDenied: false},
+		{name: "invalid value is denied", value: "bogus", wantDenied: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "numa-pod",
+					Namespace:   "default",
+					Annotations: map[string]string{util.NumaAlignmentAnnotationKey: test.value},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "container1",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+						},
+					}},
+				},
+			}
+
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			codec := serializer.NewCodecFactory(scheme).LegacyCodec(corev1.SchemeGroupVersion)
+			podBytes, err := runtime.Encode(codec, pod)
+			if err != nil {
+				t.Fatalf("Error encoding pod: %v", err)
+			}
+
+			req := admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					UID: "test-uid", Namespace: "default", Name: "numa-pod",
+					Object: runtime.RawExtension{Raw: podBytes},
+				},
+			}
+
+			wh, err := NewWebHook()
+			if err != nil {
+				t.Fatalf("Error creating webhook: %v", err)
+			}
+			resp := wh.Handle(context.Background(), req)
+
+			if test.wantDenied {
+				if resp.Allowed {
+					t.Fatalf("expected denial, got allowed: %+v", resp.Result)
+				}
+				if !strings.Contains(resp.Result.Message, "invalid") {
+					t.Fatalf("expected invalid-annotation message, got %q", resp.Result.Message)
+				}
+			} else if !resp.Allowed {
+				t.Fatalf("expected admission, got denied: %+v", resp.Result)
+			}
+		})
+	}
+}
+
+func TestHandleSchedulerPolicyAnnotation(t *testing.T) {
+	nvidiaDevice, ok := device.GetDevices()[nvidia.NvidiaGPUDevice]
+	if !ok {
+		t.Fatal("NVIDIA device is not registered")
+	}
+	resourceName := corev1.ResourceName(nvidiaDevice.GetResourceNames().ResourceCountName)
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		hasResource bool
+		wantDenied  bool
+		wantMessage string
+	}{
+		{
+			name:        "binpack is admitted",
+			annotations: map[string]string{util.GPUSchedulerPolicyAnnotationKey: "binpack"},
+			hasResource: true,
+		},
+		{
+			name:        "padded chain is admitted",
+			annotations: map[string]string{util.GPUSchedulerPolicyAnnotationKey: "binpack, numa"},
+			hasResource: true,
+		},
+		{
+			name:        "node spread is admitted",
+			annotations: map[string]string{util.NodeSchedulerPolicyAnnotationKey: "spread"},
+			hasResource: true,
+		},
+		{
+			name:        "gpu typo is denied",
+			annotations: map[string]string{util.GPUSchedulerPolicyAnnotationKey: "binpakc"},
+			hasResource: true,
+			wantDenied:  true,
+			wantMessage: util.GPUSchedulerPolicyAnnotationKey,
+		},
+		{
+			name:        "node policy chain is denied",
+			annotations: map[string]string{util.NodeSchedulerPolicyAnnotationKey: "binpack,spread"},
+			hasResource: true,
+			wantDenied:  true,
+			wantMessage: util.NodeSchedulerPolicyAnnotationKey,
+		},
+		{
+			name:        "gpu typo without HAMi resource is admitted",
+			annotations: map[string]string{util.GPUSchedulerPolicyAnnotationKey: "binpakc"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			container := corev1.Container{Name: "container1"}
+			if test.hasResource {
+				container.Resources = corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{resourceName: resource.MustParse("1")},
+				}
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "policy-pod",
+					Namespace:   "default",
+					Annotations: test.annotations,
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{container}},
+			}
+
+			resp := admitPod(t, pod)
+
+			if test.wantDenied {
+				if resp.Allowed {
+					t.Fatalf("expected denial, got allowed: %+v", resp.Result)
+				}
+				if !strings.Contains(resp.Result.Message, test.wantMessage) {
+					t.Fatalf("expected message to mention %s, got %q", test.wantMessage, resp.Result.Message)
+				}
+				return
+			}
+			if !resp.Allowed {
+				t.Fatalf("expected admission, got denied: %+v", resp.Result)
+			}
+		})
+	}
+}
+
+func TestHandleDeviceScoringWeightsAnnotation(t *testing.T) {
+	nvidiaDevice, ok := device.GetDevices()[nvidia.NvidiaGPUDevice]
+	if !ok {
+		t.Fatal("NVIDIA device is not registered")
+	}
+	resourceName := corev1.ResourceName(nvidiaDevice.GetResourceNames().ResourceCountName)
+
+	tests := []struct {
+		name              string
+		annotationPresent bool
+		value             string
+		hasResource       bool
+		wantDenied        bool
+	}{
+		{name: "missing annotation is admitted", hasResource: true, wantDenied: false},
+		{name: "valid weights with HAMi resource are admitted", annotationPresent: true, value: "slot=1,core=1,memory=3", hasResource: true, wantDenied: false},
+		{name: "missing dimension with HAMi resource is denied", annotationPresent: true, value: "slot=1,core=1", hasResource: true, wantDenied: true},
+		{name: "non-integer weight with HAMi resource is denied", annotationPresent: true, value: "slot=1,core=high,memory=3", hasResource: true, wantDenied: true},
+		{name: "invalid weights without HAMi resource are admitted", annotationPresent: true, value: "slot=1,core=1", wantDenied: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var annotations map[string]string
+			if test.annotationPresent {
+				annotations = map[string]string{util.DeviceScoringWeightsAnnotationKey: test.value}
+			}
+			container := corev1.Container{Name: "container1"}
+			if test.hasResource {
+				container.Resources = corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{resourceName: resource.MustParse("1")},
+				}
+			}
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "weights-pod",
+					Namespace:   "default",
+					Annotations: annotations,
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{container}},
+			}
+
+			scheme := runtime.NewScheme()
+			_ = corev1.AddToScheme(scheme)
+			codec := serializer.NewCodecFactory(scheme).LegacyCodec(corev1.SchemeGroupVersion)
+			podBytes, err := runtime.Encode(codec, pod)
+			if err != nil {
+				t.Fatalf("Error encoding pod: %v", err)
+			}
+
+			req := admission.Request{
+				AdmissionRequest: admissionv1.AdmissionRequest{
+					UID: "test-uid", Namespace: "default", Name: "weights-pod",
+					Object: runtime.RawExtension{Raw: podBytes},
+				},
+			}
+
+			wh, err := NewWebHook()
+			if err != nil {
+				t.Fatalf("Error creating webhook: %v", err)
+			}
+			resp := wh.Handle(context.Background(), req)
+
+			if test.wantDenied {
+				if resp.Allowed {
+					t.Fatalf("expected denial, got allowed: %+v", resp.Result)
+				}
+				if !strings.Contains(resp.Result.Message, "invalid") {
+					t.Fatalf("expected invalid-annotation message, got %q", resp.Result.Message)
+				}
+			} else if !resp.Allowed {
+				t.Fatalf("expected admission, got denied: %+v", resp.Result)
+			}
+		})
+	}
+}
+
+// admitPod runs the webhook over pod and returns the response.
+func admitPod(t *testing.T, pod *corev1.Pod) admission.Response {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to build the scheme: %v", err)
+	}
+	codec := serializer.NewCodecFactory(scheme).LegacyCodec(corev1.SchemeGroupVersion)
+	podBytes, err := runtime.Encode(codec, pod)
+	if err != nil {
+		t.Fatalf("failed to encode the pod: %v", err)
+	}
+
+	wh, err := NewWebHook()
+	if err != nil {
+		t.Fatalf("failed to create the webhook: %v", err)
+	}
+	return wh.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			UID:       "test-uid",
+			Namespace: pod.Namespace,
+			Name:      pod.Name,
+			Object:    runtime.RawExtension{Raw: podBytes},
+		},
+	})
+}
+
+func gpuPodWithAnnotations(annotations map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "forged",
+			Namespace:   "team-b",
+			Annotations: annotations,
+		},
+		Spec: corev1.PodSpec{
+			SchedulerName: "different-scheduler",
+			Containers: []corev1.Container{{
+				Name: "main",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{"hami.io/gpu": resource.MustParse("1")},
+				},
+			}},
+		},
+	}
+}
+
+// The device plugin hands out devices from these annotations, so a pod must
+// not arrive already carrying them. Routing the pod at another scheduler used
+// to skip every check below, which is what made this reachable.
+//
+// Reproduce on a cluster (issue #3041): create a pod with
+// schedulerName: default-scheduler, nvidia.com/gpu: 1, and one of the
+// annotations this test iterates over set by hand, for example
+// hami.io/vgpu-devices-to-allocate: "GPU-<uuid>,NVIDIA,20000,100:;". Before
+// this fix it was admitted and the device plugin served the named GPU with
+// no HAMi accounting or quota. admitPod below is that same request replayed
+// against the webhook directly, so it needs no cluster.
+func TestForgedAllocationAnnotationsDenied(t *testing.T) {
+	config.SchedulerName = "hami-scheduler"
+	if err := config.InitDevicesWithConfig(&config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName: "hami.io/gpu", ResourceMemoryName: "hami.io/gpumem",
+			ResourceCoreName: "hami.io/gpucores", DefaultGPUNum: 1,
+		},
+	}); err != nil {
+		t.Fatalf("failed to initialize devices: %v", err)
+	}
+
+	for _, key := range []string{
+		util.AssignedNodeAnnotations,
+		util.BindTimeAnnotations,
+		util.DeviceBindPhase,
+		device.InRequestDevices[nvidia.NvidiaGPUDevice],
+		device.SupportDevices[nvidia.NvidiaGPUDevice],
+	} {
+		t.Run(key, func(t *testing.T) {
+			resp := admitPod(t, gpuPodWithAnnotations(map[string]string{key: "forged"}))
+			if resp.Allowed {
+				t.Fatalf("pod presetting %s was admitted", key)
+			}
+			if !strings.Contains(resp.Result.Message, key) {
+				t.Errorf("denial message %q does not name %s", resp.Result.Message, key)
+			}
+		})
+	}
+}
+
+// updatePod replays an update of oldPod into newPod by username and returns the
+// response.
+func updatePod(t *testing.T, oldPod, newPod *corev1.Pod, username string) admission.Response {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to build the scheme: %v", err)
+	}
+	codec := serializer.NewCodecFactory(scheme).LegacyCodec(corev1.SchemeGroupVersion)
+	oldBytes, err := runtime.Encode(codec, oldPod)
+	if err != nil {
+		t.Fatalf("failed to encode the old pod: %v", err)
+	}
+	newBytes, err := runtime.Encode(codec, newPod)
+	if err != nil {
+		t.Fatalf("failed to encode the new pod: %v", err)
+	}
+
+	wh, err := NewWebHook()
+	if err != nil {
+		t.Fatalf("failed to create the webhook: %v", err)
+	}
+	return wh.Handle(context.Background(), admission.Request{
+		AdmissionRequest: admissionv1.AdmissionRequest{
+			UID:       "test-uid",
+			Namespace: newPod.Namespace,
+			Name:      newPod.Name,
+			Operation: admissionv1.Update,
+			UserInfo:  authenticationv1.UserInfo{Username: username},
+			Object:    runtime.RawExtension{Raw: newBytes},
+			OldObject: runtime.RawExtension{Raw: oldBytes},
+		},
+	})
+}
+
+func initHAMiScheduler(t *testing.T) {
+	t.Helper()
+
+	config.SchedulerName = "hami-scheduler"
+	initNvidiaDevices(t)
+}
+
+// allowNodeWriters answers the webhook's access review the way RBAC answers it
+// for HAMi's own writers: allowed for the given usernames, refused for the rest.
+func allowNodeWriters(t *testing.T, usernames ...string) {
+	t.Helper()
+
+	allowed := make(map[string]bool, len(usernames))
+	for _, username := range usernames {
+		allowed[username] = true
+	}
+	kubeClient := fake.NewClientset()
+	kubeClient.PrependReactor("create", "subjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		review, ok := action.(k8stesting.CreateAction).GetObject().(*authorizationv1.SubjectAccessReview)
+		if !ok {
+			return false, nil, nil
+		}
+		review.Status.Allowed = allowed[review.Spec.User]
+		return true, review, nil
+	})
+	previous := client.KubeClient
+	client.KubeClient = kubeClient
+	t.Cleanup(func() { client.KubeClient = previous })
+}
+
+func scheduledGPUPod(schedulerName string, annotations map[string]string) *corev1.Pod {
+	pod := gpuPodWithAnnotations(annotations)
+	pod.Spec.SchedulerName = schedulerName
+	return pod
+}
+
+// Denying these annotations at create leaves the pod reachable through a plain
+// patch, which is the same forgery a step later: the pod is admitted clean,
+// then given the annotations the device plugin allocates from.
+//
+// Reproduce on a cluster (issue #3041): create the pod from
+// TestForgedAllocationAnnotationsDenied without the annotations, so it is
+// admitted, then kubectl annotate it with, for example,
+// hami.io/vgpu-devices-to-allocate: "GPU-<uuid>,NVIDIA,20000,100:;". Before
+// this fix nothing looked at the pod again and the device plugin served the
+// named GPU.
+func TestPatchedAllocationAnnotationsDenied(t *testing.T) {
+	initHAMiScheduler(t)
+	allowNodeWriters(t)
+
+	for _, key := range []string{
+		util.AssignedNodeAnnotations,
+		util.BindTimeAnnotations,
+		util.DeviceBindPhase,
+		device.InRequestDevices[nvidia.NvidiaGPUDevice],
+		device.SupportDevices[nvidia.NvidiaGPUDevice],
+	} {
+		t.Run(key, func(t *testing.T) {
+			oldPod := scheduledGPUPod("hami-scheduler", nil)
+			newPod := scheduledGPUPod("hami-scheduler", map[string]string{key: "forged"})
+			resp := updatePod(t, oldPod, newPod, "kubernetes-admin")
+			if resp.Allowed {
+				t.Fatalf("patching %s in was allowed", key)
+			}
+			if !strings.Contains(resp.Result.Message, key) {
+				t.Errorf("denial message %q does not name %s", resp.Result.Message, key)
+			}
+		})
+	}
+}
+
+// A workload service account holding update on pods is the caller the create
+// path already turns away, and holds none of the node access HAMi's writers do.
+func TestWorkloadServiceAccountUpdateDenied(t *testing.T) {
+	initHAMiScheduler(t)
+	allowNodeWriters(t, "system:serviceaccount:hami-system:hami-scheduler")
+	key := device.InRequestDevices[nvidia.NvidiaGPUDevice]
+
+	oldPod := scheduledGPUPod("hami-scheduler", nil)
+	newPod := scheduledGPUPod("hami-scheduler", map[string]string{key: "forged"})
+	resp := updatePod(t, oldPod, newPod, "system:serviceaccount:team-b:builder")
+	if resp.Allowed {
+		t.Fatal("a workload service account wrote an allocation")
+	}
+}
+
+// Rewriting or dropping a value the scheduler already wrote is the same
+// forgery: it points the device plugin at another GPU, or hides the pod's
+// usage from it.
+func TestSchedulerOwnedAnnotationRewriteDenied(t *testing.T) {
+	initHAMiScheduler(t)
+	allowNodeWriters(t)
+	key := device.InRequestDevices[nvidia.NvidiaGPUDevice]
+
+	t.Run("rewrite", func(t *testing.T) {
+		oldPod := scheduledGPUPod("hami-scheduler", map[string]string{key: "GPU-real,NVIDIA,2000,10:;"})
+		newPod := scheduledGPUPod("hami-scheduler", map[string]string{key: "GPU-other,NVIDIA,20000,100:;"})
+		if resp := updatePod(t, oldPod, newPod, "kubernetes-admin"); resp.Allowed {
+			t.Fatal("rewriting the allocation was allowed")
+		}
+	})
+
+	t.Run("drop", func(t *testing.T) {
+		oldPod := scheduledGPUPod("hami-scheduler", map[string]string{key: "GPU-real,NVIDIA,2000,10:;"})
+		newPod := scheduledGPUPod("hami-scheduler", nil)
+		if resp := updatePod(t, oldPod, newPod, "kubernetes-admin"); resp.Allowed {
+			t.Fatal("dropping the allocation was allowed")
+		}
+	})
+}
+
+// HAMi rewrites these itself after admission, so its own components must keep
+// working: the scheduler patches them as it binds, and a device plugin rewrites
+// them as each container gets its devices.
+func TestSchedulerComponentUpdateAllowed(t *testing.T) {
+	initHAMiScheduler(t)
+	allowNodeWriters(t, "system:serviceaccount:hami-system:hami-scheduler")
+	key := device.InRequestDevices[nvidia.NvidiaGPUDevice]
+
+	oldPod := scheduledGPUPod("hami-scheduler", nil)
+	newPod := scheduledGPUPod("hami-scheduler", map[string]string{key: "GPU-real,NVIDIA,2000,10:;"})
+	resp := updatePod(t, oldPod, newPod, "system:serviceaccount:hami-system:hami-scheduler")
+	if !resp.Allowed {
+		t.Fatalf("the scheduler's own patch was denied: %v", resp.Result)
+	}
+}
+
+// A vendor's device plugin can run in its own namespace, and is recognised by
+// the node access it holds rather than by its account. It still only writes to
+// a pod this scheduler placed, so the same account writing to a pod routed
+// elsewhere is forging one.
+func TestNodeWriterUpdateOnForeignPodDenied(t *testing.T) {
+	initHAMiScheduler(t)
+	allowNodeWriters(t, "system:serviceaccount:kube-system:ascend-device-plugin")
+	key := device.InRequestDevices[nvidia.NvidiaGPUDevice]
+
+	oldPod := scheduledGPUPod("different-scheduler", nil)
+	newPod := scheduledGPUPod("different-scheduler", map[string]string{key: "forged"})
+	resp := updatePod(t, oldPod, newPod, "system:serviceaccount:kube-system:ascend-device-plugin")
+	if resp.Allowed {
+		t.Fatal("a pod on another scheduler was given an allocation")
+	}
+}
+
+// A review that cannot be run is not a reason to trust the caller: the guard
+// would otherwise turn itself off exactly when the API server is not answering.
+func TestUpdateDeniedWhenReviewUnavailable(t *testing.T) {
+	initHAMiScheduler(t)
+	previous := client.KubeClient
+	client.KubeClient = nil
+	t.Cleanup(func() { client.KubeClient = previous })
+	key := device.InRequestDevices[nvidia.NvidiaGPUDevice]
+
+	oldPod := scheduledGPUPod("hami-scheduler", nil)
+	newPod := scheduledGPUPod("hami-scheduler", map[string]string{key: "GPU-real,NVIDIA,2000,10:;"})
+	resp := updatePod(t, oldPod, newPod, "system:serviceaccount:hami-system:hami-scheduler")
+	if resp.Allowed {
+		t.Fatal("the update was allowed with no review to run")
+	}
+}
+
+// A review the API server refuses to answer is treated the same way.
+func TestUpdateDeniedWhenReviewFails(t *testing.T) {
+	initHAMiScheduler(t)
+	kubeClient := fake.NewClientset()
+	kubeClient.PrependReactor("create", "subjectaccessreviews", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("the api server is not answering")
+	})
+	previous := client.KubeClient
+	client.KubeClient = kubeClient
+	t.Cleanup(func() { client.KubeClient = previous })
+	key := device.InRequestDevices[nvidia.NvidiaGPUDevice]
+
+	oldPod := scheduledGPUPod("hami-scheduler", nil)
+	newPod := scheduledGPUPod("hami-scheduler", map[string]string{key: "GPU-real,NVIDIA,2000,10:;"})
+	resp := updatePod(t, oldPod, newPod, "system:serviceaccount:hami-system:hami-scheduler")
+	if resp.Allowed {
+		t.Fatal("the update was allowed with the review failing")
+	}
+}
+
+// Everything else about a pod stays the owner's to change.
+func TestUnrelatedUpdateAllowed(t *testing.T) {
+	initHAMiScheduler(t)
+	allowNodeWriters(t)
+
+	oldPod := scheduledGPUPod("hami-scheduler", map[string]string{"team.example.com/owner": "team-b"})
+	newPod := scheduledGPUPod("hami-scheduler", map[string]string{
+		"team.example.com/owner":             "team-c",
+		util.GPUSchedulerPolicyAnnotationKey: "spread",
+	})
+	resp := updatePod(t, oldPod, newPod, "kubernetes-admin")
+	if !resp.Allowed {
+		t.Fatalf("an unrelated annotation change was denied: %v", resp.Result)
+	}
+	if len(resp.Patches) > 0 {
+		t.Errorf("the update was patched: %v", resp.Patches)
+	}
+}
+
+func TestRemoteGPUInvalidServerSelectorDeniedAtAdmission(t *testing.T) {
+	resourceName := initRemoteGPUWebhookDevice(t)
+	for _, selector := range []string{"gpu-pool in (inference)", "   "} {
+		t.Run(selector, func(t *testing.T) {
+			pod := remoteGPUWebhookPod(resourceName, map[string]string{
+				remotegpu.LupineServerSelectorAnno: selector,
+			})
+
+			resp := admitPod(t, pod)
+			if resp.Allowed {
+				t.Fatal("invalid RemoteGPU selector was admitted")
+			}
+			if resp.Result.Code != http.StatusForbidden {
+				t.Fatalf("invalid selector returned status %d, want %d", resp.Result.Code, http.StatusForbidden)
+			}
+			if !strings.Contains(resp.Result.Message, remotegpu.LupineServerSelectorAnno) {
+				t.Fatalf("denial %q does not identify the invalid selector", resp.Result.Message)
+			}
+		})
+	}
+}
+
+func TestRemoteGPUServerSelectorUpdateValidation(t *testing.T) {
+	resourceName := initRemoteGPUWebhookDevice(t)
+
+	t.Run("unrelated pod may change the annotation", func(t *testing.T) {
+		oldPod := remoteGPUWebhookPod(resourceName, map[string]string{remotegpu.LupineServerSelectorAnno: "gpu-pool=inference"})
+		oldPod.Spec.Containers[0].Resources.Limits = nil
+		newPod := oldPod.DeepCopy()
+		newPod.Annotations[remotegpu.LupineServerSelectorAnno] = "gpu-pool=training"
+		resp := updatePod(t, oldPod, newPod, "system:serviceaccount:team-a:builder")
+		if !resp.Allowed {
+			t.Fatalf("unrelated pod update denied: %v", resp.Result)
+		}
+	})
+
+	t.Run("selector is immutable", func(t *testing.T) {
+		oldPod := remoteGPUWebhookPod(resourceName, map[string]string{
+			remotegpu.LupineServerSelectorAnno: "gpu-pool=inference",
+		})
+		newPod := oldPod.DeepCopy()
+		newPod.Annotations[remotegpu.LupineServerSelectorAnno] = "gpu-pool=training"
+
+		resp := updatePod(t, oldPod, newPod, "system:serviceaccount:team-a:builder")
+		if resp.Allowed {
+			t.Fatal("RemoteGPU selector changed after pod creation")
+		}
+		if !strings.Contains(resp.Result.Message, "cannot be changed after a pod is created") {
+			t.Fatalf("unexpected denial %q", resp.Result.Message)
+		}
+	})
+
+	t.Run("invalid existing selector is denied when RemoteGPU is added", func(t *testing.T) {
+		oldPod := remoteGPUWebhookPod(resourceName, map[string]string{
+			remotegpu.LupineServerSelectorAnno: "gpu-pool in (inference)",
+		})
+		oldPod.Spec.Containers[0].Resources.Limits = nil
+		newPod := oldPod.DeepCopy()
+		newPod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{
+			corev1.ResourceName(resourceName): resource.MustParse("1"),
+		}
+
+		resp := updatePod(t, oldPod, newPod, "system:serviceaccount:team-a:builder")
+		if resp.Allowed {
+			t.Fatal("invalid RemoteGPU selector update was admitted")
+		}
+		if !strings.Contains(resp.Result.Message, remotegpu.LupineServerSelectorAnno) {
+			t.Fatalf("denial %q does not identify the invalid selector", resp.Result.Message)
+		}
+	})
+
+}
+
+func initRemoteGPUWebhookDevice(t *testing.T) string {
+	t.Helper()
+	oldDevices := device.DevicesMap
+	oldCount := remotegpu.RemoteGPUResourceCount
+	oldMemory := remotegpu.RemoteGPUResourceMemory
+	oldLibImage := remotegpu.RemoteGPULibImage
+	oldSessionImage := remotegpu.RemoteGPUSessionImage
+	oldSessionImagePullSecrets := remotegpu.RemoteGPUSessionImagePullSecrets
+	dev := remotegpu.InitRemoteGPUDevice(remotegpu.RemoteGPUConfig{
+		ResourceCountName:  "hami.io/remote-gpu",
+		ResourceMemoryName: "hami.io/remote-gpu-memory",
+	})
+	device.DevicesMap = map[string]device.Devices{remotegpu.RemoteGPUDevice: dev}
+	t.Cleanup(func() {
+		device.DevicesMap = oldDevices
+		remotegpu.RemoteGPUResourceCount = oldCount
+		remotegpu.RemoteGPUResourceMemory = oldMemory
+		remotegpu.RemoteGPULibImage = oldLibImage
+		remotegpu.RemoteGPUSessionImage = oldSessionImage
+		remotegpu.RemoteGPUSessionImagePullSecrets = oldSessionImagePullSecrets
+	})
+	return remotegpu.RemoteGPUResourceCount
+}
+
+func remoteGPUWebhookPod(resourceName string, annotations map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote-gpu", Namespace: "team-a", Annotations: annotations},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "main",
+			Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+				corev1.ResourceName(resourceName): resource.MustParse("1"),
+			}},
+		}}},
+	}
+}
+
+// Unrelated annotations, including other hami.io keys the scheduler does not
+// own, must still be admitted.
+func TestUnrelatedAnnotationsStillAdmitted(t *testing.T) {
+	config.SchedulerName = "hami-scheduler"
+	if err := config.InitDevicesWithConfig(&config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName: "hami.io/gpu", ResourceMemoryName: "hami.io/gpumem",
+			ResourceCoreName: "hami.io/gpucores", DefaultGPUNum: 1,
+		},
+	}); err != nil {
+		t.Fatalf("failed to initialize devices: %v", err)
+	}
+
+	resp := admitPod(t, gpuPodWithAnnotations(map[string]string{
+		"team.example.com/owner":             "team-b",
+		util.GPUSchedulerPolicyAnnotationKey: "spread",
+	}))
+	if !resp.Allowed {
+		t.Fatalf("a pod with unrelated annotations was denied: %v", resp.Result)
 	}
 }

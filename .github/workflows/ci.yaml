@@ -3,6 +3,9 @@ on:
   # Run this workflow every time a new commit pushed to upstream/fork repository.
   # Run workflow on fork repository will help contributors find and resolve issues before sending a PR.
   pull_request:
+  schedule:
+    # Keep a longer-running benchmark history without making PR feedback slow.
+    - cron: '17 3 * * 1'
   push:
     # Exclude branches created by Dependabot to avoid triggering current workflow
     # for PRs initiated by Dependabot.
@@ -10,6 +13,11 @@ on:
       - 'dependabot/**'
 permissions:
   contents: read  # for actions/checkout to fetch code
+
+concurrency:
+  # A weekly benchmark must not cancel (or be cancelled by) a master push.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: docker.io
@@ -21,14 +29,27 @@ env:
   REGISTER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
+  support-bundle:
+    name: Support bundle tests
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Test support bundle collector
+        run: make test-support-bundle
+
   lint:
     name: lint
     runs-on: ubuntu-22.04
     steps:
       - name: checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: install Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
       - name: verify license
@@ -36,9 +57,9 @@ jobs:
       - name: go tidy
         run: make tidy
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.12.2
+          version: v2.15.0
           install-mode: goinstall
       - name: import alias
         run: hack/verify-import-aliases.sh
@@ -51,7 +72,10 @@ jobs:
       e2e_run: ${{ steps.parse_code.outputs.e2e_run }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
       - name: Parse the version
         id: parse_version
         run: |
@@ -59,11 +83,7 @@ jobs:
           suffix="$(git rev-parse --short HEAD)"
           tag="${value}-${suffix}"
           echo "version=${tag}" >> $GITHUB_OUTPUT
-      - name: Get changed files
-        id: changed-files
-        uses: tj-actions/changed-files@v47
-
-      # Check the code diff, ignore the docs and examples change
+      # Check the code diff, ignore examples and Markdown changes
       - name: Parse the code diff
         id: parse_code
         run: |
@@ -73,7 +93,7 @@ jobs:
           echo "Git log: $(git log ${pr_commit})"
           echo "Base commit: ${base_commit}"
           echo "Git log: $(git log ${base_commit})"
-          changed_files=$(git diff --name-only ${pr_commit} ${base_commit} -- . ':(exclude)docs/*' ':(exclude)examples/*' ':(exclude)*.md')
+          changed_files=$(git diff --name-only ${pr_commit} ${base_commit} -- . ':(exclude)examples/*' ':(exclude)*.md')
           echo "Changed files: ${changed_files}"
           if [ -n "$changed_files" ]; then
             echo "Will run e2e-test"
@@ -87,17 +107,21 @@ jobs:
     name: Unit test
     needs: [ lint, get_info ] # rely on lint & get_info successful completion
     runs-on: ubuntu-22.04
-    if: needs.get_info.outputs.e2e_run == 'true' || github.ref == 'refs/heads/master'
+    # The schedule added by this workflow is benchmark-only. Skipping this job
+    # also skips its build, chart, and E2E dependants.
+    if: github.event_name != 'schedule' && (needs.get_info.outputs.e2e_run == 'true' || github.ref == 'refs/heads/master')
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Checkout submodule
-        uses: Mushus/checkout-submodule@v1.0.1
+        uses: Mushus/checkout-submodule@f6a7fddc9798c8f8728b252594243ced3b56e550 # v1.0.1
         with:
           basePath: # optional, default is .
           submodulePath: libvgpu
       - name: Install Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
       - run: make tidy
@@ -106,7 +130,7 @@ jobs:
         # Prevent running from the forked repository that doesn't need to upload coverage.
         # In addition, running on the forked repository would fail as missing the necessary secret.
         if: ${{ github.repository == 'Project-HAMi/HAMi' }}
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           # Even though token upload token is not required for public repos,
           # but adding a token might increase successful uploads as per:
@@ -117,11 +141,88 @@ jobs:
           fail_ci_if_error: false
           verbose: true
 
+  bench:
+    name: Benchmark
+    # Runs alongside the unit tests rather than after them: the two share no
+    # artifacts, so serialising them would only add wall-clock time.
+    needs: [ lint, get_info ]
+    runs-on: ubuntu-22.04
+    if: needs.get_info.outputs.e2e_run == 'true' || github.ref == 'refs/heads/master'
+    # Keep concurrent benchmark allocation samples comparable across runner
+    # generations with different CPU counts. Wall-clock results remain
+    # informational, so two processors preserve concurrency without making
+    # timing a CI gate.
+    env:
+      GOMAXPROCS: '2'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          # On pull_request events, github.sha is GitHub's tested merge commit.
+          # Compare that merge result with the base revision, not the stale PR
+          # head when master has moved since the branch was last rebased.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      # The libvgpu submodule holds no Go sources, so unlike the unit test job
+      # this one does not need it to build the benchmarks.
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Test benchmark comparison script
+        run: make test-bench-compare
+      - name: Install benchstat
+        if: github.event_name == 'pull_request'
+        run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260908200009-22c9c6c9d4da
+      - name: Run PR base benchmarks
+        if: github.event_name == 'pull_request'
+        run: |
+          set -o pipefail
+          mkdir -p _output/bench
+          git worktree add --detach ../hami-bench-base "${{ github.event.pull_request.base.sha }}"
+          (
+            cd ../hami-bench-base
+            # The base may predate BENCH_COUNT, so invoke go test directly
+            # instead of relying on the new script interface from this PR.
+            package_list="$(go list ./pkg/... ./cmd/...)"
+            readarray -t benchmark_packages <<<"${package_list}"
+            go test -run '^$' -bench . -benchmem -benchtime 100ms -count 10 \
+              "${benchmark_packages[@]}"
+          ) 2>&1 | tee _output/bench/base.txt
+      - name: Run benchmarks
+        # PR comparisons need independent samples for benchstat, rather than
+        # multiple iterations collapsed into a single Go benchmark result.
+        # The scheduled run is longer and retains samples for trend inspection.
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BENCHTIME=100ms BENCH_COUNT=10 make bench
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            BENCHTIME=1s BENCH_COUNT=10 make bench
+          else
+            BENCHTIME=10x make bench
+          fi
+      - name: Compare PR benchmark results
+        if: github.event_name == 'pull_request'
+        run: >-
+          bash hack/bench-compare.sh _output/bench/base.txt _output/bench/results.txt
+          _output/bench/benchstat.txt hack/bench-policy.tsv
+      - name: Upload benchmark results
+        # Uploaded even on failure so the partial output shows which benchmark
+        # broke.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: benchmark-results
+          path: _output/bench
+          retention-days: 30
+          if-no-files-found: warn
+
   build:
     name: Compile
     needs: [ test, get_info ]
     runs-on: ubuntu-22.04
-    if: needs.get_info.outputs.e2e_run == 'true'
+    if: needs.get_info.outputs.e2e_run == 'true' || github.ref == 'refs/heads/master'
     steps:
       - name: Free disk space
         # https://github.com/actions/virtual-environments/issues/709
@@ -134,40 +235,44 @@ jobs:
           df -h
 
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Checkout submodule
-        uses: Mushus/checkout-submodule@v1.0.1
+        uses: Mushus/checkout-submodule@f6a7fddc9798c8f8728b252594243ced3b56e550 # v1.0.1
         with:
           basePath: # optional, default is .
           submodulePath: libvgpu
 
+      - name: Read image pins from version.mk
+        run: grep -E '^(GOLANG|NVIDIA)_IMAGE=' version.mk >> "$GITHUB_ENV"
+
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
         with:
-          driver-opts: image=moby/buildkit:master
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}
 
       - name: Build & Pushing hami image
-        uses: docker/build-push-action@v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ env.IMAGE_ROOT_PATH }}/Dockerfile
           labels: ${{ needs.get_info.outputs.version }}
           build-args: |
             VERSION=${{ needs.get_info.outputs.version }}
-            GOLANG_IMAGE=golang:1.26.2-bookworm
-            NVIDIA_IMAGE=nvidia/cuda:12.9.1-cudnn-devel-ubuntu20.04
+            GOLANG_IMAGE=${{ env.GOLANG_IMAGE }}
+            NVIDIA_IMAGE=${{ env.NVIDIA_IMAGE }}
             DEST_DIR=/usr/local
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ needs.get_info.outputs.version }}
           push: false
@@ -183,7 +288,7 @@ jobs:
           docker save ${{ env.REGISTRY }}/${{ env.IMAGE_REPO }}:${{ needs.get_info.outputs.version }} -o image.tar
 
       - name: Upload image.tar as artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hami-image
           path: image.tar
@@ -194,15 +299,15 @@ jobs:
   package_chart:
     runs-on: ubuntu-22.04
     needs: [ test, get_info ]
-    if: needs.get_info.outputs.e2e_run == 'true'
+    if: needs.get_info.outputs.e2e_run == 'true' || github.ref == 'refs/heads/master'
     env:
-      HELM_VERSION: v3.8.1
+      HELM_VERSION: v3.22.1
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-          ref: ${{ needs.get_ref.outputs.ref }}
+          persist-credentials: false
 
       - name: Configure Git
         run: |
@@ -210,7 +315,7 @@ jobs:
           git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
 
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: ${{ env.HELM_VERSION }}
 
@@ -244,7 +349,7 @@ jobs:
           mv charts/*.tgz tmp
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: chart_package_artifact
           path: tmp/*
@@ -255,7 +360,17 @@ jobs:
   e2e_test:
     uses: ./.github/workflows/call-e2e.yaml
     needs: [ package_chart, get_info, build ]
-    if: needs.get_info.outputs.e2e_run == 'true'
+    if: needs.get_info.outputs.e2e_run == 'true' || (github.repository == 'Project-HAMi/HAMi' && github.ref == 'refs/heads/master')
     with:
       ref: ${{ needs.get_info.outputs.version }}
       type: "pullrequest"
+
+  # execute MIG smoke test when hami code merge
+  e2e_mig_test:
+    uses: ./.github/workflows/call-e2e-mig.yaml
+    needs: [ package_chart, get_info, build, e2e_test ]
+    if: (needs.get_info.outputs.e2e_run == 'true' || (github.repository == 'Project-HAMi/HAMi' && github.ref == 'refs/heads/master')) && vars.ENABLE_MIG_E2E == 'true'
+    with:
+      ref: ${{ needs.get_info.outputs.version }}
+      type: "smoke"
+      deploy-type: "pullrequest"

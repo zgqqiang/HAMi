@@ -31,17 +31,16 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
-	"github.com/Project-HAMi/HAMi/pkg/util"
 	"github.com/Project-HAMi/HAMi/pkg/util/client"
 )
 
 func Test_MutateAdmission(t *testing.T) {
 	config := HygonConfig{
-		ResourceMemoryName: "hygon.com/dcumem",
-		ResourceCountName:  "hygon.com/dcunum",
-		ResourceCoreName:   "hygon.com/dcucores",
+		ResourceMemoryName: "hygon.com/hcumem",
+		ResourceCountName:  "hygon.com/hcunum",
+		ResourceCoreName:   "hygon.com/hcucores",
 	}
-	InitDCUDevice(config)
+	InitHCUDevice(config)
 	tests := []struct {
 		name string
 		args struct {
@@ -60,7 +59,7 @@ func Test_MutateAdmission(t *testing.T) {
 				ctr: &corev1.Container{
 					Resources: corev1.ResourceRequirements{
 						Limits: corev1.ResourceList{
-							"hygon.com/dcunum": resource.MustParse("1"),
+							"hygon.com/hcunum": resource.MustParse("1"),
 						},
 					},
 				},
@@ -72,7 +71,7 @@ func Test_MutateAdmission(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			dev := DCUDevices{}
+			dev := HCUDevices{}
 			result, err := dev.MutateAdmission(test.args.ctr, test.args.p)
 			if err != test.err {
 				klog.InfoS("set to resource limits failed")
@@ -82,7 +81,7 @@ func Test_MutateAdmission(t *testing.T) {
 	}
 }
 
-func Test_checkDCUtype(t *testing.T) {
+func Test_checkHCUtype(t *testing.T) {
 	tests := []struct {
 		name string
 		args struct {
@@ -92,116 +91,155 @@ func Test_checkDCUtype(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "exist one dcu in use type",
+			name: "exist one hcu in use type",
 			args: struct {
 				annos    map[string]string
 				cardtype string
 			}{
 				annos: map[string]string{
-					"hygon.com/use-dcutype": "dcu",
+					"hygon.com/use-hcutype": "hcu",
 				},
-				cardtype: "dcu",
+				cardtype: "hcu",
 			},
 			want: true,
 		},
 		{
-			name: "the different of dcu in use type",
+			name: "the different of hcu in use type",
 			args: struct {
 				annos    map[string]string
 				cardtype string
 			}{
 				annos: map[string]string{
-					"hygon.com/use-dcutype": "dcu",
+					"hygon.com/use-hcutype": "hcu",
 				},
 				cardtype: "test",
 			},
 			want: false,
 		},
 		{
-			name: "no dcu in use annotation",
+			name: "no hcu in use annotation",
 			args: struct {
 				annos    map[string]string
 				cardtype string
 			}{
 				annos:    map[string]string{},
-				cardtype: "dcu",
+				cardtype: "hcu",
 			},
 			want: true,
 		},
 		{
-			name: "exist multi dcu in use type",
+			name: "exist multi hcu in use type",
 			args: struct {
 				annos    map[string]string
 				cardtype string
 			}{
 				annos: map[string]string{
-					"hygon.com/use-dcutype": "dcu,test",
+					"hygon.com/use-hcutype": "hcu,test",
 				},
-				cardtype: "dcu",
+				cardtype: "hcu",
 			},
 			want: true,
 		},
 		{
-			name: "exist one dcu no use type",
+			name: "exist one hcu no use type",
 			args: struct {
 				annos    map[string]string
 				cardtype string
 			}{
 				annos: map[string]string{
-					"hygon.com/nouse-dcutype": "dcu",
+					"hygon.com/nouse-hcutype": "hcu",
 				},
-				cardtype: "dcu",
+				cardtype: "hcu",
 			},
 			want: false,
 		},
 		{
-			name: "no dcu in use annotation",
+			name: "no hcu in use annotation",
 			args: struct {
 				annos    map[string]string
 				cardtype string
 			}{
 				annos:    map[string]string{},
-				cardtype: "dcu",
+				cardtype: "hcu",
 			},
 			want: true,
 		},
 		{
-			name: "exist multi dcu no use type",
+			name: "exist multi hcu no use type",
 			args: struct {
 				annos    map[string]string
 				cardtype string
 			}{
 				annos: map[string]string{
-					"hygon.com/nouse-dcutype": "test,dcu",
+					"hygon.com/nouse-hcutype": "test,hcu",
 				},
 				cardtype: "test",
 			},
 			want: false,
 		},
 		{
-			name: "the different of dcu no use type",
+			name: "the different of hcu no use type",
 			args: struct {
 				annos    map[string]string
 				cardtype string
 			}{
 				annos: map[string]string{
-					"hygon.com/nouse-dcutype": "dcu",
+					"hygon.com/nouse-hcutype": "hcu",
 				},
 				cardtype: "test",
+			},
+			want: true,
+		},
+		{
+			name: "empty use type annotation is no constraint",
+			args: struct {
+				annos    map[string]string
+				cardtype string
+			}{
+				annos: map[string]string{
+					"hygon.com/use-hcutype": "",
+				},
+				cardtype: "hcu",
+			},
+			want: true,
+		},
+		{
+			name: "empty nouse type annotation excludes nothing",
+			args: struct {
+				annos    map[string]string
+				cardtype string
+			}{
+				annos: map[string]string{
+					"hygon.com/nouse-hcutype": "",
+				},
+				cardtype: "hcu",
+			},
+			want: true,
+		},
+		{
+			name: "whitespace-only nouse type annotation excludes nothing",
+			args: struct {
+				annos    map[string]string
+				cardtype string
+			}{
+				annos: map[string]string{
+					"hygon.com/nouse-hcutype": "   ",
+				},
+				cardtype: "hcu",
 			},
 			want: true,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			result := checkDCUtype(test.args.annos, test.args.cardtype)
+			result := checkHCUtype(test.args.annos, test.args.cardtype)
 			assert.Equal(t, result, test.want)
 		})
 	}
 }
 
 func Test_GetNodeDevices(t *testing.T) {
-	dev := DCUDevices{}
+	dev := HCUDevices{}
 	tests := []struct {
 		name string
 		args corev1.Node
@@ -219,36 +257,36 @@ func Test_GetNodeDevices(t *testing.T) {
 			err:  errors.New("annos not found " + RegisterAnnos),
 		},
 		{
-			name: "exist dcu device",
+			name: "exist hcu device",
 			args: corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
-						"hami.io/node-dcu-register": "test-0,1,1024,100,DCU,0,true,0,test:",
+						"hami.io/node-hcu-register": "test-0,1,1024,100,HCU,0,true,0,test:",
 					},
 				},
 			},
 			want: []*device.DeviceInfo{
 				{
 					ID:           "test-0",
-					Count:        int32(1),
-					Devmem:       int32(1024),
-					Devcore:      int32(100),
+					Count:        int64(1),
+					Devmem:       int64(1024),
+					Devcore:      int64(100),
 					Type:         dev.CommonWord(),
 					Numa:         0,
 					Health:       true,
 					Index:        uint(0),
 					Mode:         "test",
-					DeviceVendor: HygonDCUCommonWord,
+					DeviceVendor: HygonHCUCommonWord,
 				},
 			},
 			err: nil,
 		},
 		{
-			name: "no dcu device",
+			name: "no hcu device",
 			args: corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
-						"hami.io/node-dcu-register": ":",
+						"hami.io/node-hcu-register": ":",
 					},
 				},
 			},
@@ -260,7 +298,7 @@ func Test_GetNodeDevices(t *testing.T) {
 			args: corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
-						"hami.io/node-dcu-register": "",
+						"hami.io/node-hcu-register": "",
 					},
 				},
 			},
@@ -268,11 +306,11 @@ func Test_GetNodeDevices(t *testing.T) {
 			err:  errors.New("node annotations not decode successfully"),
 		},
 		{
-			name: "dcu device length less than 7",
+			name: "hcu device length less than 7",
 			args: corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
-						"hami.io/node-dcu-register": "test-0,1,1024,100,DCU:",
+						"hami.io/node-hcu-register": "test-0,1,1024,100,HCU:",
 					},
 				},
 			},
@@ -292,78 +330,47 @@ func Test_GetNodeDevices(t *testing.T) {
 }
 
 func Test_CheckHealth(t *testing.T) {
-	tests := []struct {
-		name string
-		args struct {
-			devType string
-			n       *corev1.Node
+	const resourceName = "hygon.com/dcunum"
+	previous := HygonResourceCount
+	t.Cleanup(func() { HygonResourceCount = previous })
+	HygonResourceCount = resourceName
+
+	node := func(name string, allocatable int64, registerAnno string) *corev1.Node {
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{}},
+			Status:     corev1.NodeStatus{Allocatable: corev1.ResourceList{}},
 		}
-		want1 bool
-		want2 bool
-	}{
-		{
-			name: "Requesting state expired",
-			args: struct {
-				devType string
-				n       *corev1.Node
-			}{
-				devType: "hygon.com/dcu",
-				n: &corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["hygon.com/dcu"]: "Requesting_2025-01-07 00:00:00",
-						},
-					},
-				},
-			},
-			want1: false,
-			want2: false,
-		},
-		{
-			name: "Deleted state",
-			args: struct {
-				devType string
-				n       *corev1.Node
-			}{
-				devType: "hygon.com/dcu",
-				n: &corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["hygon.com/dcu"]: "Deleted",
-						},
-					},
-				},
-			},
-			want1: true,
-			want2: false,
-		},
-		{
-			name: "Unknown state",
-			args: struct {
-				devType string
-				n       *corev1.Node
-			}{
-				devType: "hygon.com/dcu",
-				n: &corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							util.HandshakeAnnos["hygon.com/dcu"]: "Unknown",
-						},
-					},
-				},
-			},
-			want1: true,
-			want2: true,
-		},
+		if allocatable > 0 {
+			n.Status.Allocatable[resourceName] = *resource.NewQuantity(allocatable, resource.DecimalSI)
+		}
+		if registerAnno != "" {
+			n.Annotations[RegisterAnnos] = registerAnno
+		}
+		return n
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			dev := DCUDevices{}
-			result1, result2 := dev.CheckHealth(test.args.devType, test.args.n)
-			assert.Equal(t, result1, test.want1)
-			assert.Equal(t, result2, test.want2)
-		})
-	}
+
+	dev := HCUDevices{}
+
+	t.Run("no allocatable is unhealthy", func(t *testing.T) {
+		healthy, needUpdate := dev.CheckHealth(HygonHCUDevice, node("hcu-absent", 0, "anno"))
+		assert.Equal(t, healthy, false)
+		assert.Equal(t, needUpdate, false)
+	})
+
+	t.Run("allocatable present registers then stays cached", func(t *testing.T) {
+		n := node("hcu-present", 4, "anno-v1")
+		healthy, needUpdate := dev.CheckHealth(HygonHCUDevice, n)
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, true)
+
+		healthy, needUpdate = dev.CheckHealth(HygonHCUDevice, n)
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, false)
+
+		healthy, needUpdate = dev.CheckHealth(HygonHCUDevice, node("hcu-present", 4, "anno-v2"))
+		assert.Equal(t, healthy, true)
+		assert.Equal(t, needUpdate, true)
+	})
 }
 
 func Test_checkType(t *testing.T) {
@@ -386,13 +393,13 @@ func Test_checkType(t *testing.T) {
 				n     device.ContainerDeviceRequest
 			}{
 				annos: map[string]string{
-					"hygon.com/use-dcutype": "DCU",
+					"hygon.com/use-hcutype": "HCU",
 				},
 				d: device.DeviceUsage{
-					Type: "DCU",
+					Type: "HCU",
 				},
 				n: device.ContainerDeviceRequest{
-					Type: "DCU",
+					Type: "HCU",
 				},
 			},
 			want1: true,
@@ -407,10 +414,10 @@ func Test_checkType(t *testing.T) {
 				n     device.ContainerDeviceRequest
 			}{
 				annos: map[string]string{
-					"hygon.com/use-dcutype": "DCU",
+					"hygon.com/use-hcutype": "HCU",
 				},
 				d: device.DeviceUsage{
-					Type: "DCU",
+					Type: "HCU",
 				},
 				n: device.ContainerDeviceRequest{
 					Type: "test",
@@ -423,7 +430,7 @@ func Test_checkType(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			dev := DCUDevices{}
+			dev := HCUDevices{}
 			result1, result2, result3 := dev.checkType(test.args.annos, test.args.d, test.args.n)
 			assert.Equal(t, result1, test.want1)
 			assert.Equal(t, result2, test.want2)
@@ -449,22 +456,22 @@ func Test_PatchAnnotations(t *testing.T) {
 			}{
 				annoinput: &map[string]string{},
 				pd: device.PodDevices{
-					HygonDCUDevice: device.PodSingleDevice{
+					HygonHCUDevice: device.PodSingleDevice{
 						[]device.ContainerDevice{
 							{
 								Idx:       1,
 								UUID:      "test1",
-								Type:      HygonDCUDevice,
-								Usedmem:   int32(2048),
-								Usedcores: int32(1),
+								Type:      HygonHCUDevice,
+								Usedmem:   int64(2048),
+								Usedcores: int64(1),
 							},
 						},
 					},
 				},
 			},
 			want: map[string]string{
-				device.InRequestDevices[HygonDCUDevice]: "test1,DCU,2048,1:;",
-				device.SupportDevices[HygonDCUDevice]:   "test1,DCU,2048,1:;",
+				device.InRequestDevices[HygonHCUDevice]: "test1,HCU,2048,1:;",
+				device.SupportDevices[HygonHCUDevice]:   "test1,HCU,2048,1:;",
 			},
 		},
 		{
@@ -481,7 +488,7 @@ func Test_PatchAnnotations(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			dev := DCUDevices{}
+			dev := HCUDevices{}
 			result := dev.PatchAnnotations(&corev1.Pod{}, test.args.annoinput, test.args.pd)
 			assert.DeepEqual(t, result, test.want)
 		})
@@ -505,82 +512,207 @@ func Test_GenerateResourceRequests(t *testing.T) {
 			want: device.ContainerDeviceRequest{},
 		},
 		{
-			name: "dcuResourceCount,dcuesourceMem and dcuResourceCores set to limits and request",
+			name: "hcuResourceCount,hcuesourceMem and hcuResourceCores set to limits and request",
 			args: &corev1.Container{
 				Resources: corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
-						"hygon.com/dcunum":   resource.MustParse("1"),
-						"hygon.com/dcucores": resource.MustParse("1"),
-						"hygon.com/dcumem":   resource.MustParse("1024"),
+						"hygon.com/hcunum":   resource.MustParse("1"),
+						"hygon.com/hcucores": resource.MustParse("1"),
+						"hygon.com/hcumem":   resource.MustParse("1024"),
 					},
 					Requests: corev1.ResourceList{
-						"hygon.com/dcunum":   resource.MustParse("1"),
-						"hygon.com/dcucores": resource.MustParse("1"),
-						"hygon.com/dcumem":   resource.MustParse("1024"),
+						"hygon.com/hcunum":   resource.MustParse("1"),
+						"hygon.com/hcucores": resource.MustParse("1"),
+						"hygon.com/hcumem":   resource.MustParse("1024"),
 					},
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(1),
-				Type:             HygonDCUDevice,
-				Memreq:           int32(1024),
-				MemPercentagereq: int32(0),
-				Coresreq:         int32(1),
+				Nums:             int64(1),
+				Type:             HygonHCUDevice,
+				Memreq:           int64(1024),
+				MemPercentagereq: int64(0),
+				Coresreq:         int64(1),
 			},
 		},
 		{
-			name: "dcuResourceMem,dcuResourceCores don't set limit and dcuResourceCount set to limits and request",
+			name: "hcuResourceMem,hcuResourceCores don't set limit and hcuResourceCount set to limits and request",
 			args: &corev1.Container{
 				Resources: corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
-						"hygon.com/dcunum": resource.MustParse("1"),
+						"hygon.com/hcunum": resource.MustParse("1"),
 					},
 					Requests: corev1.ResourceList{
-						"hygon.com/dcunum":   resource.MustParse("1"),
-						"hygon.com/dcucores": resource.MustParse("1"),
-						"hygon.com/dcumem":   resource.MustParse("1024"),
+						"hygon.com/hcunum":   resource.MustParse("1"),
+						"hygon.com/hcucores": resource.MustParse("1"),
+						"hygon.com/hcumem":   resource.MustParse("1024"),
 					},
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(1),
-				Type:             HygonDCUDevice,
-				Memreq:           int32(1024),
-				MemPercentagereq: int32(0),
-				Coresreq:         int32(1),
+				Nums:             int64(1),
+				Type:             HygonHCUDevice,
+				Memreq:           int64(1024),
+				MemPercentagereq: int64(0),
+				Coresreq:         int64(1),
 			},
 		},
 		{
-			name: "dcuResourceMem don't set limit and request,dcuResourceCores don't set limit and dcuResourceCount set to limits and request",
+			name: "omitted cores reserve no compute",
 			args: &corev1.Container{
 				Resources: corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
-						"hygon.com/dcunum": resource.MustParse("1"),
-					},
-					Requests: corev1.ResourceList{
-						"hygon.com/dcunum":   resource.MustParse("1"),
-						"hygon.com/dcucores": resource.MustParse("1"),
+						"hygon.com/hcunum": resource.MustParse("1"),
+						"hygon.com/hcumem": resource.MustParse("1024"),
 					},
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(1),
-				Type:             HygonDCUDevice,
-				Memreq:           int32(0),
-				MemPercentagereq: int32(100),
-				Coresreq:         int32(1),
+				Nums:             int64(1),
+				Type:             HygonHCUDevice,
+				Memreq:           int64(1024),
+				MemPercentagereq: int64(0),
+				Coresreq:         int64(0),
+			},
+		},
+		{
+			name: "count only keeps full memory and reserves no compute",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hygon.com/hcunum": resource.MustParse("1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(1),
+				Type:             HygonHCUDevice,
+				Memreq:           int64(0),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(0),
+			},
+		},
+		{
+			name: "hcuResourceMem don't set limit and request,hcuResourceCores don't set limit and hcuResourceCount set to limits and request",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hygon.com/hcunum": resource.MustParse("1"),
+					},
+					Requests: corev1.ResourceList{
+						"hygon.com/hcunum":   resource.MustParse("1"),
+						"hygon.com/hcucores": resource.MustParse("1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(1),
+				Type:             HygonHCUDevice,
+				Memreq:           int64(0),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(1),
 			},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			dev := DCUDevices{}
+			dev := HCUDevices{}
 			fs := flag.FlagSet{}
 			ParseConfig(&fs)
-			result := dev.GenerateResourceRequests(test.args)
+			result, _ := dev.GenerateResourceRequests(test.args)
 			assert.DeepEqual(t, result, test.want)
 		})
 	}
+}
+
+func Test_GenerateResourceRequests_OutOfRangeValues(t *testing.T) {
+	tests := []struct {
+		name string
+		args *corev1.Container
+		want device.ContainerDeviceRequest
+	}{
+		{
+			name: "negative hcu cores",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hygon.com/hcunum":   resource.MustParse("1"),
+						"hygon.com/hcucores": resource.MustParse("-1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "cores 101 out of range",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hygon.com/hcunum":   resource.MustParse("1"),
+						"hygon.com/hcucores": resource.MustParse("101"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "cores 150 out of range",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hygon.com/hcunum":   resource.MustParse("1"),
+						"hygon.com/hcucores": resource.MustParse("150"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "cores 200 out of range",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hygon.com/hcunum":   resource.MustParse("1"),
+						"hygon.com/hcucores": resource.MustParse("200"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dev := HCUDevices{}
+			fs := flag.FlagSet{}
+			ParseConfig(&fs)
+			result, _ := dev.GenerateResourceRequests(test.args)
+			assert.DeepEqual(t, result, test.want)
+		})
+	}
+}
+
+// Test_GenerateResourceRequests_MemoryFactorOverflow covers the case where the
+// raw memory request fits in int64 but overflows once MemoryFactor is applied.
+func Test_GenerateResourceRequests_MemoryFactorOverflow(t *testing.T) {
+	origFactor := MemoryFactor
+	MemoryFactor = 1024
+	defer func() { MemoryFactor = origFactor }()
+
+	dev := HCUDevices{}
+	fs := flag.FlagSet{}
+	ParseConfig(&fs)
+
+	// 9100000000000000 fits in int64, but 9100000000000000 * 1024 does not.
+	ctr := &corev1.Container{
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"hygon.com/hcunum": resource.MustParse("1"),
+				"hygon.com/hcumem": resource.MustParse("9100000000000000"),
+			},
+		},
+	}
+	result, _ := dev.GenerateResourceRequests(ctr)
+	assert.DeepEqual(t, result, device.ContainerDeviceRequest{})
 }
 
 func TestDevices_LockNode(t *testing.T) {
@@ -599,11 +731,37 @@ func TestDevices_LockNode(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name: "Test with non-zero resource requests",
+			name: "Test with regular container resource requests",
 			node: &corev1.Node{},
 			pod: &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
-				"hygon.com/dcunum": resource.MustParse("1"),
+				"hygon.com/hcunum": resource.MustParse("1"),
 			}}}}}},
+			hasLock:     true,
+			expectError: false,
+		},
+		{
+			name: "Test with init container resource requests",
+			node: &corev1.Node{},
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					"hygon.com/hcunum": resource.MustParse("1"),
+				}}}},
+				Containers: []corev1.Container{{Name: "cpu-app"}},
+			}},
+			hasLock:     true,
+			expectError: false,
+		},
+		{
+			name: "Test with init and regular container resource requests",
+			node: &corev1.Node{},
+			pod: &corev1.Pod{Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					"hygon.com/hcunum": resource.MustParse("1"),
+				}}}},
+				Containers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					"hygon.com/hcunum": resource.MustParse("1"),
+				}}}},
+			}},
 			hasLock:     true,
 			expectError: false,
 		},
@@ -616,7 +774,7 @@ func TestDevices_LockNode(t *testing.T) {
 			node := &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "testNode",
-					Annotations: map[string]string{"test-annotation-key": "test-annotation-value", device.InRequestDevices["DCU"]: "some-value"},
+					Annotations: map[string]string{"test-annotation-key": "test-annotation-value", device.InRequestDevices["HCU"]: "some-value"},
 				},
 			}
 
@@ -626,10 +784,10 @@ func TestDevices_LockNode(t *testing.T) {
 				t.Fatalf("Failed to create test node: %v", err)
 			}
 
-			dev := InitDCUDevice(HygonConfig{
-				ResourceCountName:  "hygon.com/dcunum",
-				ResourceMemoryName: "hygon.com/dcumem",
-				ResourceCoreName:   "hygon.com/dcucores",
+			dev := InitHCUDevice(HygonConfig{
+				ResourceCountName:  "hygon.com/hcunum",
+				ResourceMemoryName: "hygon.com/hcumem",
+				ResourceCoreName:   "hygon.com/hcucores",
 			})
 			err = dev.LockNode(node, tt.pod)
 			if tt.expectError {
@@ -640,7 +798,7 @@ func TestDevices_LockNode(t *testing.T) {
 			node, err = client.KubeClient.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
 			assert.NilError(t, err)
 			fmt.Println(node.Annotations)
-			_, ok := node.Annotations[NodeLockDCU]
+			_, ok := node.Annotations[NodeLockHCU]
 			assert.Equal(t, ok, tt.hasLock)
 		})
 	}
@@ -648,30 +806,46 @@ func TestDevices_LockNode(t *testing.T) {
 
 func TestDevices_ReleaseNodeLock(t *testing.T) {
 	tests := []struct {
-		name        string
-		node        *corev1.Node
-		pod         *corev1.Pod
-		hasLock     bool
-		expectError bool
+		name           string
+		node           *corev1.Node
+		pod            *corev1.Pod
+		lockAnnotation string
+		hasLock        bool
+		expectError    bool
 	}{
 		{
-			name:        "Test with no containers",
-			node:        &corev1.Node{},
-			pod:         &corev1.Pod{Spec: corev1.PodSpec{}},
-			hasLock:     true,
-			expectError: false,
+			name:           "Test with no containers",
+			node:           &corev1.Node{},
+			pod:            &corev1.Pod{Spec: corev1.PodSpec{}},
+			lockAnnotation: "lock-values,default,nozerorr",
+			hasLock:        true,
+			expectError:    false,
 		},
 		{
-			name: "Test with non-zero resource requests",
+			name: "Test with regular container resource requests",
 			node: &corev1.Node{},
 			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 				Name:      "nozerorr",
 				Namespace: "default",
 			}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
-				"hygon.com/dcunum": resource.MustParse("1"),
+				"hygon.com/hcunum": resource.MustParse("1"),
 			}}}}}},
-			hasLock:     false,
-			expectError: false,
+			lockAnnotation: "lock-values,default,nozerorr",
+			hasLock:        false,
+			expectError:    false,
+		},
+		{
+			name: "Test with init container resource requests",
+			node: &corev1.Node{},
+			pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name:      "init-hcunum",
+				Namespace: "default",
+			}, Spec: corev1.PodSpec{InitContainers: []corev1.Container{{Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				"hygon.com/hcunum": resource.MustParse("1"),
+			}}}}}},
+			lockAnnotation: "lock-values,default,init-hcunum",
+			hasLock:        false,
+			expectError:    false,
 		},
 	}
 
@@ -682,7 +856,7 @@ func TestDevices_ReleaseNodeLock(t *testing.T) {
 			node := &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "testNode",
-					Annotations: map[string]string{"test-annotation-key": "test-annotation-value", device.InRequestDevices["DCU"]: "some-value", NodeLockDCU: "lock-values,default,nozerorr"},
+					Annotations: map[string]string{"test-annotation-key": "test-annotation-value", device.InRequestDevices["HCU"]: "some-value", NodeLockHCU: tt.lockAnnotation},
 				},
 			}
 
@@ -692,10 +866,10 @@ func TestDevices_ReleaseNodeLock(t *testing.T) {
 				t.Fatalf("Failed to create test node: %v", err)
 			}
 
-			dev := InitDCUDevice(HygonConfig{
-				ResourceCountName:  "hygon.com/dcunum",
-				ResourceMemoryName: "hygon.com/dcumem",
-				ResourceCoreName:   "hygon.com/dcucores",
+			dev := InitHCUDevice(HygonConfig{
+				ResourceCountName:  "hygon.com/hcunum",
+				ResourceMemoryName: "hygon.com/hcumem",
+				ResourceCoreName:   "hygon.com/hcucores",
 			})
 			err = dev.ReleaseNodeLock(node, tt.pod)
 			if tt.expectError {
@@ -706,7 +880,7 @@ func TestDevices_ReleaseNodeLock(t *testing.T) {
 			node, err = client.KubeClient.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
 			assert.NilError(t, err)
 			fmt.Println(node.Annotations)
-			_, ok := node.Annotations[NodeLockDCU]
+			_, ok := node.Annotations[NodeLockHCU]
 			assert.Equal(t, ok, tt.hasLock)
 		})
 	}
@@ -714,11 +888,11 @@ func TestDevices_ReleaseNodeLock(t *testing.T) {
 
 func TestDevices_Fit(t *testing.T) {
 	config := HygonConfig{
-		ResourceCountName:  "hygon.com/dcunum",
-		ResourceMemoryName: "hygon.com/dcumem",
-		ResourceCoreName:   "hygon.com/dcucores",
+		ResourceCountName:  "hygon.com/hcunum",
+		ResourceMemoryName: "hygon.com/hcumem",
+		ResourceCoreName:   "hygon.com/hcucores",
 	}
-	dev := InitDCUDevice(config)
+	dev := InitHCUDevice(config)
 
 	tests := []struct {
 		name       string
@@ -743,7 +917,7 @@ func TestDevices_Fit(t *testing.T) {
 					Totalcore: 100,
 					Usedcores: 0,
 					Numa:      0,
-					Type:      HygonDCUDevice,
+					Type:      HygonHCUDevice,
 					Health:    true,
 				},
 				{
@@ -756,7 +930,7 @@ func TestDevices_Fit(t *testing.T) {
 					Totalcore: 100,
 					Usedcores: 0,
 					Numa:      0,
-					Type:      HygonDCUDevice,
+					Type:      HygonHCUDevice,
 					Health:    true,
 				},
 			},
@@ -765,7 +939,7 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           64,
 				MemPercentagereq: 0,
 				Coresreq:         50,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
 			annos:      map[string]string{},
 			wantFit:    true,
@@ -785,7 +959,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 0,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -793,7 +967,7 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           512,
 				MemPercentagereq: 0,
 				Coresreq:         50,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
 			annos:      map[string]string{},
 			wantFit:    false,
@@ -813,7 +987,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 100,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -821,7 +995,7 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           512,
 				MemPercentagereq: 0,
 				Coresreq:         50,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
 			annos:      map[string]string{},
 			wantFit:    false,
@@ -842,7 +1016,7 @@ func TestDevices_Fit(t *testing.T) {
 				Usedcores: 0,
 				Numa:      0,
 				Health:    true,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 			}},
 			request: device.ContainerDeviceRequest{
 				Nums:             1,
@@ -869,7 +1043,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 0,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -877,9 +1051,9 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           512,
 				MemPercentagereq: 0,
 				Coresreq:         50,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
-			annos:      map[string]string{DCUUseUUID: "dev-0"},
+			annos:      map[string]string{HCUUseUUID: "dev-0"},
 			wantFit:    false,
 			wantLen:    0,
 			wantDevIDs: []string{},
@@ -897,7 +1071,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 0,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -905,9 +1079,9 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           512,
 				MemPercentagereq: 0,
 				Coresreq:         50,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
-			annos:      map[string]string{DCUNoUseUUID: "dev-0"},
+			annos:      map[string]string{HCUNoUseUUID: "dev-0"},
 			wantFit:    false,
 			wantLen:    0,
 			wantDevIDs: []string{},
@@ -925,7 +1099,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 0,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -933,7 +1107,7 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           512,
 				MemPercentagereq: 0,
 				Coresreq:         50,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
 			annos:      map[string]string{},
 			wantFit:    false,
@@ -942,7 +1116,7 @@ func TestDevices_Fit(t *testing.T) {
 			wantReason: "1/1 CardTimeSlicingExhausted",
 		},
 		{
-			name: "fit success: but core limit can't exceed 100",
+			name: "fit fail: core limit out of range",
 			devices: []*device.DeviceUsage{{
 				ID:        "dev-0",
 				Index:     0,
@@ -953,7 +1127,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 0,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -961,13 +1135,13 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           512,
 				MemPercentagereq: 0,
 				Coresreq:         120,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
 			annos:      map[string]string{},
-			wantFit:    true,
-			wantLen:    1,
-			wantDevIDs: []string{"dev-0"},
-			wantReason: "",
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "core limit out of range",
 		},
 		{
 			name: "fit fail:  card exclusively",
@@ -981,7 +1155,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 0,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -989,7 +1163,7 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           512,
 				MemPercentagereq: 0,
 				Coresreq:         100,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
 			annos:      map[string]string{},
 			wantFit:    false,
@@ -1009,7 +1183,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 100,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -1017,7 +1191,7 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           512,
 				MemPercentagereq: 0,
 				Coresreq:         0,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
 			annos:      map[string]string{},
 			wantFit:    false,
@@ -1037,7 +1211,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 10,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -1045,11 +1219,11 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           512,
 				MemPercentagereq: 0,
 				Coresreq:         20,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
 			annos:      map[string]string{},
 			wantFit:    false,
-			wantLen:    0,
+			wantLen:    1,
 			wantDevIDs: []string{},
 			wantReason: "1/1 AllocatedCardsInsufficientRequest",
 		},
@@ -1065,7 +1239,7 @@ func TestDevices_Fit(t *testing.T) {
 				Totalcore: 100,
 				Usedcores: 10,
 				Numa:      0,
-				Type:      HygonDCUDevice,
+				Type:      HygonHCUDevice,
 				Health:    true,
 			}},
 			request: device.ContainerDeviceRequest{
@@ -1073,13 +1247,114 @@ func TestDevices_Fit(t *testing.T) {
 				Memreq:           0,
 				MemPercentagereq: 10,
 				Coresreq:         20,
-				Type:             HygonDCUDevice,
+				Type:             HygonHCUDevice,
 			},
 			annos:      map[string]string{},
 			wantFit:    true,
 			wantLen:    1,
 			wantDevIDs: []string{"dev-0"},
 			wantReason: "",
+		},
+		{
+			name: "mutex policy rejects used device",
+			devices: []*device.DeviceUsage{
+				{
+					ID:        "dev-0",
+					Index:     0,
+					Used:      1,
+					Count:     2,
+					Usedmem:   0,
+					Totalmem:  128,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      HygonHCUDevice,
+					Health:    true,
+				},
+			},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           64,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+				Type:             HygonHCUDevice,
+			},
+			annos:      map[string]string{"hami.io/gpu-scheduler-policy": "mutex"},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 ExclusiveDeviceAllocateConflict",
+		},
+		{
+			name: "fit fail: partial allocation AllocatedCardsInsufficientRequest for multiple cards",
+			devices: []*device.DeviceUsage{
+				{
+					ID:        "dev-0",
+					Index:     0,
+					Used:      0,
+					Count:     100,
+					Usedmem:   0,
+					Totalmem:  1280,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      HygonHCUDevice,
+					Health:    true,
+				},
+				{
+					ID:        "dev-1",
+					Index:     1,
+					Used:      0,
+					Count:     100,
+					Usedmem:   0,
+					Totalmem:  1280,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      HygonHCUDevice,
+					Health:    true,
+				},
+			},
+			request: device.ContainerDeviceRequest{
+				Nums:             3,
+				Memreq:           512,
+				MemPercentagereq: 0,
+				Coresreq:         20,
+				Type:             HygonHCUDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    2,
+			wantDevIDs: []string{},
+			wantReason: "2/2 AllocatedCardsInsufficientRequest",
+		},
+		{
+			name: "fit fail: CardNotHealth",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     100,
+				Usedmem:   0,
+				Totalmem:  1280,
+				Totalcore: 100,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      HygonHCUDevice,
+				Health:    false,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           512,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+				Type:             HygonHCUDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardNotHealth",
 		},
 	}
 
@@ -1095,13 +1370,13 @@ func TestDevices_Fit(t *testing.T) {
 			if fit != test.wantFit {
 				t.Errorf("Fit: got %v, want %v", fit, test.wantFit)
 			}
+			if len(result[HygonHCUDevice]) != test.wantLen {
+				t.Errorf("expected len: %d, got len %d", test.wantLen, len(result[HygonHCUDevice]))
+			}
 			if test.wantFit {
-				if len(result[HygonDCUDevice]) != test.wantLen {
-					t.Errorf("expected len: %d, got len %d", test.wantLen, len(result[HygonDCUDevice]))
-				}
 				for idx, id := range test.wantDevIDs {
-					if id != result[HygonDCUDevice][idx].UUID {
-						t.Errorf("expected device id: %s, got device id %s", id, result[HygonDCUDevice][idx].UUID)
+					if id != result[HygonHCUDevice][idx].UUID {
+						t.Errorf("expected device id: %s, got device id %s", id, result[HygonHCUDevice][idx].UUID)
 					}
 				}
 			}
@@ -1145,7 +1420,7 @@ func TestDevices_AddResourceUsage(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dev := &DCUDevices{}
+			dev := &HCUDevices{}
 			if err := dev.AddResourceUsage(&corev1.Pod{}, tt.deviceUsage, tt.ctr); (err != nil) != tt.wantErr {
 				t.Errorf("AddResourceUsage() error=%v, wantErr %v", err, tt.wantErr)
 			}
@@ -1162,4 +1437,198 @@ func TestDevices_AddResourceUsage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFit_CoresValidation(t *testing.T) {
+	dev := &HCUDevices{}
+	devices := []*device.DeviceUsage{
+		{
+			ID:        "dev-0",
+			Index:     0,
+			Count:     10,
+			Totalmem:  8000,
+			Totalcore: 100,
+			Used:      0,
+			Usedmem:   0,
+			Usedcores: 0,
+			Health:    true,
+			Type:      HygonHCUDevice,
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+	}
+
+	tests := []struct {
+		name     string
+		coresreq int64
+		wantOk   bool
+	}{
+		{
+			name:     "cores 0 is accepted",
+			coresreq: 0,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 50 is accepted",
+			coresreq: 50,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 100 is accepted",
+			coresreq: 100,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 101 is rejected",
+			coresreq: 101,
+			wantOk:   false,
+		},
+		{
+			name:     "cores 150 is rejected and not converted to 100",
+			coresreq: 150,
+			wantOk:   false,
+		},
+		{
+			name:     "cores 200 is rejected",
+			coresreq: 200,
+			wantOk:   false,
+		},
+		{
+			name:     "negative cores -1 is rejected",
+			coresreq: -1,
+			wantOk:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := device.ContainerDeviceRequest{
+				Nums:     1,
+				Type:     HygonHCUDevice,
+				Memreq:   1000,
+				Coresreq: tt.coresreq,
+			}
+			ok, _, _ := dev.Fit(devices, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+			assert.Equal(t, ok, tt.wantOk)
+		})
+	}
+
+	t.Run("empty devices with invalid coresreq returns out of range", func(t *testing.T) {
+		req := device.ContainerDeviceRequest{
+			Nums:     1,
+			Type:     HygonHCUDevice,
+			Memreq:   1000,
+			Coresreq: 150,
+		}
+		ok, _, reason := dev.Fit([]*device.DeviceUsage{}, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+		assert.Equal(t, ok, false)
+		assert.Equal(t, reason, "core limit out of range")
+	})
+
+	t.Run("mismatched device type with invalid coresreq returns out of range", func(t *testing.T) {
+		req := device.ContainerDeviceRequest{
+			Nums:     1,
+			Type:     HygonHCUDevice,
+			Memreq:   1000,
+			Coresreq: -1,
+		}
+		mismatchDevs := []*device.DeviceUsage{
+			{ID: "other-0", Type: "OtherType", Health: true},
+		}
+		ok, _, reason := dev.Fit(mismatchDevs, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+		assert.Equal(t, ok, false)
+		assert.Equal(t, reason, "core limit out of range")
+	})
+}
+
+func Test_GenerateResourceRequests_CoresValidation(t *testing.T) {
+	dev := &HCUDevices{}
+	for _, tt := range []struct {
+		name    string
+		cores   string
+		wantOk  bool
+		wantVal int64
+	}{
+		{name: "0 cores", cores: "0", wantOk: true, wantVal: 0},
+		{name: "50 cores", cores: "50", wantOk: true, wantVal: 50},
+		{name: "100 cores", cores: "100", wantOk: true, wantVal: 100},
+		{name: "101 cores", cores: "101", wantOk: false},
+		{name: "150 cores", cores: "150", wantOk: false},
+		{name: "200 cores", cores: "200", wantOk: false},
+		{name: "-1 cores", cores: "-1", wantOk: false},
+		{name: "fractional 50m", cores: "50m", wantOk: false},
+		{name: "fractional 99.1", cores: "99.1", wantOk: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctr := &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceName(HygonResourceCount): resource.MustParse("1"),
+						corev1.ResourceName(HygonResourceCores): resource.MustParse(tt.cores),
+					},
+				},
+			}
+			req, _ := dev.GenerateResourceRequests(ctr)
+			if tt.wantOk {
+				assert.Equal(t, req.Nums, int64(1))
+				assert.Equal(t, req.Coresreq, tt.wantVal)
+			} else {
+				assert.Equal(t, req.Nums, int64(0))
+			}
+		})
+	}
+}
+
+func Test_MutateAdmission_InvalidValues(t *testing.T) {
+	InitHCUDevice(HygonConfig{ResourceMemoryName: "hygon.com/hcumem", ResourceCountName: "hygon.com/hcunum", ResourceCoreName: "hygon.com/hcucores"})
+	ctr := func(limits, requests corev1.ResourceList) *corev1.Container {
+		return &corev1.Container{Name: "c", Resources: corev1.ResourceRequirements{Limits: limits, Requests: requests}}
+	}
+	list := func(kv ...string) corev1.ResourceList {
+		l := corev1.ResourceList{}
+		for i := 0; i < len(kv); i += 2 {
+			l[corev1.ResourceName(kv[i])] = resource.MustParse(kv[i+1])
+		}
+		return l
+	}
+	tests := []struct {
+		name    string
+		ctr     *corev1.Container
+		want    bool
+		wantErr bool
+	}{
+		{"valid limits", ctr(list("hygon.com/hcunum", "1", "hygon.com/hcucores", "100", "hygon.com/hcumem", "1024"), nil), true, false},
+		{"count only in requests", ctr(nil, list("hygon.com/hcunum", "1")), true, false},
+		{"no hcu resource", ctr(list("cpu", "1"), nil), false, false},
+		{"cores above 100", ctr(list("hygon.com/hcunum", "1", "hygon.com/hcucores", "101"), nil), false, true},
+		{"cores wrap int64", ctr(list("hygon.com/hcunum", "1", "hygon.com/hcucores", "4294967296"), nil), false, true},
+		{"negative cores", ctr(list("hygon.com/hcunum", "1", "hygon.com/hcucores", "-1"), nil), false, true},
+		{"fractional cores", ctr(list("hygon.com/hcunum", "1", "hygon.com/hcucores", "50m"), nil), false, true},
+		{"negative count", ctr(list("hygon.com/hcunum", "-1"), nil), false, true},
+		{"fractional memory", ctr(list("hygon.com/hcunum", "1", "hygon.com/hcumem", "1500m"), nil), false, true},
+		{"valid limit hides invalid request", ctr(list("hygon.com/hcunum", "1", "hygon.com/hcucores", "50"), list("hygon.com/hcucores", "150")), false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := (&HCUDevices{}).MutateAdmission(tt.ctr, &corev1.Pod{})
+			assert.Equal(t, got, tt.want)
+			assert.Equal(t, err != nil, tt.wantErr)
+		})
+	}
+}
+
+func Test_GenerateResourceRequests_UnparsableMemory(t *testing.T) {
+	InitHCUDevice(HygonConfig{ResourceMemoryName: "hygon.com/hcumem", ResourceCountName: "hygon.com/hcunum", ResourceCoreName: "hygon.com/hcucores"})
+	ctr := &corev1.Container{Name: "c", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+		"hygon.com/hcunum": resource.MustParse("1"),
+		"hygon.com/hcumem": resource.MustParse("1500m"),
+	}}}
+	req, err := (&HCUDevices{}).GenerateResourceRequests(ctr)
+	var invalid *device.ErrInvalidDeviceRequest
+	assert.Assert(t, errors.As(err, &invalid))
+	assert.DeepEqual(t, req, device.ContainerDeviceRequest{})
 }

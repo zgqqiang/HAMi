@@ -18,13 +18,17 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"gotest.tools/v3/assert"
 	corev1 "k8s.io/api/core/v1"
@@ -42,6 +46,9 @@ import (
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/device/awsneuron"
+	"github.com/Project-HAMi/HAMi/pkg/device/common"
+	"github.com/Project-HAMi/HAMi/pkg/device/hygon"
 	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
 	"github.com/Project-HAMi/HAMi/pkg/scheduler/config"
 	"github.com/Project-HAMi/HAMi/pkg/util"
@@ -114,7 +121,7 @@ func Test_getNodesUsage(t *testing.T) {
 	}
 	nodes := make([]string, 0)
 	nodes = append(nodes, "node1")
-	cachenodeMap, _, err := s.getNodesUsage(&nodes, nil)
+	cachenodeMap, _, _, err := s.getNodesUsage(&nodes, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,23 +129,310 @@ func Test_getNodesUsage(t *testing.T) {
 	v, ok := (*cachenodeMap)["node1"]
 	assert.Equal(t, ok, true)
 	assert.Equal(t, len(v.Devices.DeviceLists), 2)
-	assert.Equal(t, v.Devices.DeviceLists[0].Device.Used, int32(2))
-	assert.Equal(t, v.Devices.DeviceLists[0].Device.Usedmem, int32(200))
-	assert.Equal(t, v.Devices.DeviceLists[0].Device.Usedcores, int32(20))
+	assert.Equal(t, v.Devices.DeviceLists[0].Device.Used, int64(2))
+	assert.Equal(t, v.Devices.DeviceLists[0].Device.Usedmem, int64(200))
+	assert.Equal(t, v.Devices.DeviceLists[0].Device.Usedcores, int64(20))
 }
 
-// test case matrix
-/**
-| pod name     | node name|  pod status | annotations                 |             result                  |
-|--------------|----------|-------------|---------------------------- |-------------------------------------|
-| test-pod-1   | node11   |  Succeeded  |  hami.io/bind-phase:success |  node11:{TotalPod:1,UseDevicePod:1} |
-| test-pod-2   | node12   |  Running    |  none                       |  node12:{TotalPod:0;UseDevicePod:0} |
-| test-pod-3   | node13   |  Succeeded  |  none                       |  node13:{TotalPod:1;UseDevicePod:0} |
-test case matrix.
-*/
+func Test_getNodesUsage_ReplaysAWSNeuronCoreMasks(t *testing.T) {
+	previous := device.DevicesMap
+	device.DevicesMap = map[string]device.Devices{
+		awsneuron.AWSNeuronDevice: awsneuron.InitAWSNeuronDevice(awsneuron.AWSNeuronConfig{
+			ResourceCountName: "aws.amazon.com/neuron",
+			ResourceCoreName:  "aws.amazon.com/neuroncore",
+		}),
+	}
+	t.Cleanup(func() { device.DevicesMap = previous })
+	nodes := newNodeManager()
+	nodes.addNode("node1", &device.NodeInfo{
+		ID: "node1", Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}},
+		Devices: map[string][]device.DeviceInfo{awsneuron.AWSNeuronDevice: {{
+			ID: "node1-AWSNeuron-0", Type: awsneuron.AWSNeuronDevice,
+			Count: 4, Devcore: 15, Health: true,
+		}}},
+	})
+	pods := device.NewPodManager()
+	for i, mask := range []int64{1, 2} {
+		pods.AddPod(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			UID:  types.UID(fmt.Sprintf("neuron-%d", i)),
+			Name: fmt.Sprintf("neuron-%d", i), Namespace: "default",
+		}}, "node1", device.PodDevices{awsneuron.AWSNeuronDevice: {{
+			{UUID: "node1-AWSNeuron-0", Type: awsneuron.AWSNeuronDevice, Usedcores: mask},
+		}}})
+	}
+	s := Scheduler{nodeManager: nodes, podManager: pods}
+	nodeNames := []string{"node1"}
+	usage, _, _, err := s.getNodesUsage(&nodeNames, nil)
+	require.NoError(t, err)
+	assert.Equal(t, (*usage)["node1"].Devices.DeviceLists[0].Device.Usedcores, int64(3))
+}
+
+// Regression: ListNodes() silently skips nodes whose Node field is nil, while GetNode()
+// does not apply that same filter and returns success. Before the fix, getNodesUsage()
+// blindly assigned cachenodeMap[id] = overallnodeMap[id] for every node GetNode() accepted,
+// so a node present in nodeManager but absent from the ListNodes() snapshot produced a nil
+// *NodeUsage entry with no corresponding failedNodes record. That nil is later dereferenced
+// unconditionally by calcScoreWithOptions (viewStatus(*node)), panicking the scheduler.
+func Test_getNodesUsage_NodeMissingFromSnapshotIsNotCachedAsNil(t *testing.T) {
+	nodeMage := newNodeManager()
+	nodeMage.addNode("node1", &device.NodeInfo{
+		ID:   "node1",
+		Node: nil,
+		Devices: map[string][]device.DeviceInfo{
+			nvidia.NvidiaGPUDevice: {{
+				ID:      "GPU0",
+				Index:   0,
+				Count:   10,
+				Devmem:  1024,
+				Devcore: 100,
+				Numa:    1,
+				Mode:    "hami",
+				Health:  true,
+			}},
+		},
+	})
+	podMap := device.NewPodManager()
+	s := Scheduler{
+		nodeManager: nodeMage,
+		podManager:  podMap,
+	}
+	nodes := []string{"node1"}
+	cachenodeMap, _, failedNodes, err := s.getNodesUsage(&nodes, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, 0, len(*cachenodeMap))
+	v, present := (*cachenodeMap)["node1"]
+	assert.Assert(t, !present, "node1 must not be cached at all, got %v", v)
+	_, failed := failedNodes["node1"]
+	assert.Assert(t, failed, "node1 should be recorded as a failed node")
+}
+
+func Test_getNodesUsage_StalePodDeviceAllocation(t *testing.T) {
+	t.Run("StaleOnly", func(t *testing.T) {
+		nodeMage := newNodeManager()
+		nodeMage.addNode("node1", &device.NodeInfo{
+			ID: "node1",
+			Node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "node1"},
+			},
+			Devices: map[string][]device.DeviceInfo{
+				nvidia.NvidiaGPUDevice: {
+					{
+						ID:      "GPU-B",
+						Index:   1,
+						Count:   10,
+						Devmem:  1024,
+						Devcore: 100,
+						Numa:    1,
+						Mode:    "hami",
+						Health:  true,
+					},
+				},
+			},
+		})
+		podDevicesStale := device.PodDevices{
+			"NVIDIA": device.PodSingleDevice{
+				[]device.ContainerDevice{
+					{Idx: 0, UUID: "GPU-A", Usedmem: 100, Usedcores: 10},
+				},
+			},
+		}
+		podMap := device.NewPodManager()
+		podMap.AddPod(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: "1111", Name: "stale-pod", Namespace: "default"},
+		}, "node1", podDevicesStale)
+
+		s := Scheduler{nodeManager: nodeMage, podManager: podMap}
+		nodes := []string{"node1"}
+		cachenodeMap, _, _, err := s.getNodesUsage(&nodes, nil)
+		assert.NilError(t, err)
+		v := (*cachenodeMap)["node1"]
+		dev := v.Devices.DeviceLists[0].Device
+		assert.Equal(t, "GPU-B", dev.ID)
+		assert.Equal(t, int64(0), dev.Used)
+		// A stale UUID must not poison unrelated healthy devices.
+		// Health is per-device (checked individually in every vendor Fit loop).
+		// Existing HAMi precedent: unknown-node pods are silently skipped with no
+		// health change. The stale-UUID case follows the same minimal blast radius.
+		assert.Assert(t, dev.Health, "stale UUID must not mark unrelated devices unhealthy")
+	})
+
+	t.Run("ValidOnly", func(t *testing.T) {
+		nodeMage := newNodeManager()
+		nodeMage.addNode("node1", &device.NodeInfo{
+			ID: "node1",
+			Node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "node1"},
+			},
+			Devices: map[string][]device.DeviceInfo{
+				nvidia.NvidiaGPUDevice: {
+					{
+						ID:      "GPU-B",
+						Index:   1,
+						Count:   10,
+						Devmem:  1024,
+						Devcore: 100,
+						Numa:    1,
+						Mode:    "hami",
+						Health:  true,
+					},
+				},
+			},
+		})
+		podDevicesValid := device.PodDevices{
+			"NVIDIA": device.PodSingleDevice{
+				[]device.ContainerDevice{
+					{Idx: 0, UUID: "GPU-B", Usedmem: 200, Usedcores: 20},
+				},
+			},
+		}
+		podMap := device.NewPodManager()
+		podMap.AddPod(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: "2222", Name: "valid-pod", Namespace: "default"},
+		}, "node1", podDevicesValid)
+
+		s := Scheduler{nodeManager: nodeMage, podManager: podMap}
+		nodes := []string{"node1"}
+		cachenodeMap, _, _, err := s.getNodesUsage(&nodes, nil)
+		assert.NilError(t, err)
+		v := (*cachenodeMap)["node1"]
+		dev := v.Devices.DeviceLists[0].Device
+		assert.Equal(t, "GPU-B", dev.ID)
+		assert.Equal(t, int64(1), dev.Used)
+		assert.Equal(t, int64(200), dev.Usedmem)
+		assert.Equal(t, int64(20), dev.Usedcores)
+		assert.Assert(t, dev.Health, "device health should be true for valid allocation")
+	})
+
+	t.Run("MixedStaleAndValid", func(t *testing.T) {
+		nodeMage := newNodeManager()
+		nodeMage.addNode("node1", &device.NodeInfo{
+			ID: "node1",
+			Node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "node1"},
+			},
+			Devices: map[string][]device.DeviceInfo{
+				nvidia.NvidiaGPUDevice: {
+					{
+						ID:      "GPU-B",
+						Index:   1,
+						Count:   10,
+						Devmem:  1024,
+						Devcore: 100,
+						Numa:    1,
+						Mode:    "hami",
+						Health:  true,
+					},
+				},
+			},
+		})
+		podDevicesStale := device.PodDevices{
+			"NVIDIA": device.PodSingleDevice{
+				[]device.ContainerDevice{
+					{Idx: 0, UUID: "GPU-A", Usedmem: 100, Usedcores: 10},
+				},
+			},
+		}
+		podDevicesValid := device.PodDevices{
+			"NVIDIA": device.PodSingleDevice{
+				[]device.ContainerDevice{
+					{Idx: 0, UUID: "GPU-B", Usedmem: 200, Usedcores: 20},
+				},
+			},
+		}
+		podMap := device.NewPodManager()
+		podMap.AddPod(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: "1111", Name: "stale-pod", Namespace: "default"},
+		}, "node1", podDevicesStale)
+		podMap.AddPod(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: "2222", Name: "valid-pod", Namespace: "default"},
+		}, "node1", podDevicesValid)
+
+		s := Scheduler{nodeManager: nodeMage, podManager: podMap}
+		nodes := []string{"node1"}
+		cachenodeMap, _, _, err := s.getNodesUsage(&nodes, nil)
+		assert.NilError(t, err)
+		v := (*cachenodeMap)["node1"]
+		dev := v.Devices.DeviceLists[0].Device
+		assert.Equal(t, "GPU-B", dev.ID)
+		assert.Equal(t, int64(1), dev.Used)
+		assert.Equal(t, int64(200), dev.Usedmem)
+		assert.Equal(t, int64(20), dev.Usedcores)
+		// GPU-B matched a valid allocation and must stay healthy.
+		// The stale GPU-A reference from another pod must not contaminate GPU-B.
+		assert.Assert(t, dev.Health, "stale UUID from another pod must not mark the valid device unhealthy")
+	})
+
+	// MultipleDevices explicitly documents and prevents regression to node-wide
+	// health poisoning: two healthy GPUs on the node, one pod with a stale UUID.
+	// Neither GPU should become unhealthy.
+	t.Run("MultipleDevices", func(t *testing.T) {
+		nodeMage := newNodeManager()
+		nodeMage.addNode("node1", &device.NodeInfo{
+			ID: "node1",
+			Node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "node1"},
+			},
+			Devices: map[string][]device.DeviceInfo{
+				nvidia.NvidiaGPUDevice: {
+					{
+						ID:      "GPU-A",
+						Index:   0,
+						Count:   10,
+						Devmem:  1024,
+						Devcore: 100,
+						Numa:    0,
+						Mode:    "hami",
+						Health:  true,
+					},
+					{
+						ID:      "GPU-B",
+						Index:   1,
+						Count:   10,
+						Devmem:  1024,
+						Devcore: 100,
+						Numa:    0,
+						Mode:    "hami",
+						Health:  true,
+					},
+				},
+			},
+		})
+		// The pod references GPU-GHOST which does not exist in the node inventory.
+		podDevicesStale := device.PodDevices{
+			"NVIDIA": device.PodSingleDevice{
+				[]device.ContainerDevice{
+					{Idx: 0, UUID: "GPU-GHOST", Usedmem: 512, Usedcores: 50},
+				},
+			},
+		}
+		podMap := device.NewPodManager()
+		podMap.AddPod(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: "3333", Name: "ghost-pod", Namespace: "default"},
+		}, "node1", podDevicesStale)
+
+		s := Scheduler{nodeManager: nodeMage, podManager: podMap}
+		nodes := []string{"node1"}
+		cachenodeMap, _, _, err := s.getNodesUsage(&nodes, nil)
+		assert.NilError(t, err)
+		v := (*cachenodeMap)["node1"]
+		assert.Equal(t, 2, len(v.Devices.DeviceLists))
+		for _, dl := range v.Devices.DeviceLists {
+			d := dl.Device
+			// Neither GPU-A nor GPU-B should have had their health changed.
+			// Regressing to the old for-loop would set both to false here.
+			assert.Assert(t, d.Health,
+				"device %s must remain healthy: a stale UUID must not trigger node-wide health poisoning", d.ID)
+			// The stale UUID was not matched, so no usage should be counted.
+			assert.Equal(t, int64(0), d.Used)
+		}
+	})
+}
 
 func Test_getPodUsage(t *testing.T) {
 	s := NewScheduler()
+	t.Cleanup(func() { close(s.stopCh) })
 	client.KubeClient = fake.NewClientset()
 	s.kubeClient = client.KubeClient
 	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour*1)
@@ -250,6 +544,7 @@ test case matrix.
 */
 func Test_Filter(t *testing.T) {
 	s := NewScheduler()
+	t.Cleanup(func() { close(s.stopCh) })
 	client.KubeClient = fake.NewClientset()
 	s.kubeClient = client.KubeClient
 	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour*1)
@@ -459,11 +754,11 @@ func Test_Filter(t *testing.T) {
 	}
 
 	tests := []struct {
-		name                      string
-		args                      extenderv1.ExtenderArgs
-		want                      *extenderv1.ExtenderFilterResult
-		wantPodAnnotationDeviceID string
-		wantErr                   error
+		name                       string
+		args                       extenderv1.ExtenderArgs
+		want                       *extenderv1.ExtenderFilterResult
+		wantPodAnnotationDeviceIDs []string
+		wantErr                    error
 	}{
 		{
 			name: "node use binpack gpu use binpack policy",
@@ -500,7 +795,56 @@ func Test_Filter(t *testing.T) {
 			want: &extenderv1.ExtenderFilterResult{
 				NodeNames: &[]string{"node2"},
 			},
-			wantPodAnnotationDeviceID: "device4",
+			wantPodAnnotationDeviceIDs: []string{"device4"},
+		},
+		{
+			name: "pod with init containers fits correctly using max resource logic (Binpack)",
+			args: extenderv1.ExtenderArgs{
+				Pod: &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "test-init-containers",
+						UID:  "test-init-uid",
+						Annotations: map[string]string{
+							util.GPUSchedulerPolicyAnnotationKey:  util.GPUSchedulerPolicyBinpack.String(),
+							util.NodeSchedulerPolicyAnnotationKey: util.NodeSchedulerPolicyBinpack.String(),
+						},
+					},
+					Spec: corev1.PodSpec{
+						InitContainers: []corev1.Container{
+							{
+								Name:  "init-1",
+								Image: "busybox",
+								Resources: corev1.ResourceRequirements{
+									Limits: corev1.ResourceList{
+										"hami.io/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+										"hami.io/gpucores": *resource.NewQuantity(20, resource.BinarySI),
+										"hami.io/gpumem":   *resource.NewQuantity(5000, resource.BinarySI),
+									},
+								},
+							},
+						},
+						Containers: []corev1.Container{
+							{
+								Name:  "app-1",
+								Image: "chrstnhntschl/gpu_burn",
+								Resources: corev1.ResourceRequirements{
+									Limits: corev1.ResourceList{
+										"hami.io/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+										"hami.io/gpucores": *resource.NewQuantity(20, resource.BinarySI),
+										"hami.io/gpumem":   *resource.NewQuantity(4000, resource.BinarySI),
+									},
+								},
+							},
+						},
+					},
+				},
+				NodeNames: &[]string{"node1", "node2"},
+			},
+			wantErr: nil,
+			want: &extenderv1.ExtenderFilterResult{
+				NodeNames: &[]string{"node2"},
+			},
+			wantPodAnnotationDeviceIDs: []string{"device3"},
 		},
 		{
 			name: "node use binpack gpu use spread policy",
@@ -537,7 +881,7 @@ func Test_Filter(t *testing.T) {
 			want: &extenderv1.ExtenderFilterResult{
 				NodeNames: &[]string{"node2"},
 			},
-			wantPodAnnotationDeviceID: "device3",
+			wantPodAnnotationDeviceIDs: []string{"device3", "device4"}, // Both are acceptable due to tie
 		},
 		{
 			name: "node use spread gpu use binpack policy",
@@ -574,7 +918,7 @@ func Test_Filter(t *testing.T) {
 			want: &extenderv1.ExtenderFilterResult{
 				NodeNames: &[]string{"node1"},
 			},
-			wantPodAnnotationDeviceID: "device1",
+			wantPodAnnotationDeviceIDs: []string{"device1"},
 		},
 		{
 			name: "node use spread gpu use spread policy",
@@ -611,10 +955,11 @@ func Test_Filter(t *testing.T) {
 			want: &extenderv1.ExtenderFilterResult{
 				NodeNames: &[]string{"node1"},
 			},
-			wantPodAnnotationDeviceID: "device2",
+			wantPodAnnotationDeviceIDs: []string{"device2"},
 		},
 	}
 
+	successfulFilters := 0
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			initNode()
@@ -624,7 +969,126 @@ func Test_Filter(t *testing.T) {
 			assert.DeepEqual(t, test.want, got)
 			getPod, _ := client.KubeClient.CoreV1().Pods(test.args.Pod.Namespace).Get(context.Background(), test.args.Pod.Name, metav1.GetOptions{})
 			podDevices, _ := device.DecodePodDevices(device.SupportDevices, getPod.Annotations)
-			assert.DeepEqual(t, test.wantPodAnnotationDeviceID, podDevices["NVIDIA"][0][0].UUID)
+
+			actualUUID := podDevices["NVIDIA"][0][0].UUID
+
+			if !slices.Contains(test.wantPodAnnotationDeviceIDs, actualUUID) {
+				t.Errorf("expected one of %v, got %s", test.wantPodAnnotationDeviceIDs, actualUUID)
+			}
+			successfulFilters++
+			require.NoError(t, promtestutil.CollectAndCompare(s.GetAllocationMetrics(), strings.NewReader(fmt.Sprintf(`
+# HELP hami_scheduler_allocations_total Successful HAMi device allocations.
+# TYPE hami_scheduler_allocations_total counter
+hami_scheduler_allocations_total{device_type="NVIDIA",failure_reason="none",phase="filter"} %d
+`, successfulFilters)), "hami_scheduler_allocations_total"))
+		})
+	}
+}
+
+func TestSchedulerOnDelQuotaClearsLimitFromTombstone(t *testing.T) {
+	const namespace = "quota-tombstone-test"
+
+	s := NewScheduler()
+
+	nvidiaDevice, ok := device.GetDevices()[nvidia.NvidiaGPUDevice]
+	require.True(t, ok, "NVIDIA device should be registered")
+
+	resourceName := nvidiaDevice.GetResourceNames().ResourceMemoryName
+	require.NotEmpty(t, resourceName, "NVIDIA memory resource name should not be empty")
+
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gpu-quota",
+			Namespace: namespace,
+		},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + resourceName): *resource.NewQuantity(1024, resource.BinarySI),
+			},
+		},
+	}
+
+	s.onAddQuota(quota)
+	t.Cleanup(func() {
+		s.onDelQuota(quota)
+	})
+
+	quotas := s.quotaManager.GetResourceQuota()
+	namespaceQuota, ok := quotas[namespace]
+	require.True(t, ok)
+	require.Equal(t, int64(1024), (*namespaceQuota)[resourceName].Limit)
+
+	s.onDelQuota(cache.DeletedFinalStateUnknown{
+		Key: namespace + "/" + quota.Name,
+		Obj: quota,
+	})
+
+	quotas = s.quotaManager.GetResourceQuota()
+	namespaceQuota, ok = quotas[namespace]
+	require.True(t, ok)
+	require.Equal(t, int64(0), (*namespaceQuota)[resourceName].Limit)
+}
+
+func TestSchedulerOnDelQuotaIgnoresInvalidObjects(t *testing.T) {
+	const namespace = "invalid-quota-delete-test"
+
+	s := NewScheduler()
+
+	nvidiaDevice, ok := device.GetDevices()[nvidia.NvidiaGPUDevice]
+	require.True(t, ok, "NVIDIA device should be registered")
+
+	resourceName := nvidiaDevice.GetResourceNames().ResourceMemoryName
+	require.NotEmpty(t, resourceName)
+
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gpu-quota",
+			Namespace: namespace,
+		},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + resourceName): *resource.NewQuantity(1024, resource.BinarySI),
+			},
+		},
+	}
+
+	s.onAddQuota(quota)
+	t.Cleanup(func() {
+		s.onDelQuota(quota)
+	})
+
+	quotas := s.quotaManager.GetResourceQuota()
+	namespaceQuota, ok := quotas[namespace]
+	require.True(t, ok)
+	expectedLimit := (*namespaceQuota)[resourceName].Limit
+
+	tests := []struct {
+		name string
+		obj  any
+	}{
+		{
+			name: "tombstone containing non-quota object",
+			obj: cache.DeletedFinalStateUnknown{
+				Key: "test/invalid",
+				Obj: struct{}{},
+			},
+		},
+		{
+			name: "unknown delete object",
+			obj:  struct{}{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.NotPanics(t, func() {
+				s.onDelQuota(test.obj)
+			})
+
+			currentQuotas := s.quotaManager.GetResourceQuota()
+			currentNamespaceQuota, ok := currentQuotas[namespace]
+			require.True(t, ok)
+			require.Equal(t, expectedLimit, (*currentNamespaceQuota)[resourceName].Limit)
 		})
 	}
 }
@@ -698,103 +1162,48 @@ func TestSchedulerOnDelNodeIgnoresNonNodeObjects(t *testing.T) {
 	require.Equal(t, initial, nodelockutil.NodeLockCountForTest())
 }
 
-func Test_RegisterFromNodeAnnotations(t *testing.T) {
-	tests := []struct {
-		name      string
-		Scheduler *Scheduler
-		want      func(node *corev1.Node) bool
-	}{
-		{
-			name: "test node handshake annotations layout",
-			Scheduler: func() *Scheduler {
-				s := NewScheduler()
-				s.stopCh = make(chan struct{})
-				s.nodeNotify = make(chan struct{})
-				client.KubeClient = fake.NewClientset()
-				s.kubeClient = client.KubeClient
-				informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour*1)
-				s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+// Test_register_RemovesObsoleteHandshake checks that register() deletes the
+// handshake annotations an older scheduler left behind, including on a node
+// that has none of the device in question.
+func Test_register_RemovesObsoleteHandshake(t *testing.T) {
+	previousDevices := device.DevicesMap
+	previousHygon := [3]string{hygon.HygonResourceCount, hygon.HygonResourceMemory, hygon.HygonResourceCores}
+	t.Cleanup(func() {
+		device.DevicesMap = previousDevices
+		hygon.HygonResourceCount, hygon.HygonResourceMemory, hygon.HygonResourceCores = previousHygon[0], previousHygon[1], previousHygon[2]
+	})
+	device.DevicesMap = map[string]device.Devices{
+		nvidia.NvidiaGPUDevice: nvidia.InitNvidiaDevice(nvidia.NvidiaConfig{ResourceCountName: "nvidia.com/gpu"}),
+		hygon.HygonHCUDevice:   hygon.InitHCUDevice(hygon.HygonConfig{ResourceCountName: "hygon.com/dcunum"}),
+	}
 
-				// Create a node
-				node := &corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "node",
-						Annotations: map[string]string{
-							"hami.io/node-handshake":     "Requesting_2025-06-13 09:07:40",
-							"hami.io/node-handshake-dcu": "Requesting_2025-06-13 09:07:40",
-						},
-					},
-				}
-				_, err := client.KubeClient.CoreV1().Nodes().Create(context.TODO(), node, metav1.CreateOptions{})
-				if err != nil {
-					t.Errorf("failed to create node: %v", err)
-					return nil
-				}
+	client.KubeClient = fake.NewClientset()
+	s := NewScheduler()
+	s.kubeClient = client.KubeClient
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour)
+	s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
 
-				// Add node to informer cache
-				err = informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node)
-				if err != nil {
-					t.Errorf("failed to add node to indexer: %v", err)
-					return nil
-				}
-
-				// Start informer factory to sync cache
-				informerFactory.Start(s.stopCh)
-				informerFactory.WaitForCacheSync(s.stopCh)
-
-				return s
-			}(),
-			want: func(node *corev1.Node) bool {
-				handshakeTimeStr, okHami := node.Annotations["hami.io/node-handshake"]
-				if !okHami {
-					t.Errorf("missing annotation: hami.io/node-handshake")
-					return false
-				}
-				dcuTimeStr, okDcu := node.Annotations["hami.io/node-handshake-dcu"]
-				if !okDcu {
-					t.Errorf("missing annotation: hami.io/node-handshake-dcu")
-					return false
-				}
-				_, errHami := time.Parse(time.DateTime, strings.TrimPrefix(handshakeTimeStr, "Requesting_"))
-				_, errDcu := time.Parse(time.DateTime, strings.TrimPrefix(dcuTimeStr, "Requesting_"))
-				if errHami != nil {
-					t.Errorf("invalid time format in annotation 'hami.io/node-handshake': %v", errHami)
-					return false
-				}
-				if errDcu != nil {
-					t.Errorf("invalid time format in annotation 'hami.io/node-handshake-dcu': %v", errDcu)
-					return false
-				}
-				return true
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node",
+			Annotations: map[string]string{
+				"hami.io/node-handshake":     "Requesting_2025-06-13 09:07:40",
+				"hami.io/node-handshake-hcu": "Requesting_2025-06-13 09:07:40",
 			},
 		},
 	}
+	_, err := client.KubeClient.CoreV1().Nodes().Create(context.TODO(), node, metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node))
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			// Graceful shutdown after 5 seconds
-			time.AfterFunc(5*time.Second, func() {
-				close(test.Scheduler.stopCh)
-			})
+	s.register(labels.Everything())
 
-			// Notify node annotations
-			go func() {
-				test.Scheduler.nodeNotify <- struct{}{}
-			}()
-
-			// Invoke the method to test
-			test.Scheduler.RegisterFromNodeAnnotations()
-
-			// Get the node to verify annotations
-			node, err := test.Scheduler.kubeClient.CoreV1().Nodes().Get(context.TODO(), "node", metav1.GetOptions{})
-			if err != nil {
-				t.Errorf("failed to get node: %v", err)
-				return
-			}
-
-			// Verify the annotations
-			assert.Equal(t, test.want(node), true)
-		})
+	got, err := client.KubeClient.CoreV1().Nodes().Get(context.TODO(), "node", metav1.GetOptions{})
+	require.NoError(t, err)
+	for _, key := range []string{"hami.io/node-handshake", "hami.io/node-handshake-hcu"} {
+		_, ok := got.Annotations[key]
+		require.False(t, ok, "annotation %s should have been removed", key)
 	}
 }
 
@@ -851,35 +1260,14 @@ func Test_RegisterFromNodeAnnotations_NIL(t *testing.T) {
 					return false
 				}
 
-				// Check if RegisterFromNodeAnnotations handles nil annotations gracefully
-				if node.Annotations == nil {
-					t.Logf("node annotations are nil, checking if handled properly...")
-					return true // Adjust based on expected behavior
+				// The scheduler no longer writes handshake annotations, so a
+				// node that had none must still have none.
+				for _, key := range []string{"hami.io/node-handshake", "hami.io/node-handshake-hcu"} {
+					if value, ok := node.Annotations[key]; ok {
+						t.Errorf("unexpected annotation %s=%q", key, value)
+						return false
+					}
 				}
-
-				// If annotations exist, check for specific annotations
-				handshakeTimeStr, okHami := node.Annotations["hami.io/node-handshake"]
-				dcuTimeStr, okDcu := node.Annotations["hami.io/node-handshake-dcu"]
-
-				// Here you can define what should happen when annotations are present but not set
-				if !okHami || !okDcu {
-					t.Logf("expected annotations are missing, checking if handled properly...")
-					return true // Adjust based on expected behavior
-				}
-
-				// Verify time format in annotations if they exist
-				_, errHami := time.Parse(time.DateTime, strings.TrimPrefix(handshakeTimeStr, "Requesting_"))
-				_, errDcu := time.Parse(time.DateTime, strings.TrimPrefix(dcuTimeStr, "Requesting_"))
-
-				if errHami != nil {
-					t.Errorf("invalid time format in annotation 'hami.io/node-handshake': %v", errHami)
-					return false
-				}
-				if errDcu != nil {
-					t.Errorf("invalid time format in annotation 'hami.io/node-handshake-dcu': %v", errDcu)
-					return false
-				}
-
 				return true
 			},
 		},
@@ -921,11 +1309,12 @@ func Test_RegisterFromNodeAnnotations_NIL(t *testing.T) {
 }
 
 type registerMockDevice struct {
-	nodeDevices   []*device.DeviceInfo
-	getNodeErr    error
-	health        bool
-	needUpdate    bool
-	nodeCleanedUp int
+	nodeDevices        []*device.DeviceInfo
+	getNodeErr         error
+	getNodeDevicesFunc func(node corev1.Node) ([]*device.DeviceInfo, error)
+	health             bool
+	needUpdate         bool
+	nodeCleanedUp      int
 }
 
 func (m *registerMockDevice) CommonWord() string { return "mock-vendor" }
@@ -940,13 +1329,16 @@ func (m *registerMockDevice) NodeCleanUp(_ string) error {
 	return nil
 }
 func (m *registerMockDevice) GetResourceNames() device.ResourceNames { return device.ResourceNames{} }
-func (m *registerMockDevice) GetNodeDevices(_ corev1.Node) ([]*device.DeviceInfo, error) {
+func (m *registerMockDevice) GetNodeDevices(node corev1.Node) ([]*device.DeviceInfo, error) {
+	if m.getNodeDevicesFunc != nil {
+		return m.getNodeDevicesFunc(node)
+	}
 	return m.nodeDevices, m.getNodeErr
 }
 func (m *registerMockDevice) LockNode(_ *corev1.Node, _ *corev1.Pod) error        { return nil }
 func (m *registerMockDevice) ReleaseNodeLock(_ *corev1.Node, _ *corev1.Pod) error { return nil }
-func (m *registerMockDevice) GenerateResourceRequests(_ *corev1.Container) device.ContainerDeviceRequest {
-	return device.ContainerDeviceRequest{}
+func (m *registerMockDevice) GenerateResourceRequests(_ *corev1.Container) (device.ContainerDeviceRequest, error) {
+	return device.ContainerDeviceRequest{}, nil
 }
 func (m *registerMockDevice) PatchAnnotations(_ *corev1.Pod, _ *map[string]string, _ device.PodDevices) map[string]string {
 	return nil
@@ -976,6 +1368,7 @@ func TestRegisterSkipsCleanupForUntrackedVendor(t *testing.T) {
 
 	s := NewScheduler()
 	s.stopCh = make(chan struct{})
+	t.Cleanup(func() { close(s.stopCh) })
 	client.KubeClient = fake.NewClientset()
 	s.kubeClient = client.KubeClient
 
@@ -1031,7 +1424,7 @@ func TestRegisterSkipsCleanupForUntrackedVendor(t *testing.T) {
 	})
 
 	atomic.StoreUint32(&s.started, 1)
-	s.register(labels.Everything(), map[string]bool{})
+	s.register(labels.Everything())
 
 	assert.Equal(t, mockDev.nodeCleanedUp, 0)
 
@@ -1043,8 +1436,603 @@ func TestRegisterSkipsCleanupForUntrackedVendor(t *testing.T) {
 	assert.Equal(t, ok, false)
 }
 
+func TestRegisterHealthReconciliationOnDiscoveryError_Unhealthy(t *testing.T) {
+	oldDevicesMap := device.DevicesMap
+	defer func() { device.DevicesMap = oldDevicesMap }()
+
+	mockDev := &registerMockDevice{
+		nodeDevices: nil,
+		getNodeErr:  errors.New("device discovery error"),
+		health:      false,
+		needUpdate:  false,
+	}
+	device.DevicesMap = map[string]device.Devices{
+		"mock-vendor": mockDev,
+	}
+
+	s := NewScheduler()
+	s.stopCh = make(chan struct{})
+	t.Cleanup(func() { close(s.stopCh) })
+	client.KubeClient = fake.NewClientset()
+	s.kubeClient = client.KubeClient
+
+	t.Setenv("POD_NAMESPACE", "default")
+	t.Setenv("POD_NAME", "scheduler-0")
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour)
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
+	s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+		},
+	}
+	_, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node)
+	require.NoError(t, err)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "scheduler-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.HAMiComponentLabel: util.HAMiComponentScheduler,
+			},
+		},
+	}
+	_, err = client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Pods().Informer().GetIndexer().Add(pod)
+	require.NoError(t, err)
+
+	informerFactory.Start(s.stopCh)
+	informerFactory.WaitForCacheSync(s.stopCh)
+
+	// Pre-populate scheduler cache with mock-vendor device
+	s.addNode("node-1", &device.NodeInfo{
+		ID:   "node-1",
+		Node: node.DeepCopy(),
+		Devices: map[string][]device.DeviceInfo{
+			"mock-vendor": {{
+				ID:           "MOCK-0",
+				Index:        0,
+				Count:        1,
+				Devmem:       1024,
+				Devcore:      100,
+				Type:         "mock-vendor",
+				Health:       true,
+				DeviceVendor: "mock-vendor",
+			}},
+		},
+	})
+
+	atomic.StoreUint32(&s.started, 1)
+	s.register(labels.Everything())
+
+	assert.Equal(t, 1, mockDev.nodeCleanedUp, "NodeCleanUp should be invoked when device is unhealthy even on discovery error")
+
+	// mock-vendor was the only vendor on node-1; rmNodeDevices deletes the node
+	// entry entirely when no vendors remain. GetNode must return an error.
+	_, err = s.GetNode("node-1")
+	assert.ErrorContains(t, err, "not found", "node-1 should be removed from scheduler cache after last vendor cleanup")
+}
+
+func TestRegisterHealthReconciliationOnDiscoveryError_Healthy(t *testing.T) {
+	oldDevicesMap := device.DevicesMap
+	defer func() { device.DevicesMap = oldDevicesMap }()
+
+	mockDev := &registerMockDevice{
+		nodeDevices: nil,
+		getNodeErr:  errors.New("transient discovery error"),
+		health:      true,
+		needUpdate:  false,
+	}
+	device.DevicesMap = map[string]device.Devices{
+		"mock-vendor": mockDev,
+	}
+
+	s := NewScheduler()
+	s.stopCh = make(chan struct{})
+	t.Cleanup(func() { close(s.stopCh) })
+	client.KubeClient = fake.NewClientset()
+	s.kubeClient = client.KubeClient
+
+	t.Setenv("POD_NAMESPACE", "default")
+	t.Setenv("POD_NAME", "scheduler-0")
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour)
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
+	s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+		},
+	}
+	_, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node)
+	require.NoError(t, err)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "scheduler-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.HAMiComponentLabel: util.HAMiComponentScheduler,
+			},
+		},
+	}
+	_, err = client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Pods().Informer().GetIndexer().Add(pod)
+	require.NoError(t, err)
+
+	informerFactory.Start(s.stopCh)
+	informerFactory.WaitForCacheSync(s.stopCh)
+
+	// Pre-populate scheduler cache with mock-vendor device
+	s.addNode("node-1", &device.NodeInfo{
+		ID:   "node-1",
+		Node: node.DeepCopy(),
+		Devices: map[string][]device.DeviceInfo{
+			"mock-vendor": {{
+				ID:           "MOCK-0",
+				Index:        0,
+				Count:        1,
+				Devmem:       1024,
+				Devcore:      100,
+				Type:         "mock-vendor",
+				Health:       true,
+				DeviceVendor: "mock-vendor",
+			}},
+		},
+	})
+
+	atomic.StoreUint32(&s.started, 1)
+	s.register(labels.Everything())
+
+	assert.Equal(t, 0, mockDev.nodeCleanedUp, "NodeCleanUp should NOT be invoked when device is healthy")
+
+	nodeInfo, err := s.GetNode("node-1")
+	require.NoError(t, err)
+	_, ok := nodeInfo.Devices["mock-vendor"]
+	assert.Equal(t, true, ok, "healthy mock-vendor device should be preserved in scheduler cache despite discovery error")
+}
+
+func TestRegisterHealthReconciliationOnDiscoveryError_HeterogeneousNode(t *testing.T) {
+	oldDevicesMap := device.DevicesMap
+	defer func() { device.DevicesMap = oldDevicesMap }()
+
+	devHealthy := &registerMockDevice{
+		nodeDevices: []*device.DeviceInfo{{
+			ID:           "HEALTHY-0",
+			Index:        0,
+			Count:        1,
+			Devmem:       1024,
+			Devcore:      100,
+			Type:         "vendor-healthy",
+			Health:       true,
+			DeviceVendor: "vendor-healthy",
+		}},
+		getNodeErr: nil,
+		health:     true,
+		needUpdate: true,
+	}
+	devUnhealthyErr := &registerMockDevice{
+		nodeDevices: nil,
+		getNodeErr:  errors.New("discovery error for vendor-unhealthy"),
+		health:      false,
+		needUpdate:  false,
+	}
+	devHealthyErr := &registerMockDevice{
+		nodeDevices: nil,
+		getNodeErr:  errors.New("transient error for vendor-healthy-err"),
+		health:      true,
+		needUpdate:  false,
+	}
+
+	device.DevicesMap = map[string]device.Devices{
+		"vendor-healthy":       devHealthy,
+		"vendor-unhealthy-err": devUnhealthyErr,
+		"vendor-healthy-err":   devHealthyErr,
+	}
+
+	s := NewScheduler()
+	s.stopCh = make(chan struct{})
+	t.Cleanup(func() { close(s.stopCh) })
+	client.KubeClient = fake.NewClientset()
+	s.kubeClient = client.KubeClient
+
+	t.Setenv("POD_NAMESPACE", "default")
+	t.Setenv("POD_NAME", "scheduler-0")
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour)
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
+	s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-hetero",
+		},
+	}
+	_, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node)
+	require.NoError(t, err)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "scheduler-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.HAMiComponentLabel: util.HAMiComponentScheduler,
+			},
+		},
+	}
+	_, err = client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Pods().Informer().GetIndexer().Add(pod)
+	require.NoError(t, err)
+
+	informerFactory.Start(s.stopCh)
+	informerFactory.WaitForCacheSync(s.stopCh)
+
+	// Pre-populate scheduler cache with all three vendors
+	s.addNode("node-hetero", &device.NodeInfo{
+		ID:   "node-hetero",
+		Node: node.DeepCopy(),
+		Devices: map[string][]device.DeviceInfo{
+			"vendor-healthy": {{
+				ID:           "HEALTHY-0",
+				Index:        0,
+				Count:        1,
+				Devmem:       1024,
+				Devcore:      100,
+				Type:         "vendor-healthy",
+				Health:       true,
+				DeviceVendor: "vendor-healthy",
+			}},
+			"vendor-unhealthy-err": {{
+				ID:           "UNHEALTHY-0",
+				Index:        0,
+				Count:        1,
+				Devmem:       1024,
+				Devcore:      100,
+				Type:         "vendor-unhealthy-err",
+				Health:       true,
+				DeviceVendor: "vendor-unhealthy-err",
+			}},
+			"vendor-healthy-err": {{
+				ID:           "HEALTHY-ERR-0",
+				Index:        0,
+				Count:        1,
+				Devmem:       1024,
+				Devcore:      100,
+				Type:         "vendor-healthy-err",
+				Health:       true,
+				DeviceVendor: "vendor-healthy-err",
+			}},
+		},
+	})
+
+	atomic.StoreUint32(&s.started, 1)
+	s.register(labels.Everything())
+
+	assert.Equal(t, 0, devHealthy.nodeCleanedUp)
+	assert.Equal(t, 1, devUnhealthyErr.nodeCleanedUp)
+	assert.Equal(t, 0, devHealthyErr.nodeCleanedUp)
+
+	nodeInfo, err := s.GetNode("node-hetero")
+	require.NoError(t, err)
+
+	_, hasHealthy := nodeInfo.Devices["vendor-healthy"]
+	assert.Equal(t, true, hasHealthy, "healthy vendor should remain")
+
+	_, hasUnhealthyErr := nodeInfo.Devices["vendor-unhealthy-err"]
+	assert.Equal(t, false, hasUnhealthyErr, "unhealthy vendor should be cleaned up")
+
+	_, hasHealthyErr := nodeInfo.Devices["vendor-healthy-err"]
+	assert.Equal(t, true, hasHealthyErr, "healthy-err vendor should be preserved")
+}
+
+func TestRegisterHealthReconciliationOnDiscoveryError_Recovery(t *testing.T) {
+	oldDevicesMap := device.DevicesMap
+	defer func() { device.DevicesMap = oldDevicesMap }()
+
+	mockDev := &registerMockDevice{
+		nodeDevices: nil,
+		getNodeErr:  errors.New("transient discovery error"),
+		health:      true,
+		needUpdate:  false,
+	}
+	device.DevicesMap = map[string]device.Devices{
+		"mock-vendor": mockDev,
+	}
+
+	s := NewScheduler()
+	s.stopCh = make(chan struct{})
+	t.Cleanup(func() { close(s.stopCh) })
+	client.KubeClient = fake.NewClientset()
+	s.kubeClient = client.KubeClient
+
+	t.Setenv("POD_NAMESPACE", "default")
+	t.Setenv("POD_NAME", "scheduler-0")
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour)
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
+	s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-recovery",
+		},
+	}
+	_, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node)
+	require.NoError(t, err)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "scheduler-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.HAMiComponentLabel: util.HAMiComponentScheduler,
+			},
+		},
+	}
+	_, err = client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Pods().Informer().GetIndexer().Add(pod)
+	require.NoError(t, err)
+
+	informerFactory.Start(s.stopCh)
+	informerFactory.WaitForCacheSync(s.stopCh)
+
+	// Pre-populate scheduler cache with initial mock-vendor device (MOCK-0)
+	s.addNode("node-recovery", &device.NodeInfo{
+		ID:   "node-recovery",
+		Node: node.DeepCopy(),
+		Devices: map[string][]device.DeviceInfo{
+			"mock-vendor": {{
+				ID:           "MOCK-0",
+				Index:        0,
+				Count:        1,
+				Devmem:       1024,
+				Devcore:      100,
+				Type:         "mock-vendor",
+				Health:       true,
+				DeviceVendor: "mock-vendor",
+			}},
+		},
+	})
+
+	atomic.StoreUint32(&s.started, 1)
+
+	// Cycle 1: Transient discovery error occurs when fetching node devices.
+	s.register(labels.Everything())
+
+	// Verify Cycle 1 semantics:
+	// - NodeCleanUp was NOT called because device is healthy.
+	// - Transient error did NOT trigger zero-device cleanup.
+	// - Cached MOCK-0 device is preserved in scheduler cache.
+	assert.Equal(t, 0, mockDev.nodeCleanedUp, "NodeCleanUp should NOT be called during transient discovery error")
+	nodeInfo, err := s.GetNode("node-recovery")
+	require.NoError(t, err)
+	cachedDevs, ok := nodeInfo.Devices["mock-vendor"]
+	assert.Equal(t, true, ok, "cached mock-vendor devices should be preserved despite transient discovery error")
+	require.Len(t, cachedDevs, 1)
+	assert.Equal(t, "MOCK-0", cachedDevs[0].ID, "cached device ID MOCK-0 should remain unchanged")
+
+	// Cycle 2: Vendor recovers — GetNodeDevices succeeds and returns updated device (MOCK-RECOVERED).
+	mockDev.getNodeErr = nil
+	mockDev.nodeDevices = []*device.DeviceInfo{{
+		ID:           "MOCK-RECOVERED",
+		Index:        0,
+		Count:        1,
+		Devmem:       2048,
+		Devcore:      100,
+		Type:         "mock-vendor",
+		Health:       true,
+		DeviceVendor: "mock-vendor",
+	}}
+	mockDev.health = true
+	mockDev.needUpdate = true
+
+	s.register(labels.Everything())
+
+	// Verify Cycle 2 recovery semantics:
+	// - Device state correctly recovers and updates in scheduler cache.
+	// - Old MOCK-0 state is updated to MOCK-RECOVERED.
+	nodeInfo, err = s.GetNode("node-recovery")
+	require.NoError(t, err)
+	cachedDevs, ok = nodeInfo.Devices["mock-vendor"]
+	assert.Equal(t, true, ok, "mock-vendor devices should be present after recovery")
+	require.Len(t, cachedDevs, 1)
+	// Cycle 3: Vendor subsequently reports zero devices successfully.
+	// Verify zero-device cleanup removes stale cached vendor entry (scheduler.go:509-516).
+	mockDev.getNodeErr = nil
+	mockDev.nodeDevices = []*device.DeviceInfo{}
+
+	s.register(labels.Everything())
+
+	// Verify Cycle 3 zero-device semantics:
+	// - NodeCleanUp is NOT called because device is healthy.
+	// - Stale vendor cache entry is removed via rmNodeDevices.
+	assert.Equal(t, 0, mockDev.nodeCleanedUp, "NodeCleanUp must NOT be invoked when vendor reports zero devices with no error")
+	_, getErr := s.GetNode("node-recovery")
+	assert.ErrorContains(t, getErr, "not found", "stale vendor entry should be removed when vendor reports zero devices")
+}
+
+func Test_register_StaleDeviceVendorRemoval(t *testing.T) {
+	oldDevicesMap := device.DevicesMap
+	t.Cleanup(func() { device.DevicesMap = oldDevicesMap })
+
+	vendorA := &registerMockDevice{
+		getNodeDevicesFunc: func(node corev1.Node) ([]*device.DeviceInfo, error) {
+			if node.Name == "node-1" {
+				return []*device.DeviceInfo{
+					{
+						ID:           "gpu-1",
+						DeviceVendor: "vendor-A",
+						Health:       true,
+					},
+				}, nil
+			}
+			return nil, nil
+		},
+		health:     true,
+		needUpdate: true,
+	}
+	vendorB := &registerMockDevice{
+		nodeDevices: []*device.DeviceInfo{},
+		health:      true,
+		needUpdate:  true,
+	}
+	vendorC := &registerMockDevice{
+		getNodeDevicesFunc: func(node corev1.Node) ([]*device.DeviceInfo, error) {
+			if node.Name == "node-1" {
+				return []*device.DeviceInfo{
+					{
+						ID:           "gpu-3",
+						DeviceVendor: "vendor-C",
+						Health:       true,
+					},
+				}, nil
+			}
+			return nil, nil
+		},
+		health:     true,
+		needUpdate: true,
+	}
+	vendorD := &registerMockDevice{
+		nodeDevices: []*device.DeviceInfo{},
+		health:      true,
+		needUpdate:  true,
+	}
+
+	device.DevicesMap = map[string]device.Devices{
+		"vendor-A": vendorA,
+		"vendor-B": vendorB,
+		"vendor-C": vendorC,
+		"vendor-D": vendorD,
+	}
+
+	s := NewScheduler()
+	s.stopCh = make(chan struct{})
+	t.Cleanup(func() { close(s.stopCh) })
+
+	oldKubeClient := client.KubeClient
+	client.KubeClient = fake.NewClientset()
+	t.Cleanup(func() { client.KubeClient = oldKubeClient })
+	s.kubeClient = client.KubeClient
+
+	t.Setenv("POD_NAMESPACE", "default")
+	t.Setenv("POD_NAME", "scheduler-0")
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour)
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
+	s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+
+	// node-1: present in k8s indexer and pre-populated in scheduler cache
+	node1 := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+		},
+	}
+	_, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), node1, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node1)
+	require.NoError(t, err)
+
+	// node-absent: present in k8s indexer but absent from scheduler cache (exercises GetNode() error branch)
+	nodeAbsent := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-absent",
+		},
+	}
+	_, err = client.KubeClient.CoreV1().Nodes().Create(context.Background(), nodeAbsent, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(nodeAbsent)
+	require.NoError(t, err)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "scheduler-0",
+			Namespace: "default",
+			Labels: map[string]string{
+				util.HAMiComponentLabel: util.HAMiComponentScheduler,
+			},
+		},
+	}
+	_, err = client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+	err = informerFactory.Core().V1().Pods().Informer().GetIndexer().Add(pod)
+	require.NoError(t, err)
+
+	informerFactory.Start(s.stopCh)
+	informerFactory.WaitForCacheSync(s.stopCh)
+
+	// Initial cache state: node-1 has vendor-A, vendor-B, and vendor-C (vendor-D is untracked)
+	s.addNode("node-1", &device.NodeInfo{
+		ID:   "node-1",
+		Node: node1.DeepCopy(),
+		Devices: map[string][]device.DeviceInfo{
+			"vendor-A": {{
+				ID:           "gpu-1",
+				DeviceVendor: "vendor-A",
+				Health:       true,
+			}},
+			"vendor-B": {{
+				ID:           "gpu-2",
+				DeviceVendor: "vendor-B",
+				Health:       true,
+			}},
+			"vendor-C": {{
+				ID:           "gpu-3",
+				DeviceVendor: "vendor-C",
+				Health:       true,
+			}},
+		},
+	})
+
+	// Verify initial state has vendor-A, vendor-B, and vendor-C, but not vendor-D
+	nodeInfo, err := s.GetNode("node-1")
+	require.NoError(t, err)
+	require.Contains(t, nodeInfo.Devices, "vendor-A")
+	require.Contains(t, nodeInfo.Devices, "vendor-B")
+	require.Contains(t, nodeInfo.Devices, "vendor-C")
+	require.NotContains(t, nodeInfo.Devices, "vendor-D")
+
+	atomic.StoreUint32(&s.started, 1)
+
+	// Execute register cycle:
+	// - For node-1: vendor-B (0 devices) is removed from cache (exercises ok == true branch);
+	//   vendor-D (0 devices) is not in cache (exercises ok == false branch).
+	// - For node-absent: node is absent from scheduler cache (exercises GetNode error branch).
+	s.register(labels.Everything())
+
+	// Expect vendor-B to be removed from node-1 cache, while vendor-A and vendor-C remain
+	nodeInfo, err = s.GetNode("node-1")
+	require.NoError(t, err)
+	_, hasVendorA := nodeInfo.Devices["vendor-A"]
+	_, hasVendorB := nodeInfo.Devices["vendor-B"]
+	_, hasVendorC := nodeInfo.Devices["vendor-C"]
+	assert.Equal(t, hasVendorA, true, "vendor-A should remain in node cache")
+	assert.Equal(t, hasVendorB, false, "stale vendor-B should be removed from node cache")
+	assert.Equal(t, hasVendorC, true, "vendor-C should remain in node cache")
+
+	// Confirm node-absent was never added to scheduler cache
+	_, err = s.GetNode("node-absent")
+	require.Error(t, err)
+}
+
 func Test_ResourceQuota(t *testing.T) {
 	s := NewScheduler()
+	t.Cleanup(func() { close(s.stopCh) })
 	client.KubeClient = fake.NewClientset()
 	s.kubeClient = client.KubeClient
 	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour*1)
@@ -1232,7 +2220,7 @@ func Test_ResourceQuota(t *testing.T) {
 			wantErr: nil,
 			want: &extenderv1.ExtenderFilterResult{
 				FailedNodes: map[string]string{
-					"node1": "NodeUnfitPod",
+					"node1": "1/4 AllocatedCardsInsufficientRequest, 3/4 ResourceQuotaNotFit",
 				},
 			},
 		},
@@ -1320,7 +2308,7 @@ func Test_ResourceQuota(t *testing.T) {
 			wantErr: nil,
 			want: &extenderv1.ExtenderFilterResult{
 				FailedNodes: map[string]string{
-					"node1": "NodeUnfitPod",
+					"node1": "4/4 ResourceQuotaNotFit",
 				},
 			},
 		},
@@ -1418,7 +2406,15 @@ func Test_Filter_EvictsStaleEntry(t *testing.T) {
 	}
 	s.podManager.AddPod(pod, "node1", devs)
 	s.quotaManager.AddUsage(pod, devs)
-	s.Filter(extenderv1.ExtenderArgs{Pod: pod, NodeNames: &[]string{}})
+	seedPods(t, s, pod)
+	result, err := s.Filter(extenderv1.ExtenderArgs{Pod: pod, NodeNames: &[]string{}})
+	require.NoError(t, err)
+	require.Empty(t, result.NodeNames)
+	require.NoError(t, promtestutil.CollectAndCompare(s.GetAllocationMetrics(), strings.NewReader(`
+# HELP hami_scheduler_allocation_failures_total HAMi device allocation failures.
+# TYPE hami_scheduler_allocation_failures_total counter
+hami_scheduler_allocation_failures_total{device_type="NVIDIA",failure_reason="no_fit",phase="filter"} 1
+`), "hami_scheduler_allocation_failures_total"))
 	_, inCache := s.podManager.GetPod(pod)
 	assert.Equal(t, false, inCache)
 	for _, v := range *s.quotaManager.GetResourceQuota()[pod.Namespace] {
@@ -1426,13 +2422,267 @@ func Test_Filter_EvictsStaleEntry(t *testing.T) {
 	}
 }
 
-func Test_Scheduler_Issue1368_TerminatingPodRetainsCache(t *testing.T) {
+func TestFilterUsesTemplateNodesWithoutSideEffects(t *testing.T) {
+	s := NewScheduler()
+	client.KubeClient = fake.NewSimpleClientset()
+	s.kubeClient = client.KubeClient
+	s.podLister = informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour).Core().V1().Pods().Lister()
+
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "hami.io/gpu",
+			ResourceMemoryName:           "hami.io/gpumem",
+			ResourceMemoryPercentageName: "hami.io/gpumem-percentage",
+			ResourceCoreName:             "hami.io/gpucores",
+			DefaultGPUNum:                1,
+		},
+	}
+	require.NoError(t, config.InitDevicesWithConfig(sConfig))
+	config.NodeSchedulerPolicy = "binpack"
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "template-pod",
+			Namespace: "default",
+			UID:       types.UID("template-pod-uid"),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: "worker",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hami.io/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"hami.io/gpucores": *resource.NewQuantity(20, resource.BinarySI),
+						"hami.io/gpumem":   *resource.NewQuantity(1024, resource.BinarySI),
+					},
+				},
+			}},
+		},
+	}
+	_, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	templateNode := corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "template-node-a",
+			Annotations: map[string]string{
+				nvidia.RegisterAnnos: `[{"id":"GPU-0","count":10,"devmem":8192,"devcore":100,"type":"NVIDIA-A100","numa":0,"health":true,"index":0,"mode":"hami-core"}]`,
+			},
+		},
+	}
+
+	res, err := s.Filter(extenderv1.ExtenderArgs{
+		Pod:   pod,
+		Nodes: &corev1.NodeList{Items: []corev1.Node{templateNode}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Nil(t, res.NodeNames)
+	require.NotNil(t, res.Nodes)
+	require.Len(t, res.Nodes.Items, 1)
+	require.Equal(t, "template-node-a", res.Nodes.Items[0].Name)
+
+	cachedPod, ok := s.podManager.GetPod(pod)
+	require.False(t, ok)
+	require.Nil(t, cachedPod)
+
+	updatedPod, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, updatedPod.Annotations[util.AssignedNodeAnnotations])
+	require.Empty(t, updatedPod.Annotations[util.AssignedTimeAnnotations])
+}
+
+func TestFilterTemplateNodesDoesNotTouchSchedulingCaches(t *testing.T) {
+	s := NewScheduler()
+	client.KubeClient = fake.NewSimpleClientset()
+	s.kubeClient = client.KubeClient
+	s.podLister = informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour).Core().V1().Pods().Lister()
+	s.quotaManager.Quotas = map[string]*device.DeviceQuota{}
+
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "hami.io/gpu",
+			ResourceMemoryName:           "hami.io/gpumem",
+			ResourceMemoryPercentageName: "hami.io/gpumem-percentage",
+			ResourceCoreName:             "hami.io/gpucores",
+			DefaultGPUNum:                1,
+		},
+	}
+	require.NoError(t, config.InitDevicesWithConfig(sConfig))
+
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gpu-quota",
+			Namespace: "default",
+		},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				"limits.hami.io/gpucores": *resource.NewQuantity(1000, resource.BinarySI),
+				"limits.hami.io/gpumem":   *resource.NewQuantity(65536, resource.BinarySI),
+			},
+		},
+	}
+	s.onAddQuota(quota)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "template-pod-cache",
+			Namespace: "default",
+			UID:       types.UID("template-pod-cache-uid"),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: "worker",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hami.io/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"hami.io/gpucores": *resource.NewQuantity(30, resource.BinarySI),
+						"hami.io/gpumem":   *resource.NewQuantity(2048, resource.BinarySI),
+					},
+				},
+			}},
+		},
+	}
+	_, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	templateNode := corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "template-node-b",
+			Annotations: map[string]string{
+				nvidia.RegisterAnnos: `[{"id":"GPU-1","count":10,"devmem":8192,"devcore":100,"type":"NVIDIA-A100","numa":0,"health":true,"index":1,"mode":"hami-core"}]`,
+			},
+		},
+	}
+
+	_, err = s.Filter(extenderv1.ExtenderArgs{
+		Pod:   pod,
+		Nodes: &corev1.NodeList{Items: []corev1.Node{templateNode}},
+	})
+	require.NoError(t, err)
+
+	pods, err := s.podManager.ListPodsUID()
+	require.NoError(t, err)
+	require.Empty(t, pods)
+
+	quotas := s.quotaManager.GetResourceQuota()
+	require.Contains(t, quotas, "default")
+	require.NotNil(t, quotas["default"])
+	require.Equal(t, int64(0), (*quotas["default"])["hami.io/gpucores"].Used)
+	require.Equal(t, int64(0), (*quotas["default"])["hami.io/gpumem"].Used)
+}
+
+func TestFilterTemplateNodesReturnsDetailedFailureReason(t *testing.T) {
+	s := NewScheduler()
+	client.KubeClient = fake.NewSimpleClientset()
+	s.kubeClient = client.KubeClient
+	s.podLister = informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour).Core().V1().Pods().Lister()
+
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "hami.io/gpu",
+			ResourceMemoryName:           "hami.io/gpumem",
+			ResourceMemoryPercentageName: "hami.io/gpumem-percentage",
+			ResourceCoreName:             "hami.io/gpucores",
+			DefaultGPUNum:                1,
+		},
+	}
+	require.NoError(t, config.InitDevicesWithConfig(sConfig))
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "template-pod-unfit",
+			Namespace: "default",
+			UID:       types.UID("template-pod-unfit-uid"),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: "worker",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hami.io/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"hami.io/gpucores": *resource.NewQuantity(20, resource.BinarySI),
+						"hami.io/gpumem":   *resource.NewQuantity(16384, resource.BinarySI),
+					},
+				},
+			}},
+		},
+	}
+
+	templateNode := corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "template-node-unfit",
+			Annotations: map[string]string{
+				nvidia.RegisterAnnos: `[{"id":"GPU-0","count":10,"devmem":8192,"devcore":100,"type":"NVIDIA-A100","numa":0,"health":true,"index":0,"mode":"hami-core"}]`,
+			},
+		},
+	}
+
+	res, err := s.Filter(extenderv1.ExtenderArgs{
+		Pod:   pod,
+		Nodes: &corev1.NodeList{Items: []corev1.Node{templateNode}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Nil(t, res.Nodes)
+	require.Contains(t, res.FailedNodes, "template-node-unfit")
+	require.Contains(t, res.FailedNodes["template-node-unfit"], common.CardInsufficientMemory)
+}
+
+func TestFilterTemplateNodesMissingRegisterAnnotation(t *testing.T) {
+	s := NewScheduler()
+	client.KubeClient = fake.NewSimpleClientset()
+	s.kubeClient = client.KubeClient
+	s.podLister = informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour).Core().V1().Pods().Lister()
+
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "hami.io/gpu",
+			ResourceMemoryName:           "hami.io/gpumem",
+			ResourceMemoryPercentageName: "hami.io/gpumem-percentage",
+			ResourceCoreName:             "hami.io/gpucores",
+			DefaultGPUNum:                1,
+		},
+	}
+	require.NoError(t, config.InitDevicesWithConfig(sConfig))
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "template-pod-cold-zero",
+			Namespace: "default",
+			UID:       types.UID("template-pod-cold-zero-uid"),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: "worker",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"hami.io/gpu": *resource.NewQuantity(1, resource.BinarySI),
+					},
+				},
+			}},
+		},
+	}
+
+	res, err := s.Filter(extenderv1.ExtenderArgs{
+		Pod: pod,
+		Nodes: &corev1.NodeList{Items: []corev1.Node{{
+			ObjectMeta: metav1.ObjectMeta{Name: "template-node-cold-zero"},
+		}}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	require.Nil(t, res.Nodes)
+	require.Equal(t, "node unregistered", res.FailedNodes["template-node-cold-zero"])
+}
+
+func Test_SchedulerTerminatingPodRetainsCache(t *testing.T) {
 	s := NewScheduler()
 
 	podDevces := device.PodDevices{
 		nvidia.NvidiaGPUDevice: device.PodSingleDevice{
 			[]device.ContainerDevice{
-				{Idx: 0, UUID: "GPU0", Usedmem: 1000, Usedcores: 10},
+				{Idx: 0, UUID: "GPU0", Type: nvidia.NvidiaGPUDevice, Usedmem: 1000, Usedcores: 10},
 			},
 		},
 	}
@@ -1473,10 +2723,196 @@ func Test_Scheduler_Issue1368_TerminatingPodRetainsCache(t *testing.T) {
 	_, ok = s.podManager.GetPod(terminatedPod)
 	assert.Equal(t, false, ok, "Pod should be removed from cache after reaching a terminal phase (Succeeded/Failed)")
 }
+func Test_onUpdatePod_InitContainerShrink(t *testing.T) {
+	s := NewScheduler()
+	sConfig := &config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "hami.io/gpu",
+			ResourceMemoryName:           "hami.io/gpumem",
+			ResourceMemoryPercentageName: "hami.io/gpumem-percentage",
+			ResourceCoreName:             "hami.io/gpucores",
+			DefaultMemory:                0,
+			DefaultCores:                 0,
+			DefaultGPUNum:                1,
+		},
+	}
+	if err := config.InitDevicesWithConfig(sConfig); err != nil {
+		t.Fatalf("Failed to initialize devices with config: %v", err)
+	}
+	client.KubeClient = fake.NewClientset()
+	s.kubeClient = client.KubeClient
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour)
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
+	informer := informerFactory.Core().V1().Pods().Informer()
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    s.onAddPod,
+		UpdateFunc: s.onUpdatePod,
+		DeleteFunc: s.onDelPod,
+	})
+	informerFactory.Start(s.stopCh)
+	informerFactory.WaitForCacheSync(s.stopCh)
+	s.addAllEventHandlers()
+
+	// Setup a pod with one init container (20Gi mem, 10 cores) and one app container (10Gi mem, 5 cores).
+	// Effective = max(20,10)=20Gi mem, max(10,5)=10 cores.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "shrink-uid",
+			Name:      "test-shrink",
+			Namespace: "default",
+			Annotations: map[string]string{
+				util.AssignedNodeAnnotations: "node1",
+			},
+		},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{
+				Name:  "init",
+				Image: "busybox",
+			}},
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Image: "app",
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
+	rawDevices := device.PodDevices{
+		nvidia.NvidiaGPUDevice: device.PodSingleDevice{
+			// Init container (index 0)
+			{{
+				Idx: 0, UUID: "GPU0", Type: nvidia.NvidiaGPUDevice, Usedmem: 20000, Usedcores: 10,
+			}},
+			// App container (index 1)
+			{{
+				Idx: 0, UUID: "GPU0", Type: nvidia.NvidiaGPUDevice, Usedmem: 10000, Usedcores: 5,
+			}},
+		},
+	}
+	encoded := device.EncodePodDevices(device.SupportDevices, rawDevices)
+	maps.Copy(pod.Annotations, encoded)
+
+	s.onAddPod(pod)
+
+	pi, ok := s.podManager.GetPod(pod)
+	require.True(t, ok)
+	require.Len(t, pi.Devices[nvidia.NvidiaGPUDevice], 1)
+	require.Len(t, pi.Devices[nvidia.NvidiaGPUDevice][0], 1)
+	assert.Equal(t, int64(20000), pi.Devices[nvidia.NvidiaGPUDevice][0][0].Usedmem)
+	assert.Equal(t, int64(10), pi.Devices[nvidia.NvidiaGPUDevice][0][0].Usedcores)
+
+	updatedPod := pod.DeepCopy()
+	updatedPod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+		{
+			Name: "init",
+			State: corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+			},
+		},
+	}
+
+	s.onUpdatePod(pod, updatedPod)
+
+	piAfter, ok := s.podManager.GetPod(updatedPod)
+	require.True(t, ok)
+	assert.Assert(t, piAfter.InitContainerResourceReleased)
+	assert.Equal(t, int64(10000), piAfter.Devices[nvidia.NvidiaGPUDevice][0][0].Usedmem)
+	assert.Equal(t, int64(5), piAfter.Devices[nvidia.NvidiaGPUDevice][0][0].Usedcores)
+
+	quotas := s.quotaManager.GetResourceQuota()
+	require.Contains(t, quotas, "default")
+	memQuota := (*quotas["default"])["hami.io/gpumem"]
+	coresQuota := (*quotas["default"])["hami.io/gpucores"]
+	require.NotNil(t, memQuota)
+	require.NotNil(t, coresQuota)
+	assert.Equal(t, int64(10000), memQuota.Used)
+	assert.Equal(t, int64(5), coresQuota.Used)
+}
+
+func Test_getNodesUsage_WithInitContainers(t *testing.T) {
+	nodeMage := newNodeManager()
+	nodeMage.addNode("node1", &device.NodeInfo{
+		ID: "node1", Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}},
+		Devices: map[string][]device.DeviceInfo{
+			nvidia.NvidiaGPUDevice: {{
+				ID: "GPU0", Index: 0, Count: 10, Devmem: 102400, Devcore: 100,
+				Numa: 1, Mode: "hami", Health: true,
+			}},
+		},
+	})
+	podMap := device.NewPodManager()
+	// Create a pod with init container (mem 20000, cores 10) and app (mem 10000, cores 5)
+	// Collapsed usage = peak (20000,10)
+	collapsed := device.CollapseInitContainerUsage(
+		&corev1.Pod{
+			Spec: corev1.PodSpec{
+				InitContainers: []corev1.Container{{Name: "init"}},
+				Containers:     []corev1.Container{{Name: "app"}},
+			},
+		},
+		device.PodDevices{
+			nvidia.NvidiaGPUDevice: device.PodSingleDevice{
+				{{Idx: 0, UUID: "GPU0", Usedmem: 20000, Usedcores: 10}},
+				{{Idx: 0, UUID: "GPU0", Usedmem: 10000, Usedcores: 5}},
+			},
+		},
+	)
+	podMap.AddPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "initpod", Name: "initpod", Namespace: "default"},
+	}, "node1", collapsed)
+
+	s := Scheduler{nodeManager: nodeMage, podManager: podMap}
+	nodes := []string{"node1"}
+	cachenodeMap, _, _, err := s.getNodesUsage(&nodes, nil)
+	require.NoError(t, err)
+	v := (*cachenodeMap)["node1"]
+	assert.Equal(t, int64(1), v.Devices.DeviceLists[0].Device.Used)
+	assert.Equal(t, int64(20000), v.Devices.DeviceLists[0].Device.Usedmem) // peak, not sum
+	assert.Equal(t, int64(10), v.Devices.DeviceLists[0].Device.Usedcores)
+}
+
+func Test_getNodesUsage_WithMultipleAppContainersSharingDevice(t *testing.T) {
+	nodeMage := newNodeManager()
+	nodeMage.addNode("node1", &device.NodeInfo{
+		ID: "node1", Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}},
+		Devices: map[string][]device.DeviceInfo{
+			nvidia.NvidiaGPUDevice: {{
+				ID: "GPU0", Index: 0, Count: 10, Devmem: 102400, Devcore: 100,
+				Numa: 1, Mode: "hami", Health: true,
+			}},
+		},
+	})
+	podMap := device.NewPodManager()
+	collapsed := device.CollapseInitContainerUsage(
+		&corev1.Pod{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app0"}, {Name: "app1"}},
+		}},
+		device.PodDevices{
+			nvidia.NvidiaGPUDevice: device.PodSingleDevice{
+				{{Idx: 0, UUID: "GPU0", Usedmem: 10000, Usedcores: 5}},
+				{{Idx: 0, UUID: "GPU0", Usedmem: 10000, Usedcores: 5}},
+			},
+		},
+	)
+	podMap.AddPod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "apppod", Name: "apppod", Namespace: "default"},
+	}, "node1", collapsed)
+
+	s := Scheduler{nodeManager: nodeMage, podManager: podMap}
+	nodes := []string{"node1"}
+	cachenodeMap, _, _, err := s.getNodesUsage(&nodes, nil)
+	require.NoError(t, err)
+	v := (*cachenodeMap)["node1"]
+	assert.Equal(t, int64(2), v.Devices.DeviceLists[0].Device.Used)
+}
 
 func Test_onAddPod_BadDeviceAnnotation(t *testing.T) {
 	device.SupportDevices["TEST"] = "hami.io/test-allocated"
+	t.Cleanup(func() { delete(device.SupportDevices, "TEST") })
 	s := NewScheduler()
+	t.Cleanup(func() { close(s.stopCh) })
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			UID:       "bad-anno-uid",
@@ -1507,6 +2943,7 @@ func Test_Bind_DelPodOnGetPodFailure(t *testing.T) {
 	}
 
 	s := NewScheduler()
+	t.Cleanup(func() { close(s.stopCh) })
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	s.eventRecorder = record.NewBroadcaster().NewRecorder(scheme, corev1.EventSource{})
@@ -1534,7 +2971,12 @@ func Test_Bind_DelPodOnGetPodFailure(t *testing.T) {
 	require.Contains(t, err.Error(), "not found")
 
 	podsAfter, _ := s.podManager.ListPodsUID()
-	require.Len(t, podsAfter, 0)
+	require.Empty(t, podsAfter)
+	require.NoError(t, promtestutil.CollectAndCompare(s.GetAllocationMetrics(), strings.NewReader(`
+# HELP hami_scheduler_allocation_failures_total HAMi device allocation failures.
+# TYPE hami_scheduler_allocation_failures_total counter
+hami_scheduler_allocation_failures_total{device_type="unknown",failure_reason="lookup",phase="bind"} 1
+`), "hami_scheduler_allocation_failures_total"))
 }
 
 func Test_Bind_DelPodOnGetNodeFailure(t *testing.T) {
@@ -1550,6 +2992,7 @@ func Test_Bind_DelPodOnGetNodeFailure(t *testing.T) {
 	}
 
 	s := NewScheduler()
+	t.Cleanup(func() { close(s.stopCh) })
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	s.eventRecorder = record.NewBroadcaster().NewRecorder(scheme, corev1.EventSource{})
@@ -1588,5 +3031,680 @@ func Test_Bind_DelPodOnGetNodeFailure(t *testing.T) {
 	require.Contains(t, res.Error, "not found")
 
 	podsAfter, _ := s.podManager.ListPodsUID()
-	require.Len(t, podsAfter, 0)
+	require.Empty(t, podsAfter)
+	require.NoError(t, promtestutil.CollectAndCompare(s.GetAllocationMetrics(), strings.NewReader(`
+# HELP hami_scheduler_allocation_failures_total HAMi device allocation failures.
+# TYPE hami_scheduler_allocation_failures_total counter
+hami_scheduler_allocation_failures_total{device_type="unknown",failure_reason="lookup",phase="bind"} 1
+`), "hami_scheduler_allocation_failures_total"))
+}
+
+type bindLockMockDevice struct {
+	registerMockDevice
+	lockErr      error
+	lockErrOnce  bool
+	lockCalls    atomic.Int32
+	releaseCalls atomic.Int32
+}
+
+func (m *bindLockMockDevice) CommonWord() string { return "bind-lock-mock" }
+func (m *bindLockMockDevice) LockNode(_ *corev1.Node, _ *corev1.Pod) error {
+	n := m.lockCalls.Add(1)
+	if m.lockErr != nil && (!m.lockErrOnce || n == 1) {
+		return m.lockErr
+	}
+	return nil
+}
+func (m *bindLockMockDevice) ReleaseNodeLock(_ *corev1.Node, _ *corev1.Pod) error {
+	m.releaseCalls.Add(1)
+	return nil
+}
+
+var errContention = fmt.Errorf("contended: %w", nodelockutil.ErrNodeLockContention)
+
+func setupBindLockRetryTest(t *testing.T, retryTimeout time.Duration, pod *corev1.Pod, mock *bindLockMockDevice) (*Scheduler, extenderv1.ExtenderBindingArgs, func()) {
+	t.Helper()
+
+	oldRetry := config.NodeLockRetryTimeout
+	config.NodeLockRetryTimeout = retryTimeout
+	oldDevicesMap := device.DevicesMap
+	device.DevicesMap = map[string]device.Devices{"bind-lock-mock": mock}
+
+	s := NewScheduler()
+	cleanup := func() {
+		config.NodeLockRetryTimeout = oldRetry
+		device.DevicesMap = oldDevicesMap
+		close(s.stopCh)
+	}
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	s.eventRecorder = record.NewBroadcaster().NewRecorder(scheme, corev1.EventSource{})
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+	fakeClient := fake.NewSimpleClientset(pod, node)
+	s.kubeClient = fakeClient
+	client.KubeClient = fakeClient
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(fakeClient, time.Hour)
+	require.NoError(t, informerFactory.Core().V1().Pods().Informer().GetIndexer().Add(pod))
+	require.NoError(t, informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node))
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
+	s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+	informerFactory.Start(s.stopCh)
+	informerFactory.WaitForCacheSync(s.stopCh)
+
+	args := extenderv1.ExtenderBindingArgs{
+		PodName: pod.Name, PodNamespace: pod.Namespace, PodUID: pod.UID, Node: "node1",
+	}
+	return s, args, cleanup
+}
+
+func Test_Bind_NonPodGroupPodDoesNotRetry(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-nogroup", Namespace: "default", UID: types.UID("uid-nogroup"),
+		},
+	}
+	mock := &bindLockMockDevice{lockErr: errContention, lockErrOnce: true}
+	s, args, cleanup := setupBindLockRetryTest(t, 5*time.Second, pod, mock)
+	defer cleanup()
+
+	res, err := s.Bind(args)
+	require.NoError(t, err)
+	require.Contains(t, res.Error, "node lock contention")
+	require.Equal(t, int32(1), mock.lockCalls.Load(),
+		"non-PodGroup pod must not retry LockNode")
+	require.NoError(t, promtestutil.CollectAndCompare(s.GetAllocationMetrics(), strings.NewReader(`
+# HELP hami_scheduler_allocation_failures_total HAMi device allocation failures.
+# TYPE hami_scheduler_allocation_failures_total counter
+hami_scheduler_allocation_failures_total{device_type="unknown",failure_reason="lock",phase="bind"} 1
+# HELP hami_scheduler_bind_rollbacks_total HAMi bind operations that released a reservation after failure.
+# TYPE hami_scheduler_bind_rollbacks_total counter
+hami_scheduler_bind_rollbacks_total{device_type="unknown",failure_reason="lock",phase="bind"} 1
+`), "hami_scheduler_allocation_failures_total", "hami_scheduler_bind_rollbacks_total"))
+}
+
+func Test_Bind_PodGroupPodRetriesOnContention(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-gang", Namespace: "default", UID: types.UID("uid-gang"),
+			Labels: map[string]string{util.PodGroupLabel: "my-training-job"},
+		},
+	}
+	mock := &bindLockMockDevice{lockErr: errContention, lockErrOnce: true}
+	s, args, cleanup := setupBindLockRetryTest(t, 2*time.Second, pod, mock)
+	defer cleanup()
+
+	s.Bind(args)
+	require.GreaterOrEqual(t, mock.lockCalls.Load(), int32(2),
+		"expected at least 2 LockNode calls (initial + retry)")
+}
+
+func Test_Bind_PodGroupPodContendsUntilTimeout(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-timeout", Namespace: "default", UID: types.UID("uid-timeout"),
+			Labels: map[string]string{util.PodGroupLabel: "my-training-job"},
+		},
+	}
+	mock := &bindLockMockDevice{lockErr: errContention}
+	s, args, cleanup := setupBindLockRetryTest(t, 300*time.Millisecond, pod, mock)
+	defer cleanup()
+
+	res, err := s.Bind(args)
+	require.NoError(t, err)
+	require.Contains(t, res.Error, "node lock contention",
+		"timeout error should wrap ErrNodeLockContention for observability")
+	require.GreaterOrEqual(t, mock.releaseCalls.Load(), int32(1),
+		"expected ReleaseNodeLock to be called at least once on timeout path")
+}
+
+func Test_Bind_PodGroupPodNonContentionErrorDoesNotRetry(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-other-err", Namespace: "default", UID: types.UID("uid-other-err"),
+			Labels: map[string]string{util.PodGroupLabel: "my-training-job"},
+		},
+	}
+	mock := &bindLockMockDevice{lockErr: fmt.Errorf("apiserver 500"), lockErrOnce: true}
+	s, args, cleanup := setupBindLockRetryTest(t, 5*time.Second, pod, mock)
+	defer cleanup()
+
+	res, err := s.Bind(args)
+	require.NoError(t, err)
+	require.Contains(t, res.Error, "apiserver 500")
+	require.Equal(t, int32(1), mock.lockCalls.Load(),
+		"non-contention error must not trigger retry")
+}
+
+type transactionMockDevice struct {
+	registerMockDevice
+	name         string
+	lockErr      error
+	lockErrFunc  func(attempt int64) error // optional dynamic lock error generator
+	releaseErr   error                     // returned by ReleaseNodeLock; exercises rollback error branch
+	lockCalls    atomic.Int32
+	releaseCalls atomic.Int32
+
+	// events records the sequence of "lock:<name>" and "release:<name>" calls.
+	// The pointer is shared across all devices in a test so ordering is global.
+	events *[]string
+	mu     sync.Mutex
+}
+
+func (m *transactionMockDevice) CommonWord() string { return m.name }
+func (m *transactionMockDevice) LockNode(_ *corev1.Node, _ *corev1.Pod) error {
+	attempt := m.lockCalls.Add(1)
+	if m.events != nil {
+		m.mu.Lock()
+		*m.events = append(*m.events, "lock:"+m.name)
+		m.mu.Unlock()
+	}
+	if m.lockErrFunc != nil {
+		return m.lockErrFunc(int64(attempt))
+	}
+	return m.lockErr
+}
+func (m *transactionMockDevice) ReleaseNodeLock(_ *corev1.Node, _ *corev1.Pod) error {
+	m.releaseCalls.Add(1)
+	if m.events != nil {
+		m.mu.Lock()
+		*m.events = append(*m.events, "release:"+m.name)
+		m.mu.Unlock()
+	}
+	return m.releaseErr
+}
+
+func Test_lockAllDevices_Transactional(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod1", Namespace: "default"}}
+	errMockFailed := fmt.Errorf("mock lock failed")
+
+	t.Run("AllLocksSucceed", func(t *testing.T) {
+		oldDevicesMap := device.DevicesMap
+		defer func() { device.DevicesMap = oldDevicesMap }()
+
+		dev1 := &transactionMockDevice{name: "backend1"}
+		dev2 := &transactionMockDevice{name: "backend2"}
+		dev3 := &transactionMockDevice{name: "backend3"}
+		device.DevicesMap = map[string]device.Devices{
+			"backend1": dev1,
+			"backend2": dev2,
+			"backend3": dev3,
+		}
+
+		s := Scheduler{}
+		err := s.lockAllDevices(node, pod)
+		assert.NilError(t, err)
+		assert.Equal(t, dev1.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev2.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev3.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev1.releaseCalls.Load(), int32(0))
+		assert.Equal(t, dev2.releaseCalls.Load(), int32(0))
+		assert.Equal(t, dev3.releaseCalls.Load(), int32(0))
+	})
+
+	t.Run("FirstBackendFails", func(t *testing.T) {
+		oldDevicesMap := device.DevicesMap
+		defer func() { device.DevicesMap = oldDevicesMap }()
+
+		dev1 := &transactionMockDevice{name: "backend1", lockErr: errMockFailed}
+		dev2 := &transactionMockDevice{name: "backend2"}
+		dev3 := &transactionMockDevice{name: "backend3"}
+		device.DevicesMap = map[string]device.Devices{
+			"backend1": dev1,
+			"backend2": dev2,
+			"backend3": dev3,
+		}
+
+		s := Scheduler{}
+		err := s.lockAllDevices(node, pod)
+		assert.ErrorIs(t, err, errMockFailed)
+		assert.Equal(t, dev1.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev2.lockCalls.Load(), int32(0))
+		assert.Equal(t, dev3.lockCalls.Load(), int32(0))
+		assert.Equal(t, dev1.releaseCalls.Load(), int32(0))
+		assert.Equal(t, dev2.releaseCalls.Load(), int32(0))
+		assert.Equal(t, dev3.releaseCalls.Load(), int32(0))
+	})
+
+	// LastBackendFails: backend1 and backend2 both acquire locks, backend3 fails.
+	// This verifies:
+	//   - backend1 and backend2 are each released exactly once.
+	//   - backend3 is NOT released.
+	//   - rollback is in reverse acquisition order: release:backend2 before release:backend1.
+	t.Run("LastBackendFails", func(t *testing.T) {
+		oldDevicesMap := device.DevicesMap
+		defer func() { device.DevicesMap = oldDevicesMap }()
+
+		events := &[]string{}
+		dev1 := &transactionMockDevice{name: "backend1", events: events}
+		dev2 := &transactionMockDevice{name: "backend2", events: events}
+		dev3 := &transactionMockDevice{name: "backend3", lockErr: errMockFailed, events: events}
+		device.DevicesMap = map[string]device.Devices{
+			"backend1": dev1,
+			"backend2": dev2,
+			"backend3": dev3,
+		}
+
+		s := Scheduler{}
+		err := s.lockAllDevices(node, pod)
+		assert.ErrorIs(t, err, errMockFailed)
+
+		// Call counts
+		assert.Equal(t, dev1.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev2.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev3.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev1.releaseCalls.Load(), int32(1))
+		assert.Equal(t, dev2.releaseCalls.Load(), int32(1))
+		assert.Equal(t, dev3.releaseCalls.Load(), int32(0))
+
+		// Verify event order: lock1, lock2, lock3(fail), release2, release1
+		assert.DeepEqual(t, *events, []string{
+			"lock:backend1",
+			"lock:backend2",
+			"lock:backend3",
+			"release:backend2",
+			"release:backend1",
+		})
+	})
+
+	// SubsequentAttemptSucceedsAfterRollback: confirms that after a failed+rollback attempt,
+	// a subsequent lockAllDevices() call with the failure cleared succeeds cleanly.
+	t.Run("SubsequentAttemptSucceedsAfterRollback", func(t *testing.T) {
+		oldDevicesMap := device.DevicesMap
+		defer func() { device.DevicesMap = oldDevicesMap }()
+
+		dev1 := &transactionMockDevice{name: "backend1"}
+		dev2 := &transactionMockDevice{name: "backend2"}
+		dev3 := &transactionMockDevice{name: "backend3", lockErr: errMockFailed}
+		device.DevicesMap = map[string]device.Devices{
+			"backend1": dev1,
+			"backend2": dev2,
+			"backend3": dev3,
+		}
+
+		s := Scheduler{}
+
+		// First attempt: backend3 fails → rollback
+		err := s.lockAllDevices(node, pod)
+		assert.ErrorIs(t, err, errMockFailed)
+		assert.Equal(t, dev1.releaseCalls.Load(), int32(1))
+		assert.Equal(t, dev2.releaseCalls.Load(), int32(1))
+		assert.Equal(t, dev3.releaseCalls.Load(), int32(0))
+
+		// Clear the failure for backend3
+		dev3.lockErr = nil
+
+		// Second attempt: all succeed
+		err = s.lockAllDevices(node, pod)
+		assert.NilError(t, err)
+		assert.Equal(t, dev1.lockCalls.Load(), int32(2))
+		assert.Equal(t, dev2.lockCalls.Load(), int32(2))
+		assert.Equal(t, dev3.lockCalls.Load(), int32(2))
+		// No additional releases
+		assert.Equal(t, dev1.releaseCalls.Load(), int32(1))
+		assert.Equal(t, dev2.releaseCalls.Load(), int32(1))
+		assert.Equal(t, dev3.releaseCalls.Load(), int32(0))
+	})
+
+	// RollbackReleaseError: backend1 and backend2 acquire locks, backend3's LockNode fails.
+	// During rollback, backend2's ReleaseNodeLock returns an error, but rollback continues
+	// and backend1's ReleaseNodeLock is still executed.
+	// Verifies:
+	//   - backend1: LockNode succeeds (1), ReleaseNodeLock succeeds (1).
+	//   - backend2: LockNode succeeds (1), ReleaseNodeLock returns a release error (1).
+	//   - backend3: LockNode fails with errMockFailed (1), ReleaseNodeLock is NOT called (0).
+	//   - Rollback continues despite backend2's release error.
+	//   - The original LockNode error from backend3 is returned (not overwritten by backend2's release error).
+	t.Run("RollbackReleaseError", func(t *testing.T) {
+		oldDevicesMap := device.DevicesMap
+		defer func() { device.DevicesMap = oldDevicesMap }()
+
+		errRelease := fmt.Errorf("mock release failed")
+		events := &[]string{}
+		dev1 := &transactionMockDevice{name: "backend1", events: events}
+		dev2 := &transactionMockDevice{name: "backend2", releaseErr: errRelease, events: events}
+		dev3 := &transactionMockDevice{name: "backend3", lockErr: errMockFailed, events: events}
+		device.DevicesMap = map[string]device.Devices{
+			"backend1": dev1,
+			"backend2": dev2,
+			"backend3": dev3,
+		}
+
+		s := Scheduler{}
+		err := s.lockAllDevices(node, pod)
+
+		// Original LockNode error from backend3 must be returned, not backend2's release error.
+		assert.ErrorIs(t, err, errMockFailed)
+
+		// Call count assertions:
+		assert.Equal(t, dev1.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev1.releaseCalls.Load(), int32(1))
+		assert.Equal(t, dev2.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev2.releaseCalls.Load(), int32(1))
+		assert.Equal(t, dev3.lockCalls.Load(), int32(1))
+		assert.Equal(t, dev3.releaseCalls.Load(), int32(0))
+
+		// Verify event sequence: lock1, lock2, lock3(fail), release2(err), release1
+		assert.DeepEqual(t, *events, []string{
+			"lock:backend1",
+			"lock:backend2",
+			"lock:backend3",
+			"release:backend2",
+			"release:backend1",
+		})
+	})
+
+	// AcquireNodeLocks_RetryLoop_ReleaseCount: exercises the REAL acquireNodeLocks() retry loop
+	// when a podgroup member encounters node-lock contention on attempt 1 and succeeds on attempt 2.
+	// Verifies:
+	//   - backend1 is locked on attempt 1, then backend2 returns nodelockutil.ErrNodeLockContention.
+	//   - rollback in lockAllDevices() releases backend1 exactly once for attempt 1 (release:backend1).
+	//   - acquireNodeLocks() catches contention error and enters retry loop.
+	//   - on attempt 2, backend1 and backend2 both lock successfully.
+	//   - acquireNodeLocks() returns nil.
+	//   - total release count for backend1 is 1 (no duplicate releases from acquireNodeLocks).
+	//   - total release count for backend2 is 0.
+	t.Run("AcquireNodeLocks_RetryLoop_ReleaseCount", func(t *testing.T) {
+		oldDevicesMap := device.DevicesMap
+		defer func() { device.DevicesMap = oldDevicesMap }()
+
+		oldTimeout := config.NodeLockRetryTimeout
+		config.NodeLockRetryTimeout = 5 * time.Second
+		defer func() { config.NodeLockRetryTimeout = oldTimeout }()
+
+		pgPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pod1",
+				Namespace: "default",
+				Labels:    map[string]string{util.PodGroupLabel: "pg1"},
+			},
+		}
+
+		events := &[]string{}
+		dev1 := &transactionMockDevice{name: "backend1", events: events}
+		dev2 := &transactionMockDevice{
+			name:   "backend2",
+			events: events,
+			lockErrFunc: func(attempt int64) error {
+				if attempt == 1 {
+					return nodelockutil.ErrNodeLockContention
+				}
+				return nil
+			},
+		}
+		device.DevicesMap = map[string]device.Devices{
+			"backend1": dev1,
+			"backend2": dev2,
+		}
+
+		s := Scheduler{}
+		err := s.acquireNodeLocks(node, pgPod)
+
+		// Verification:
+		// 1. acquireNodeLocks() returns nil (second attempt succeeded)
+		assert.NilError(t, err)
+
+		// 2. Call counts: both backends locked twice (attempt 1 & attempt 2)
+		assert.Equal(t, dev1.lockCalls.Load(), int32(2))
+		assert.Equal(t, dev2.lockCalls.Load(), int32(2))
+
+		// 3. Release counts: backend1 released EXACTLY ONCE (during attempt 1 rollback).
+		//    backend2 NEVER released (failed attempt 1 before lock was acquired, succeeded attempt 2).
+		//    NO duplicate release was issued by acquireNodeLocks().
+		assert.Equal(t, dev1.releaseCalls.Load(), int32(1))
+		assert.Equal(t, dev2.releaseCalls.Load(), int32(0))
+
+		// 4. Exact sequence of events across the real retry loop:
+		//    Attempt 1: lock1, lock2(fail -> contention) -> release1 (rollback)
+		//    Attempt 2: lock1, lock2(succeed)
+		assert.DeepEqual(t, *events, []string{
+			"lock:backend1",
+			"lock:backend2",
+			"release:backend1",
+			"lock:backend1",
+			"lock:backend2",
+		})
+	})
+}
+
+func TestSchedulerIsSynced(t *testing.T) {
+	s := &Scheduler{}
+	assert.Equal(t, false, s.IsSynced())
+
+	s.synced.Store(true)
+
+	assert.Equal(t, true, s.IsSynced())
+}
+
+// Test_register_OverviewIncludesCachedNodesOutsideSelector covers a cached node
+// that stops matching the registration selector. The selector controls which
+// nodes are refreshed, but overviewstatus must continue to include the entire
+// registered-node cache for metrics.
+func Test_register_OverviewIncludesCachedNodesOutsideSelector(t *testing.T) {
+	oldDevicesMap := device.DevicesMap
+	device.DevicesMap = map[string]device.Devices{}
+	t.Cleanup(func() { device.DevicesMap = oldDevicesMap })
+
+	s := NewScheduler()
+	t.Cleanup(func() { close(s.stopCh) })
+
+	oldKubeClient := client.KubeClient
+	client.KubeClient = fake.NewClientset()
+	t.Cleanup(func() { client.KubeClient = oldKubeClient })
+	s.kubeClient = client.KubeClient
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour)
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
+	s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+
+	selectedNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name:   "node-a",
+		Labels: map[string]string{"registration": "enabled"},
+	}}
+	unselectedNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}}
+	nodeIndexer := informerFactory.Core().V1().Nodes().Informer().GetIndexer()
+	require.NoError(t, nodeIndexer.Add(selectedNode))
+	require.NoError(t, nodeIndexer.Add(unselectedNode))
+
+	s.addNode(selectedNode.Name, testNodeInfo(selectedNode.Name, 1))
+	s.addNode(unselectedNode.Name, testNodeInfo(unselectedNode.Name, 1))
+
+	s.register(labels.SelectorFromSet(labels.Set{"registration": "enabled"}))
+
+	overview := *s.InspectAllNodesUsage()
+	require.Len(t, overview, 2)
+	assert.Assert(t, overview["node-a"] != nil)
+	assert.Assert(t, overview["node-b"] != nil)
+}
+
+// TestFilterInvalidDeviceRequestFailsClosed makes sure a pod whose container
+// declares a HAMi device resource with an invalid value is rejected by the
+// filter instead of being treated as device-less and bound without any GPU.
+func TestFilterInvalidDeviceRequestFailsClosed(t *testing.T) {
+	require.NoError(t, config.InitDevicesWithConfig(&config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName: "hami.io/gpu", ResourceMemoryName: "hami.io/gpumem",
+			ResourceCoreName: "hami.io/gpucores", DefaultGPUNum: 1,
+		},
+	}))
+	s := NewScheduler()
+	client.KubeClient = fake.NewClientset()
+	s.kubeClient = client.KubeClient
+	s.podLister = informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour).Core().V1().Pods().Lister()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "uid-ic", Name: "invalid-cores", Namespace: "ns-invalid"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "c",
+			Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+				"hami.io/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+				"hami.io/gpucores": *resource.NewQuantity(150, resource.BinarySI),
+			}},
+		}}},
+	}
+	_, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	require.NoError(t, err)
+	nodeNames := []string{"node1"}
+	res, err := s.Filter(extenderv1.ExtenderArgs{Pod: pod, NodeNames: &nodeNames})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "out of range")
+	assert.Assert(t, res != nil)
+	assert.Equal(t, res.Error, err.Error())
+	// No node may survive: the pod must not be schedulable as device-less.
+	assert.Assert(t, res.Nodes == nil && res.NodeNames == nil)
+}
+
+// Test_register_PrintedLogPrunedOnNodeDelete covers the printedLog bookkeeping
+// across a node's full lifecycle. The map used to be a loop-local in
+// RegisterFromNodeAnnotations, so onDelNode could not reach it: entries
+// accumulated for every node name ever seen, and a node recreated under an old
+// name was logged at V(5) as "updated" instead of at info level as "added".
+func Test_register_PrintedLogPrunedOnNodeDelete(t *testing.T) {
+	oldDevicesMap := device.DevicesMap
+	t.Cleanup(func() { device.DevicesMap = oldDevicesMap })
+
+	device.DevicesMap = map[string]device.Devices{
+		"mock-vendor": &registerMockDevice{
+			nodeDevices: []*device.DeviceInfo{{
+				ID:           "gpu-1",
+				DeviceVendor: "mock-vendor",
+				Health:       true,
+			}},
+			health:     true,
+			needUpdate: true,
+		},
+	}
+
+	s := NewScheduler()
+	s.stopCh = make(chan struct{})
+	t.Cleanup(func() { close(s.stopCh) })
+
+	oldKubeClient := client.KubeClient
+	client.KubeClient = fake.NewClientset()
+	t.Cleanup(func() { client.KubeClient = oldKubeClient })
+	s.kubeClient = client.KubeClient
+
+	t.Setenv("POD_NAMESPACE", "default")
+	t.Setenv("POD_NAME", "scheduler-0")
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(client.KubeClient, time.Hour)
+	s.podLister = informerFactory.Core().V1().Pods().Lister()
+	s.nodeLister = informerFactory.Core().V1().Nodes().Lister()
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}
+	require.NoError(t, informerFactory.Core().V1().Nodes().Informer().GetIndexer().Add(node))
+
+	// A second node stands in for the rest of the cluster: deleting node-1 must
+	// not disturb it.
+	s.lock.Lock()
+	s.printedLog["node-2"] = true
+	s.lock.Unlock()
+
+	// First registration logs the node as added and records it.
+	s.register(labels.Everything())
+	s.lock.RLock()
+	assert.Equal(t, true, s.printedLog["node-1"], "first registration should record the node")
+	s.lock.RUnlock()
+
+	// Deleting the node must drop its entry, and only its entry.
+	s.onDelNode(node)
+	s.lock.RLock()
+	_, stillPresent := s.printedLog["node-1"]
+	assert.Equal(t, false, stillPresent, "deleting a node should prune its printedLog entry")
+	assert.Equal(t, true, s.printedLog["node-2"], "deleting a node must not disturb other nodes")
+	s.lock.RUnlock()
+
+	// A node returning under the same name is treated as newly added again.
+	s.register(labels.Everything())
+	s.lock.RLock()
+	assert.Equal(t, true, s.printedLog["node-1"], "a recreated node should be recorded again")
+	s.lock.RUnlock()
+}
+
+// seedPods makes pods resolvable to Filter, which verifies the request against
+// the live object before it touches any reservation.
+func seedPods(t *testing.T, s *Scheduler, pods ...*corev1.Pod) {
+	t.Helper()
+	if s.kubeClient == nil {
+		s.kubeClient = fake.NewClientset()
+	}
+	for _, p := range pods {
+		if _, err := s.kubeClient.CoreV1().Pods(p.Namespace).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("failed to seed pod %s/%s: %v", p.Namespace, p.Name, err)
+		}
+	}
+}
+
+// testNodeInfo builds a registered node carrying gpus idle NVIDIA devices.
+func testNodeInfo(name string, gpus int) *device.NodeInfo {
+	infos := make([]device.DeviceInfo, 0, gpus)
+	for j := range gpus {
+		infos = append(infos, device.DeviceInfo{
+			ID:           fmt.Sprintf("%s-gpu-%d", name, j),
+			Index:        uint(j),
+			Count:        10,
+			Devmem:       8192,
+			Devcore:      100,
+			Type:         nvidia.NvidiaGPUDevice,
+			Numa:         j % 2,
+			Health:       true,
+			DeviceVendor: nvidia.NvidiaGPUDevice,
+		})
+	}
+	return &device.NodeInfo{
+		ID:      name,
+		Node:    &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}},
+		Devices: map[string][]device.DeviceInfo{nvidia.NvidiaGPUDevice: infos},
+	}
+}
+
+// Test_getNodesUsage_BuildsOnlyCandidateNodes pins the narrowing: Filter passes
+// a candidate list and discards the second return value, so nodes outside that
+// list must not be snapshotted at all.
+func Test_getNodesUsage_BuildsOnlyCandidateNodes(t *testing.T) {
+	nodeMage := newNodeManager()
+	for _, name := range []string{"node1", "node2", "node3"} {
+		nodeMage.addNode(name, testNodeInfo(name, 2))
+	}
+	s := Scheduler{nodeManager: nodeMage, podManager: device.NewPodManager()}
+
+	candidates := []string{"node2"}
+	cachenodeMap, overallnodeMap, failedNodes, err := s.getNodesUsage(&candidates, nil)
+	assert.NilError(t, err)
+	assert.Equal(t, len(failedNodes), 0)
+
+	assert.Equal(t, len(*cachenodeMap), 1)
+	assert.Equal(t, len(*overallnodeMap), 1)
+	for _, absent := range []string{"node1", "node3"} {
+		_, present := (*overallnodeMap)[absent]
+		assert.Assert(t, !present, "%s was snapshotted but is not a candidate", absent)
+	}
+	_, present := (*cachenodeMap)["node2"]
+	assert.Assert(t, present, "node2 is a candidate and must be snapshotted")
+}
+
+// Test_getNodesUsage_NilCandidatesBuildsEveryNode covers the register loop's
+// contract: it needs usage for every node, because s.overviewstatus drives the
+// node metrics.
+func Test_getNodesUsage_NilCandidatesBuildsEveryNode(t *testing.T) {
+	nodeMage := newNodeManager()
+	for _, name := range []string{"node1", "node2", "node3"} {
+		nodeMage.addNode(name, testNodeInfo(name, 2))
+	}
+	s := Scheduler{nodeManager: nodeMage, podManager: device.NewPodManager()}
+
+	cachenodeMap, overallnodeMap, _, err := s.getNodesUsage(nil, nil)
+	assert.NilError(t, err)
+	assert.Equal(t, len(*overallnodeMap), 3)
+	// The candidate map stays empty when no candidate list was supplied.
+	assert.Equal(t, len(*cachenodeMap), 0)
+}
+
+// Test_buildNodeUsage_LeavesPodInfosNil documents that the per-device PodInfos
+// slice is not preallocated. Every consumer ranges over it or appends to it.
+func Test_buildNodeUsage_LeavesPodInfosNil(t *testing.T) {
+	usage := buildNodeUsage(testNodeInfo("node1", 1), nil)
+	assert.Equal(t, len(usage.Devices.DeviceLists), 1)
+	assert.Assert(t, usage.Devices.DeviceLists[0].Device.PodInfos == nil)
 }

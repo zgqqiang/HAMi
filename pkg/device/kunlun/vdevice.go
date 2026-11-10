@@ -83,6 +83,9 @@ func (dev *KunlunVDevices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod)
 	if ok {
 		trimMem := dev.trimMemory(memory.Value())
 		ctr.Resources.Limits[corev1.ResourceName(KunlunResourceVMemory)] = resource.MustParse(fmt.Sprint(trimMem))
+		if ctr.Resources.Requests == nil {
+			ctr.Resources.Requests = corev1.ResourceList{}
+		}
 		ctr.Resources.Requests[corev1.ResourceName(KunlunResourceVMemory)] = resource.MustParse(fmt.Sprint(trimMem))
 		return true, nil
 	}
@@ -90,7 +93,7 @@ func (dev *KunlunVDevices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod)
 }
 
 func (dev *KunlunVDevices) CheckHealth(devType string, n *corev1.Node) (bool, bool) {
-	return device.CheckHealth(devType, dev.GetResourceNames().ResourceCountName, n)
+	return device.CheckHealth(devType, dev.GetResourceNames().ResourceCountName, n, n.Annotations[RegisterAnnos])
 }
 
 func (dev *KunlunVDevices) NodeCleanUp(nn string) error {
@@ -131,28 +134,14 @@ func (dev *KunlunVDevices) PatchAnnotations(pod *corev1.Pod, annoinput *map[stri
 }
 
 func (dev *KunlunVDevices) LockNode(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 	return nodelock.LockNode(n.Name, NodeLock, p)
 }
 
 func (dev *KunlunVDevices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 	return nodelock.ReleaseNodeLock(n.Name, NodeLock, p, false)
@@ -165,7 +154,7 @@ func (dev *KunlunVDevices) CheckType(annos map[string]string, d device.DeviceUsa
 	return false, false
 }
 
-func (dev *KunlunVDevices) GenerateResourceRequests(ctr *corev1.Container) device.ContainerDeviceRequest {
+func (dev *KunlunVDevices) GenerateResourceRequests(ctr *corev1.Container) (device.ContainerDeviceRequest, error) {
 	xpuResourceCount := corev1.ResourceName(KunlunResourceVCount)
 	xpuResourceMem := corev1.ResourceName(KunlunResourceVMemory)
 	v, ok := ctr.Resources.Limits[xpuResourceCount]
@@ -175,6 +164,15 @@ func (dev *KunlunVDevices) GenerateResourceRequests(ctr *corev1.Container) devic
 	if ok {
 		klog.V(3).Infof("Counting %s devices", dev.CommonWord())
 		if n, ok := v.AsInt64(); ok {
+			if n == 0 {
+				// An explicit zero count means no device is requested,
+				// not an invalid request. See the nvidia backend.
+				return device.ContainerDeviceRequest{}, nil
+			}
+			if n < 0 {
+				klog.ErrorS(nil, "kunlun vdevice count request is out of range", "container", ctr.Name, "request", n)
+				return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "kunlun", Reason: fmt.Sprintf("device count %d is out of range", n)}
+			}
 			memnum := 0
 			mem, ok := ctr.Resources.Limits[xpuResourceMem]
 			if !ok {
@@ -195,15 +193,21 @@ func (dev *KunlunVDevices) GenerateResourceRequests(ctr *corev1.Container) devic
 				memnum = KunlunMaxMemory
 			}
 			return device.ContainerDeviceRequest{
-				Nums:             int32(n),
+				Nums:             n,
 				Type:             dev.CommonWord(),
-				Memreq:           int32(memnum), //int32(dev.config.MemoryMax),
-				MemPercentagereq: int32(mempnum),
-				Coresreq:         int32(cores),
-			}
+				Memreq:           int64(memnum), //int32(dev.config.MemoryMax),
+				MemPercentagereq: int64(mempnum),
+				Coresreq:         int64(cores),
+			}, nil
 		}
+		// A quantity the apiserver accepts as an integer can still be too
+		// large for int64 (1Ei, 1e19). Falling through would report the
+		// container as device-less, which is the fail-open this change
+		// exists to remove.
+		klog.ErrorS(nil, "kunlun device count request is not a plain integer", "container", ctr.Name, "request", v.String())
+		return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "kunlun", Reason: fmt.Sprintf("device count %s is not a plain integer", v.String())}
 	}
-	return device.ContainerDeviceRequest{}
+	return device.ContainerDeviceRequest{}, nil
 }
 
 func (dev *KunlunVDevices) ScoreNode(node *corev1.Node, podDevices device.PodSingleDevice, previous []*device.DeviceUsage, policy string) float32 {
@@ -230,11 +234,46 @@ func (dev *KunlunVDevices) Fit(devices []*device.DeviceUsage, request device.Con
 	tmpDevs := make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
 
-	alloc := graghSelect(devices, request, FitVXPU)
+	isMutex := util.PolicyContains(util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod), util.GPUSchedulerPolicyMutex)
+	base := FitFn(FitVXPU)
+	if isMutex {
+		// mutex: only idle devices are eligible, no sharing onto a used device.
+		base = func(d *device.DeviceUsage, r device.ContainerDeviceRequest) bool {
+			return d.Used == 0 && FitVXPU(d, r)
+		}
+	}
+	// graghSelect decides topology from the position of a device in the slice,
+	// so the uuid constraint has to be applied through fitFn rather than by
+	// filtering the slice first.
+	uuidMismatches := make(map[string]bool)
+	fitFn := func(d *device.DeviceUsage, r device.ContainerDeviceRequest) bool {
+		if !device.CheckUUID(pod.GetAnnotations(), d.ID, UseUUIDAnno, NoUseUUIDAnno, dev.CommonWord()) ||
+			!device.CheckUUID(pod.GetAnnotations(), d.ID, KunlunUseUUID, KunlunNoUseUUID, dev.CommonWord()) {
+			uuidMismatches[d.ID] = true
+			klog.V(5).InfoS(common.CardUUIDMismatch, "pod", klog.KObj(pod), "device", d.ID)
+			return false
+		}
+		return base(d, r)
+	}
+	alloc := graghSelect(devices, request, fitFn)
 	if len(alloc) == 0 {
-		reason[common.NumaNotFit]++
-		klog.V(5).InfoS(common.NumaNotFit, "pod", klog.KObj(pod), "device", devices, "request nums", request.Nums, "numa")
-		return false, tmpDevs, common.GenReason(reason, len(reason))
+		if isMutex {
+			for _, dev := range devices {
+				if dev.Used > 0 && FitVXPU(dev, request) {
+					reason[common.ExclusiveDeviceAllocateConflict]++
+					klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "used", dev.Used)
+				}
+			}
+		}
+		uuidMismatch := len(uuidMismatches)
+		if len(reason) == 0 && uuidMismatch > 0 {
+			reason[common.CardUUIDMismatch] += uuidMismatch
+		}
+		if len(reason) == 0 {
+			reason[common.NumaNotFit]++
+			klog.V(5).InfoS(common.NumaNotFit, "pod", klog.KObj(pod), "device", devices, "request nums", request.Nums)
+		}
+		return false, tmpDevs, common.GenReason(reason, len(devices))
 	}
 	for _, dev := range alloc {
 		for _, val := range devices {
@@ -254,6 +293,9 @@ func (dev *KunlunVDevices) Fit(devices []*device.DeviceUsage, request device.Con
 }
 
 func FitVXPU(device *device.DeviceUsage, request device.ContainerDeviceRequest) bool {
+	if !device.Health {
+		return false
+	}
 	if request.Memreq+device.Usedmem > device.Totalmem {
 		return false
 	}

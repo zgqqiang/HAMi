@@ -1,0 +1,925 @@
+/*
+Copyright 2025 The HAMi Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package nvidia
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"gotest.tools/v3/assert"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+
+	"github.com/Project-HAMi/HAMi/pkg/device/remotegpu"
+	v0 "github.com/Project-HAMi/HAMi/pkg/monitor/nvidia/v0"
+	v1 "github.com/Project-HAMi/HAMi/pkg/monitor/nvidia/v1"
+	"github.com/Project-HAMi/HAMi/pkg/util"
+)
+
+// v1CacheFileSize is large enough for v1.CastSpec to safely dereference
+// every field of the real v1 sharedRegionT; using a smaller fixture would
+// leave usage.Info backed by an out-of-bounds pointer.
+var v1CacheFileSize = v1.MinSize()
+
+// v0CacheFileSize is the minimum byte count for v0.CastSpec to safely
+// dereference every field of the v0 sharedRegionT; using a smaller fixture
+// would leave usage.Info backed by an out-of-bounds pointer.
+var v0CacheFileSize = v0.MinSize()
+
+// fakePodLister is a minimal corelisters.PodLister used to drive Update()'s
+// error path without touching a real (or fake) Kubernetes API server.
+type fakePodLister struct {
+	pods    []*corev1.Pod
+	listErr error
+}
+
+func (f *fakePodLister) List(labels.Selector) ([]*corev1.Pod, error) {
+	return f.pods, f.listErr
+}
+
+func (f *fakePodLister) Pods(string) corelisters.PodNamespaceLister {
+	return nil
+}
+
+func newTestPodLister(pods ...*corev1.Pod) corelisters.PodLister {
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	for _, p := range pods {
+		_ = indexer.Add(p)
+	}
+	return corelisters.NewPodLister(indexer)
+}
+
+func headerBytes(size int, magic, major, minor int32) []byte {
+	buf := make([]byte, size)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(magic))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(major))
+	binary.LittleEndian.PutUint32(buf[8:12], uint32(minor))
+	return buf
+}
+
+func writeCacheFile(t *testing.T, dir, name string, content []byte) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	assert.NilError(t, os.WriteFile(p, content, 0666))
+	return p
+}
+
+// makeV0CacheBytes builds a minimal v0 shared-memory cache payload with the
+// given device count and per-device memory limits. Field offsets are derived
+// from unsafe.Offsetof applied to the unexported v0.sharedRegionT:
+//
+//	num   @ byte 48   (uint64, little-endian)
+//	limit @ byte 1592 (16 × uint64, one per device slot, little-endian)
+func makeV0CacheBytes(numDevices int, limits []uint64) []byte {
+	buf := make([]byte, v0.MinSize())
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(SharedRegionMagicFlag))
+	binary.LittleEndian.PutUint64(buf[48:56], uint64(numDevices))
+	for i, l := range limits {
+		binary.LittleEndian.PutUint64(buf[1592+i*8:1592+(i+1)*8], l)
+	}
+	return buf
+}
+
+func Test_ContainerLister_Accessors(t *testing.T) {
+	l := &ContainerLister{
+		containers: map[string]*ContainerUsage{"a": {}},
+	}
+	assert.Equal(t, len(l.ListContainers()), 1)
+	assert.Assert(t, l.Clientset() == nil)
+	assert.Assert(t, l.PodLister() == nil)
+
+	l.Lock()
+	l.UnLock()
+}
+
+func Test_NewContainerLister_errors(t *testing.T) {
+	t.Run("HOOK_PATH not set", func(t *testing.T) {
+		t.Setenv("HOOK_PATH", "")
+		os.Unsetenv("HOOK_PATH")
+		_, err := NewContainerLister()
+		assert.ErrorContains(t, err, "HOOK_PATH not set")
+	})
+
+	t.Run("invalid KUBECONFIG", func(t *testing.T) {
+		t.Setenv("HOOK_PATH", t.TempDir())
+		t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "does-not-exist.yaml"))
+		_, err := NewContainerLister()
+		assert.Assert(t, err != nil)
+	})
+
+	t.Run("clientset construction fails", func(t *testing.T) {
+		t.Setenv("HOOK_PATH", t.TempDir())
+		t.Setenv("KUBECONFIG", writeKubeconfig(t, "http://[::1]:namedport"))
+		_, err := NewContainerLister()
+		assert.ErrorContains(t, err, "host must be a URL or a host:port pair")
+	})
+
+	t.Run("NODE_NAME not set", func(t *testing.T) {
+		t.Setenv("HOOK_PATH", t.TempDir())
+		t.Setenv("KUBECONFIG", writeKubeconfig(t, "http://localhost:8080"))
+		t.Setenv(util.NodeNameEnvName, "")
+		os.Unsetenv(util.NodeNameEnvName)
+		_, err := NewContainerLister()
+		assert.ErrorContains(t, err, "env "+util.NodeNameEnvName+" not set")
+	})
+}
+
+func writeKubeconfig(t *testing.T, server string) string {
+	t.Helper()
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig.yaml")
+	content := `apiVersion: v1
+clusters:
+- cluster:
+    server: ` + server + `
+  name: local-server
+contexts:
+- context:
+    cluster: local-server
+    namespace: the-right-prefix
+    user: myself
+  name: default-context
+current-context: default-context
+kind: Config
+preferences: {}
+users:
+- name: myself
+  user:
+    password: secret
+    username: admin
+`
+	assert.NilError(t, os.WriteFile(kubeconfig, []byte(content), 0644))
+	return kubeconfig
+}
+
+// unreachableClientset builds a real *kubernetes.Clientset pointed at a port
+// nothing is listening on, so any request fails fast with connection refused
+// instead of hanging.
+func unreachableClientset(t *testing.T) *kubernetes.Clientset {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NilError(t, err)
+	addr := ln.Addr().String()
+	assert.NilError(t, ln.Close())
+
+	cs, err := kubernetes.NewForConfig(&rest.Config{Host: "http://" + addr})
+	assert.NilError(t, err)
+	return cs
+}
+
+func Test_initInformerWithConfig_syncTimeout(t *testing.T) {
+	l := &ContainerLister{
+		clientset: unreachableClientset(t),
+		nodeName:  "test-node",
+		stopCh:    make(chan struct{}),
+	}
+	time.AfterFunc(200*time.Millisecond, func() { close(l.stopCh) })
+
+	err := l.initInformerWithConfig(50 * time.Millisecond)
+	assert.ErrorContains(t, err, "failed to sync pod informer cache")
+}
+
+func Test_onPodDelete(t *testing.T) {
+	l := &ContainerLister{}
+
+	t.Run("plain pod", func(t *testing.T) {
+		l.onPodDelete(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "default"}})
+	})
+
+	t.Run("tombstone wrapping a pod", func(t *testing.T) {
+		l.onPodDelete(cache.DeletedFinalStateUnknown{
+			Key: "default/p2",
+			Obj: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p2", Namespace: "default"}},
+		})
+	})
+
+	t.Run("tombstone wrapping a non-pod", func(t *testing.T) {
+		l.onPodDelete(cache.DeletedFinalStateUnknown{Key: "x", Obj: "not-a-pod"})
+	})
+
+	t.Run("neither pod nor tombstone", func(t *testing.T) {
+		l.onPodDelete("garbage")
+	})
+}
+
+func Test_loadCache(t *testing.T) {
+	t.Run("directory missing", func(t *testing.T) {
+		_, err := loadCache(filepath.Join(t.TempDir(), "missing"))
+		assert.Assert(t, err != nil)
+	})
+
+	t.Run("too many files", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "a.cache", []byte("x"))
+		writeCacheFile(t, dir, "b.cache", []byte("x"))
+		writeCacheFile(t, dir, "c.cache", []byte("x"))
+		_, err := loadCache(dir)
+		assert.ErrorContains(t, err, "cache num not matched")
+	})
+
+	t.Run("ignores unrelated files when one cache file exists", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		writeCacheFile(t, dir, "notes.txt", []byte("x"))
+		writeCacheFile(t, dir, "debug.log", []byte("x"))
+
+		usage, err := loadCache(dir)
+		assert.NilError(t, err)
+		assert.Assert(t, usage != nil)
+		assert.Assert(t, usage.Info != nil)
+		defer func() { _ = syscall.Munmap(usage.data) }()
+	})
+
+	t.Run("ignores files that contain cache suffix in the middle", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		writeCacheFile(t, dir, "debug.cache.bak", []byte("x"))
+		writeCacheFile(t, dir, "trace.cache.tmp", []byte("x"))
+
+		usage, err := loadCache(dir)
+		assert.NilError(t, err)
+		assert.Assert(t, usage != nil)
+		assert.Assert(t, usage.Info != nil)
+		defer func() { _ = syscall.Munmap(usage.data) }()
+	})
+
+	t.Run("empty directory", func(t *testing.T) {
+		usage, err := loadCache(t.TempDir())
+		assert.NilError(t, err)
+		assert.Assert(t, usage == nil)
+	})
+
+	t.Run("no matching cache file", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "libvgpu.so", []byte("x"))
+		writeCacheFile(t, dir, "notes.txt", []byte("x"))
+		usage, err := loadCache(dir)
+		assert.NilError(t, err)
+		assert.Assert(t, usage == nil)
+	})
+
+	t.Run("cache file too small", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", []byte("tiny"))
+		_, err := loadCache(dir)
+		assert.ErrorContains(t, err, "too small")
+	})
+
+	t.Run("magic flag mismatch", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", headerBytes(64, 0, 1, 0))
+		_, err := loadCache(dir)
+		assert.ErrorContains(t, err, "magic flag not matched")
+	})
+
+	t.Run("unknown version and size", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", headerBytes(64, SharedRegionMagicFlag, 99, 0))
+		_, err := loadCache(dir)
+		assert.ErrorContains(t, err, "unknown cache file size")
+	})
+
+	t.Run("v1 header but file too small for the v1 spec", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", headerBytes(64, SharedRegionMagicFlag, 1, 0))
+		_, err := loadCache(dir)
+		assert.ErrorContains(t, err, "unknown cache file size")
+	})
+
+	t.Run("v1 cache file", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		usage, err := loadCache(dir)
+		assert.NilError(t, err)
+		assert.Assert(t, usage != nil)
+		assert.Assert(t, usage.Info != nil)
+		defer func() { _ = syscall.Munmap(usage.data) }()
+	})
+
+	t.Run("v0 cache file (struct-derived size)", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", headerBytes(v0CacheFileSize, SharedRegionMagicFlag, 0, 0))
+		usage, err := loadCache(dir)
+		assert.NilError(t, err)
+		assert.Assert(t, usage != nil)
+		assert.Assert(t, usage.Info != nil)
+		defer func() { _ = syscall.Munmap(usage.data) }()
+	})
+
+	t.Run("v0 cache file (empirical legacy size 1197897)", func(t *testing.T) {
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", headerBytes(1197897, SharedRegionMagicFlag, 0, 0))
+		usage, err := loadCache(dir)
+		assert.NilError(t, err)
+		assert.Assert(t, usage != nil)
+		assert.Assert(t, usage.Info != nil)
+		defer func() { _ = syscall.Munmap(usage.data) }()
+	})
+
+	t.Run("v0 cache file (e2e: field data round-trips through loadCache)", func(t *testing.T) {
+		const (
+			wantNum    = 2
+			wantLimit0 = 4 * 1024 * 1024 * 1024
+			wantLimit1 = 2 * 1024 * 1024 * 1024
+		)
+		dir := t.TempDir()
+		writeCacheFile(t, dir, "x.cache", makeV0CacheBytes(wantNum, []uint64{wantLimit0, wantLimit1}))
+		usage, err := loadCache(dir)
+		assert.NilError(t, err)
+		assert.Assert(t, usage != nil)
+		assert.Assert(t, usage.Info != nil)
+		defer func() { _ = syscall.Munmap(usage.data) }()
+
+		assert.Equal(t, wantNum, usage.Info.DeviceNum())
+		assert.Equal(t, uint64(wantLimit0), usage.Info.DeviceMemoryLimit(0))
+		assert.Equal(t, uint64(wantLimit1), usage.Info.DeviceMemoryLimit(1))
+	})
+
+	t.Run("open file fails", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("running as root bypasses file permission checks")
+		}
+		dir := t.TempDir()
+		path := writeCacheFile(t, dir, "x.cache", headerBytes(64, SharedRegionMagicFlag, 1, 0))
+		assert.NilError(t, os.Chmod(path, 0000))
+		defer os.Chmod(path, 0666)
+		_, err := loadCache(dir)
+		assert.Assert(t, err != nil)
+	})
+}
+
+// Test_ContainerLister_Update checks mapping discovery, replacement, and removal across Pod and
+// cache-directory changes.
+func Test_ContainerLister_Update(t *testing.T) {
+	t.Run("container path missing", func(t *testing.T) {
+		l := &ContainerLister{
+			containerPath: filepath.Join(t.TempDir(), "missing"),
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(),
+		}
+		err := l.Update()
+		assert.Assert(t, err != nil)
+	})
+
+	t.Run("podLister error propagates", func(t *testing.T) {
+		l := &ContainerLister{
+			containerPath: t.TempDir(),
+			containers:    map[string]*ContainerUsage{},
+			podLister:     &fakePodLister{listErr: errors.New("boom")},
+		}
+		err := l.Update()
+		assert.ErrorContains(t, err, "failed to list pods")
+	})
+
+	t.Run("skips non-directory entries", func(t *testing.T) {
+		dir := t.TempDir()
+		assert.NilError(t, os.WriteFile(filepath.Join(dir, "stray-file"), []byte("x"), 0644))
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(),
+		}
+		assert.NilError(t, l.Update())
+		assert.Equal(t, len(l.containers), 0)
+	})
+
+	t.Run("recently modified stale dir is kept", func(t *testing.T) {
+		dir := t.TempDir()
+		ctrDir := filepath.Join(dir, "missing-pod-uid_ctr")
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(),
+		}
+		assert.NilError(t, l.Update())
+		_, err := os.Stat(ctrDir)
+		assert.NilError(t, err)
+	})
+
+	t.Run("old stale dir with tracked mapping is unmapped but not removed", func(t *testing.T) {
+		dir := t.TempDir()
+		entryName := "missing-pod-uid_ctr"
+		ctrDir := filepath.Join(dir, entryName)
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		old := time.Now().Add(-2 * resyncInterval)
+		assert.NilError(t, os.Chtimes(ctrDir, old, old))
+
+		cacheDir := t.TempDir()
+		writeCacheFile(t, cacheDir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		usage, err := loadCache(cacheDir)
+		assert.NilError(t, err)
+
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{entryName: usage},
+			podLister:     newTestPodLister(),
+		}
+		assert.NilError(t, l.Update())
+		_, ok := l.containers[entryName]
+		assert.Equal(t, ok, false)
+		_, err = os.Stat(ctrDir)
+		assert.NilError(t, err)
+	})
+
+	t.Run("already tracked entry is left untouched", func(t *testing.T) {
+		dir := t.TempDir()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "uid1"}}
+		entryName := "uid1_ctr"
+		ctrDir := filepath.Join(dir, entryName)
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		writeCacheFile(t, ctrDir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		existing, err := loadCache(ctrDir)
+		assert.NilError(t, err)
+		defer func() { _ = syscall.Munmap(existing.data) }()
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{entryName: existing},
+			podLister:     newTestPodLister(pod),
+		}
+		assert.NilError(t, l.Update())
+		assert.Assert(t, l.containers[entryName] == existing)
+	})
+
+	t.Run("loadCache error is skipped", func(t *testing.T) {
+		dir := t.TempDir()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "uid2"}}
+		entryName := "uid2_ctr"
+		ctrDir := filepath.Join(dir, entryName)
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		writeCacheFile(t, ctrDir, "a.cache", []byte("x"))
+		writeCacheFile(t, ctrDir, "b.cache", []byte("x"))
+		writeCacheFile(t, ctrDir, "c.cache", []byte("x"))
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(pod),
+		}
+		assert.NilError(t, l.Update())
+		assert.Equal(t, len(l.containers), 0)
+	})
+
+	t.Run("no cuInit yet is skipped", func(t *testing.T) {
+		dir := t.TempDir()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "uid3"}}
+		entryName := "uid3_ctr"
+		ctrDir := filepath.Join(dir, entryName)
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(pod),
+		}
+		assert.NilError(t, l.Update())
+		assert.Equal(t, len(l.containers), 0)
+	})
+
+	t.Run("new container is added with PodUID and ContainerName set", func(t *testing.T) {
+		dir := t.TempDir()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "uid4"}}
+		entryName := "uid4_mycontainer"
+		ctrDir := filepath.Join(dir, entryName)
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		writeCacheFile(t, ctrDir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(pod),
+		}
+		assert.NilError(t, l.Update())
+		got, ok := l.containers[entryName]
+		assert.Equal(t, ok, true)
+		assert.Equal(t, got.PodUID, "uid4")
+		assert.Equal(t, got.ContainerName, "mycontainer")
+		defer func() { _ = syscall.Munmap(got.data) }()
+	})
+
+	t.Run("externally removed directory releases tracked mapping", func(t *testing.T) {
+		dir := t.TempDir()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "uid5"}}
+		entryName := "uid5_ctr"
+		ctrDir := filepath.Join(dir, entryName)
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		writeCacheFile(t, ctrDir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(pod),
+		}
+		assert.NilError(t, l.Update())
+		assert.Equal(t, len(l.containers), 1)
+		assert.NilError(t, os.RemoveAll(ctrDir))
+		assert.NilError(t, l.Update())
+		assert.Equal(t, len(l.containers), 0)
+	})
+
+	t.Run("same-name replacement reloads mapping", func(t *testing.T) {
+		dir := t.TempDir()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "uid6"}}
+		entryName := "uid6_ctr"
+		ctrDir := filepath.Join(dir, entryName)
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		cachePath := writeCacheFile(t, ctrDir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(pod),
+		}
+		assert.NilError(t, l.Update())
+		original := l.containers[entryName]
+		assert.NilError(t, os.Remove(cachePath))
+		writeCacheFile(t, ctrDir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		assert.NilError(t, l.Update())
+		reloaded := l.containers[entryName]
+		assert.Assert(t, reloaded != nil)
+		assert.Assert(t, reloaded != original)
+		defer func() { _ = syscall.Munmap(reloaded.data) }()
+	})
+
+	t.Run("dir without underscore in name is skipped", func(t *testing.T) {
+		dir := t.TempDir()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "nodashes"}}
+		ctrDir := filepath.Join(dir, "nodashes")
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		writeCacheFile(t, ctrDir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(pod),
+		}
+		assert.NilError(t, l.Update())
+		assert.Equal(t, len(l.containers), 0)
+	})
+
+	t.Run("dir with trailing underscore is skipped", func(t *testing.T) {
+		dir := t.TempDir()
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: "uid"}}
+		ctrDir := filepath.Join(dir, "uid_")
+		assert.NilError(t, os.Mkdir(ctrDir, 0755))
+		writeCacheFile(t, ctrDir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+		l := &ContainerLister{
+			containerPath: dir,
+			containers:    map[string]*ContainerUsage{},
+			podLister:     newTestPodLister(pod),
+		}
+		assert.NilError(t, l.Update())
+		assert.Equal(t, len(l.containers), 0)
+	})
+}
+
+// TestContainerListerCloseReleasesMappings checks that repeated Close calls stop the informer
+// and release mappings safely.
+func TestContainerListerCloseReleasesMappings(t *testing.T) {
+	cacheDir := t.TempDir()
+	writeCacheFile(t, cacheDir, "x.cache", headerBytes(v1CacheFileSize, SharedRegionMagicFlag, 1, 0))
+	usage, err := loadCache(cacheDir)
+	assert.NilError(t, err)
+	l := &ContainerLister{
+		containers: map[string]*ContainerUsage{"uid_ctr": usage},
+		stopCh:     make(chan struct{}),
+	}
+	l.Close()
+	l.Close()
+	assert.Equal(t, len(l.containers), 0)
+	select {
+	case <-l.stopCh:
+	default:
+		t.Fatal("Close did not stop informer")
+	}
+}
+
+// TestNewContainerListerCacheRoot checks configured cache roots, legacy fallback, and invalid
+// path rejection.
+func TestNewContainerListerCacheRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name, root string
+		invalid    bool
+	}{
+		{name: "fallback"}, {name: "custom", root: t.TempDir()},
+		{name: "relative", root: "relative", invalid: true}, {name: "filesystem root", root: "/", invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Query().Get("watch") == "true" {
+					// Support the initial-events bookmark used by watch-list clients.
+					bookmark := map[string]any{"type": "BOOKMARK", "object": &corev1.Pod{
+						TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
+						ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1", Annotations: map[string]string{"k8s.io/initial-events-end": "true"}},
+					}}
+					if err := json.NewEncoder(w).Encode(bookmark); err != nil {
+						t.Errorf("encode bookmark: %v", err)
+						return
+					}
+					if err := http.NewResponseController(w).Flush(); err != nil {
+						t.Errorf("flush bookmark: %v", err)
+						return
+					}
+					<-r.Context().Done()
+					return
+				}
+				err := json.NewEncoder(w).Encode(&corev1.PodList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PodList"}, ListMeta: metav1.ListMeta{ResourceVersion: "1"}, Items: []corev1.Pod{}})
+				if err != nil {
+					t.Errorf("encode Pod list: %v", err)
+				}
+			}))
+			defer server.Close()
+			hook := t.TempDir()
+			t.Setenv("HOOK_PATH", hook)
+			t.Setenv("HAMI_VGPU_CACHE_ROOT", tc.root)
+			t.Setenv("KUBECONFIG", writeKubeconfig(t, server.URL))
+			t.Setenv(util.NodeNameEnvName, "test-node")
+			l, err := NewContainerLister()
+			if tc.invalid {
+				require.ErrorContains(t, err, "absolute non-root path")
+				require.Nil(t, l)
+				return
+			}
+			require.NoError(t, err)
+			defer l.Close()
+			expected := tc.root
+			if expected == "" {
+				expected = filepath.Join(hook, "containers")
+			}
+			require.Equal(t, expected, l.containerPath)
+			require.True(t, l.podListerSynced())
+			l.Close()
+			require.Eventually(t, func() bool { return l.podInformer.IsStopped() }, time.Second, time.Millisecond)
+		})
+	}
+}
+
+// TestContainerListerIndependentMappings checks that replacing or removing one container cache
+// preserves other mappings.
+func TestContainerListerIndependentMappings(t *testing.T) {
+	root := t.TempDir()
+	pods := &fakePodLister{pods: []*corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{UID: "pod-a"}}, {ObjectMeta: metav1.ObjectMeta{UID: "pod-b"}},
+	}}
+	l := &ContainerLister{containerPath: root, containers: map[string]*ContainerUsage{}, podLister: pods, stopCh: make(chan struct{})}
+	t.Cleanup(l.Close)
+	paths := map[string]string{}
+	for name, limit := range map[string]uint64{"pod-a_small": 1024, "pod-a_large": 2048, "pod-b_main": 4096} {
+		dir := filepath.Join(root, name)
+		require.NoError(t, os.Mkdir(dir, 0o755))
+		paths[name] = writeCacheFile(t, dir, "x.cache", makeV0CacheBytes(1, []uint64{limit}))
+	}
+	require.NoError(t, l.Update())
+	require.Len(t, l.containers, 3)
+	small, large, other := l.containers["pod-a_small"], l.containers["pod-a_large"], l.containers["pod-b_main"]
+	require.Equal(t, uint64(1024), small.Info.DeviceMemoryLimit(0))
+	require.Equal(t, uint64(2048), large.Info.DeviceMemoryLimit(0))
+	require.Equal(t, uint64(4096), other.Info.DeviceMemoryLimit(0))
+	require.Equal(t, "pod-a", small.PodUID)
+	require.Equal(t, "small", small.ContainerName)
+	require.Equal(t, "large", large.ContainerName)
+
+	// A missing cache releases only its mapping, even while its Pod still exists.
+	require.NoError(t, os.Remove(paths["pod-a_small"]))
+	require.NoError(t, l.Update())
+	require.NotContains(t, l.containers, "pod-a_small")
+	require.Same(t, large, l.containers["pod-a_large"])
+	require.Same(t, other, l.containers["pod-b_main"])
+	writeCacheFile(t, filepath.Dir(paths["pod-a_small"]), "x.cache", makeV0CacheBytes(1, []uint64{512}))
+	require.NoError(t, l.Update())
+	require.NotSame(t, small, l.containers["pod-a_small"])
+	require.Equal(t, uint64(512), l.containers["pod-a_small"].Info.DeviceMemoryLimit(0))
+
+	// An inode-preserving size change must also invalidate the old mapping.
+	require.NoError(t, os.Truncate(paths["pod-a_small"], int64(v0CacheFileSize+4096)))
+	before := l.containers["pod-a_small"]
+	require.NoError(t, l.Update())
+	require.NotSame(t, before, l.containers["pod-a_small"])
+	require.Len(t, l.containers["pod-a_small"].data, v0CacheFileSize+4096)
+	require.Same(t, large, l.containers["pod-a_large"])
+
+	// Deleting one Pod retains recent mappings, then releases both of its
+	// containers without deleting directories or touching the other Pod.
+	pods.pods = pods.pods[1:]
+	recent := time.Now()
+	for _, name := range []string{"pod-a_small", "pod-a_large"} {
+		require.NoError(t, os.Chtimes(filepath.Join(root, name), recent, recent))
+	}
+	require.NoError(t, l.Update())
+	require.Len(t, l.containers, 3)
+	old := time.Now().Add(-2 * resyncInterval)
+	for _, name := range []string{"pod-a_small", "pod-a_large"} {
+		require.NoError(t, os.Chtimes(filepath.Join(root, name), old, old))
+	}
+	require.NoError(t, l.Update())
+	require.Len(t, l.containers, 1)
+	require.Same(t, other, l.containers["pod-b_main"])
+	require.DirExists(t, filepath.Join(root, "pod-a_small"))
+	require.DirExists(t, filepath.Join(root, "pod-a_large"))
+
+	// Removing the whole shared root releases all remaining mappings as well.
+	require.NoError(t, os.RemoveAll(root))
+	require.ErrorIs(t, l.Update(), os.ErrNotExist)
+	require.Empty(t, l.containers)
+}
+
+// TestMappedUsageRemainsValidUntilUnlock checks that replacement, removal, and shutdown wait for
+// access to real mmap data to finish.
+func TestMappedUsageRemainsValidUntilUnlock(t *testing.T) {
+	for _, action := range []string{"replace", "remove", "close"} {
+		t.Run(action, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "pod_gpu")
+			require.NoError(t, os.Mkdir(dir, 0o755))
+			path := writeCacheFile(t, dir, "x.cache", makeV0CacheBytes(1, []uint64{1024}))
+			l := &ContainerLister{
+				containerPath: root, containers: map[string]*ContainerUsage{}, stopCh: make(chan struct{}),
+				podLister: &fakePodLister{pods: []*corev1.Pod{{ObjectMeta: metav1.ObjectMeta{UID: "pod"}}}},
+			}
+			t.Cleanup(l.Close)
+			require.NoError(t, l.Update())
+			switch action {
+			case "replace":
+				replacement := writeCacheFile(t, dir, "replacement.cache", makeV0CacheBytes(1, []uint64{2048}))
+				require.NoError(t, os.Rename(replacement, path))
+			case "remove":
+				require.NoError(t, os.RemoveAll(dir))
+			}
+			l.Lock()
+			var unlockOnce sync.Once
+			unlock := func() { unlockOnce.Do(l.UnLock) }
+			defer unlock()
+			usage := l.ListContainers()["pod_gpu"]
+			started, done := make(chan struct{}), make(chan error, 1)
+			go func() {
+				close(started)
+				if action == "close" {
+					l.Close()
+					done <- nil
+				} else {
+					done <- l.Update()
+				}
+			}()
+			<-started
+			select {
+			case <-done:
+				t.Fatal("mapping released while a caller holds the lister lock")
+			case <-time.After(30 * time.Millisecond):
+			}
+			// Exercise the real mmap, including a feedback write, while the
+			// concurrent replacement/removal/shutdown is waiting for the lock.
+			require.Equal(t, uint64(1024), usage.Info.DeviceMemoryLimit(0))
+			usage.Info.SetRecentKernel(7)
+			require.Equal(t, int32(7), usage.Info.GetRecentKernel())
+			unlock()
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(time.Second):
+				t.Fatal("cleanup did not finish after unlock")
+			}
+			l.Lock()
+			defer l.UnLock()
+			if action == "replace" {
+				require.NotSame(t, usage, l.ListContainers()["pod_gpu"])
+				require.Equal(t, uint64(2048), l.ListContainers()["pod_gpu"].Info.DeviceMemoryLimit(0))
+			} else {
+				require.Empty(t, l.ListContainers())
+			}
+		})
+	}
+}
+
+func TestCacheDirectoryRecoveryKeepsDCGMAliveUntilClose(t *testing.T) {
+	previous := wholeGPUDisableHAMiCore
+	wholeGPUDisableHAMiCore = false
+	t.Cleanup(func() { wholeGPUDisableHAMiCore = previous })
+	collector := newMigTestCollector(&fakeLatestValuesQuerier{})
+	cleanups, shutdowns := 0, 0
+	collector.watched = map[uint]func(){1: func() { cleanups++ }}
+	collector.shutdown = func() { shutdowns++ }
+	path := filepath.Join(t.TempDir(), "cache")
+	l := &ContainerLister{containerPath: path, containers: map[string]*ContainerUsage{}, podLister: newTestPodLister(), wholeGPU: &wholeGPUState{dcgm: collector}, stopCh: make(chan struct{})}
+	defer l.Close()
+	if err := l.Update(); !os.IsNotExist(err) {
+		t.Fatalf("expected missing directory: %v", err)
+	}
+	if collector.closed || cleanups != 0 || shutdowns != 0 {
+		t.Fatal("missing directory closed DCGM")
+	}
+	assert.NilError(t, os.Mkdir(path, 0755))
+	assert.NilError(t, l.Update())
+	if collector.closed {
+		t.Fatal("directory recovery lost collector")
+	}
+	l.Close()
+	l.Close()
+	if !collector.closed || cleanups != 1 || shutdowns != 1 {
+		t.Fatalf("close failed: closed=%v cleanups=%d shutdowns=%d", collector.closed, cleanups, shutdowns)
+	}
+}
+
+func TestOnLupineServerCustomPortKeepsCollecting(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{name: "empty chart-managed", labels: map[string]string{remotegpu.LupineServerLabel: ""}, want: true},
+		{name: "custom port", labels: map[string]string{remotegpu.LupineServerLabel: "14833"}, want: false},
+		{name: "missing", labels: nil, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newListerForHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				body, err := json.Marshal(&corev1.Node{
+					TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Node"},
+					ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: tc.labels},
+				})
+				assert.NilError(t, err)
+				_, _ = w.Write(body)
+			}))
+			assert.Equal(t, l.OnLupineServer(context.Background()), tc.want)
+		})
+	}
+}
+
+func TestOnLupineServerLookupFailureKeepsPreviousAnswer(t *testing.T) {
+	t.Run("no client reports false", func(t *testing.T) {
+		if (&ContainerLister{}).OnLupineServer(context.Background()) {
+			t.Fatal("missing client looked like a lupine server")
+		}
+	})
+
+	var (
+		status = http.StatusOK
+		labels map[string]string
+		hits   int
+	)
+	l := newListerForHTTP(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		body, err := json.Marshal(&corev1.Node{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Node"},
+			ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: labels},
+		})
+		assert.NilError(t, err)
+		_, _ = w.Write(body)
+	}))
+
+	labels = map[string]string{remotegpu.LupineServerLabel: ""}
+	if !l.OnLupineServer(context.Background()) {
+		t.Fatal("empty label")
+	}
+	if !l.OnLupineServer(context.Background()) || hits != 1 {
+		t.Fatalf("cache hit = %d requests, on=%v", hits, l.lupineOn)
+	}
+
+	status = http.StatusInternalServerError
+	l.lupineAt = time.Now().Add(-lupineServerLookupTTL - time.Second)
+	if !l.OnLupineServer(context.Background()) {
+		t.Fatal("lookup failure dropped a known lupine server")
+	}
+
+	labels = nil
+	status = http.StatusOK
+	l.lupineAt = time.Now().Add(-lupineServerLookupTTL - time.Second)
+	if l.OnLupineServer(context.Background()) {
+		t.Fatal("removing the label did not resume collection")
+	}
+
+	l.nodeName = ""
+	l.lupineKnown = false
+	if l.OnLupineServer(context.Background()) {
+		t.Fatal("empty node name looked like a lupine server")
+	}
+}

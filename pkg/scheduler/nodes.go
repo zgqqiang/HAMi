@@ -28,17 +28,32 @@ import (
 )
 
 type NodeUsage struct {
-	Node    *corev1.Node
-	Devices policy.DeviceUsageList
+	Node     *corev1.Node
+	NodeInfo *device.NodeInfo
+	Devices  policy.DeviceUsageList
 }
 
 func (n *NodeUsage) DeepCopy() *NodeUsage {
 	if n == nil {
 		return nil
 	}
+	var nodeInfoCopy *device.NodeInfo
+	if n.NodeInfo != nil {
+		nodeInfoCopy = &device.NodeInfo{
+			ID:      n.NodeInfo.ID,
+			Devices: make(map[string][]device.DeviceInfo, len(n.NodeInfo.Devices)),
+		}
+		if n.NodeInfo.Node != nil {
+			nodeInfoCopy.Node = n.NodeInfo.Node.DeepCopy()
+		}
+		for vendor, devices := range n.NodeInfo.Devices {
+			nodeInfoCopy.Devices[vendor] = device.DeepCopyDeviceInfos(devices)
+		}
+	}
 	return &NodeUsage{
-		Node:    n.Node.DeepCopy(),
-		Devices: n.Devices.DeepCopy(),
+		Node:     n.Node.DeepCopy(),
+		NodeInfo: nodeInfoCopy,
+		Devices:  n.Devices.DeepCopy(),
 	}
 }
 
@@ -53,6 +68,11 @@ func newNodeManager() *nodeManager {
 	}
 }
 
+// addNode copies what it is given. RegisterFromNodeAnnotations builds nodeInfo
+// around a *corev1.Node taken from nodeLister.List, which belongs to the shared
+// informer, and a backend such as cambricon writes to that same object when it
+// releases a node lock. Storing the pointer would leave GetNode and ListNodes
+// deep-copying it while that write happens.
 func (m *nodeManager) addNode(nodeID string, nodeInfo *device.NodeInfo) {
 	if nodeInfo == nil || len(nodeInfo.Devices) == 0 {
 		return
@@ -61,14 +81,26 @@ func (m *nodeManager) addNode(nodeID string, nodeInfo *device.NodeInfo) {
 	defer m.mutex.Unlock()
 	_, ok := m.nodes[nodeID]
 	if ok {
-		if len(nodeInfo.Devices) > 0 {
-			for vendor := range nodeInfo.Devices {
-				m.nodes[nodeID].Devices[vendor] = nodeInfo.Devices[vendor]
-			}
+		for vendor := range nodeInfo.Devices {
+			m.nodes[nodeID].Devices[vendor] = device.DeepCopyDeviceInfos(nodeInfo.Devices[vendor])
 		}
-		m.nodes[nodeID].Node = nodeInfo.Node
+		if nodeInfo.Node != nil {
+			m.nodes[nodeID].Node = nodeInfo.Node.DeepCopy()
+		} else {
+			m.nodes[nodeID].Node = nil
+		}
 	} else {
-		m.nodes[nodeID] = nodeInfo
+		stored := &device.NodeInfo{
+			ID:      nodeInfo.ID,
+			Devices: make(map[string][]device.DeviceInfo, len(nodeInfo.Devices)),
+		}
+		if nodeInfo.Node != nil {
+			stored.Node = nodeInfo.Node.DeepCopy()
+		}
+		for vendor, devices := range nodeInfo.Devices {
+			stored.Devices[vendor] = device.DeepCopyDeviceInfos(devices)
+		}
+		m.nodes[nodeID] = stored
 	}
 }
 
@@ -98,10 +130,54 @@ func (m *nodeManager) rmNode(nodeID string) {
 func (m *nodeManager) GetNode(nodeID string) (*device.NodeInfo, error) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	if n, ok := m.nodes[nodeID]; ok {
-		return n, nil
+	n, ok := m.nodes[nodeID]
+	if !ok {
+		return &device.NodeInfo{}, fmt.Errorf("node %v not found", nodeID)
 	}
-	return &device.NodeInfo{}, fmt.Errorf("node %v not found", nodeID)
+	nodeInfoCopy := &device.NodeInfo{
+		ID:      n.ID,
+		Devices: make(map[string][]device.DeviceInfo, len(n.Devices)),
+	}
+	if n.Node != nil {
+		nodeInfoCopy.Node = n.Node.DeepCopy()
+	}
+	for k, v := range n.Devices {
+		nodeInfoCopy.Devices[k] = device.DeepCopyDeviceInfos(v)
+	}
+	return nodeInfoCopy, nil
+}
+
+// GetNodes returns a point-in-time, deep-copied snapshot of the requested
+// cache entries. Unlike ListNodes, it does not copy entries that the caller
+// did not request. An entry with a nil NodeInfo or NodeInfo.Node is retained
+// so callers can distinguish it from an unregistered node.
+func (m *nodeManager) GetNodes(nodeIDs []string) map[string]*device.NodeInfo {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	nodesCopy := make(map[string]*device.NodeInfo, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		nodeInfo, ok := m.nodes[nodeID]
+		if !ok {
+			continue
+		}
+		if nodeInfo == nil {
+			nodesCopy[nodeID] = nil
+			continue
+		}
+		nodeInfoCopy := &device.NodeInfo{
+			ID:      nodeInfo.ID,
+			Devices: make(map[string][]device.DeviceInfo, len(nodeInfo.Devices)),
+		}
+		if nodeInfo.Node != nil {
+			nodeInfoCopy.Node = nodeInfo.Node.DeepCopy()
+		}
+		for vendor, devices := range nodeInfo.Devices {
+			nodeInfoCopy.Devices[vendor] = device.DeepCopyDeviceInfos(devices)
+		}
+		nodesCopy[nodeID] = nodeInfoCopy
+	}
+	return nodesCopy
 }
 
 func (m *nodeManager) ListNodes() (map[string]*device.NodeInfo, error) {
@@ -119,8 +195,7 @@ func (m *nodeManager) ListNodes() (map[string]*device.NodeInfo, error) {
 			Devices: make(map[string][]device.DeviceInfo),
 		}
 		for k, v := range nodeInfo.Devices {
-			nodeInfoCopy.Devices[k] = make([]device.DeviceInfo, len(v))
-			copy(nodeInfoCopy.Devices[k], v)
+			nodeInfoCopy.Devices[k] = device.DeepCopyDeviceInfos(v)
 		}
 		nodesCopy[nodeID] = nodeInfoCopy
 	}

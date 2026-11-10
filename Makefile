@@ -45,7 +45,7 @@ tidy:
 	$(GO) mod tidy
 
 proto:
-	$(GO) get github.com/gogo/protobuf/protoc-gen-gofast@v1.3.2
+	$(GO) install github.com/gogo/protobuf/protoc-gen-gofast@v1.3.2
 	protoc --gofast_out=plugins=grpc:. ./pkg/api/*.proto
 
 build: $(CMDS) $(DEVICES)
@@ -65,6 +65,20 @@ clean:
 test:
 	mkdir -p ./_output/coverage/
 	bash hack/unit-test.sh
+
+# Runs every Go benchmark to completion. Set BENCHTIME for a longer, more
+# meaningful local measurement, e.g. BENCHTIME=1s make bench.
+.PHONY: bench
+bench:
+	bash hack/bench.sh
+
+.PHONY: test-bench-compare
+test-bench-compare:
+	bash hack/test-bench-compare.sh
+
+.PHONY: test-support-bundle
+test-support-bundle:
+	bash hack/test-hami-support-bundle.sh
 
 lint:
 	bash hack/verify-staticcheck.sh
@@ -93,6 +107,21 @@ lint_chart:
       (($$?==0)) || { echo "error, failed to check chart trivy" && exit 1 ; } ; \
       echo "chart trivy check: pass"
 
+.PHONY: update-helm-chart-docs
+update-helm-chart-docs:
+	$(MAKE) -C charts update-helm-chart-docs
+
+.PHONY: verify-helm-chart-docs
+verify-helm-chart-docs:
+	$(MAKE) -C charts verify-helm-chart-docs
+
+.PHONY: verify_chart
+verify_chart:
+	$(MAKE) -C charts validate
+	$(MAKE) verify-helm-chart-docs
+	bash ./hack/verify-chart-version.sh
+	$(MAKE) lint_chart
+
 .PHONY: e2e-env-setup
 e2e-env-setup:
 	./hack/e2e-test-setup.sh
@@ -108,3 +137,15 @@ local-deploy: docker
 .PHONY: e2e-test
 e2e-test:
 	./hack/e2e-test.sh "${E2E_TYPE}" "${KUBE_CONF}"
+
+.PHONY: e2e-mig-test
+e2e-mig-test:
+	./hack/e2e-mig-test.sh "${KUBE_CONF}"
+
+.PHONY: e2e-mig-smoke-test
+e2e-mig-smoke-test:
+	./hack/e2e-mig-smoke-test.sh "${KUBE_CONF}"
+
+.PHONY: e2e-policy-test
+e2e-policy-test:
+	HAMI_E2E_REQUIRE_POLICY_TOPOLOGY=true bash ./hack/e2e-policy-test.sh "${KUBE_CONF}"

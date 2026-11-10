@@ -17,44 +17,383 @@ limitations under the License.
 package main
 
 import (
+	"context"
+	"fmt"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
+	"gotest.tools/v3/assert"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	corelisters "k8s.io/client-go/listers/core/v1"
 
 	"github.com/Project-HAMi/HAMi/pkg/monitor/nvidia"
 )
 
-type stubInfo struct{ priority int }
+// emptyPodLister satisfies ContainerLister.Update's pod listing for tests that
+// build a zero-value lister.
+type emptyPodLister struct{}
 
-func (s *stubInfo) DeviceMax() int                     { return 1 }
-func (s *stubInfo) DeviceNum() int                     { return 0 }
-func (s *stubInfo) DeviceUUID(int) string              { return "gpu-0" }
-func (s *stubInfo) DeviceMemoryContextSize(int) uint64 { return 0 }
-func (s *stubInfo) DeviceMemoryModuleSize(int) uint64  { return 0 }
-func (s *stubInfo) DeviceMemoryBufferSize(int) uint64  { return 0 }
-func (s *stubInfo) DeviceMemoryOffset(int) uint64      { return 0 }
-func (s *stubInfo) DeviceMemoryTotal(int) uint64       { return 0 }
-func (s *stubInfo) DeviceSmUtil(int) uint64            { return 0 }
-func (s *stubInfo) SetDeviceSmLimit(uint64)            {}
-func (s *stubInfo) IsValidUUID(int) bool               { return true }
-func (s *stubInfo) DeviceMemoryLimit(int) uint64       { return 0 }
-func (s *stubInfo) SetDeviceMemoryLimit(uint64)        {}
-func (s *stubInfo) LastKernelTime() int64              { return 0 }
-func (s *stubInfo) GetPriority() int                   { return s.priority }
-func (s *stubInfo) GetRecentKernel() int32             { return 1 }
-func (s *stubInfo) SetRecentKernel(int32)              {}
-func (s *stubInfo) GetUtilizationSwitch() int32        { return 0 }
-func (s *stubInfo) SetUtilizationSwitch(int32)         {}
+func (emptyPodLister) List(labels.Selector) ([]*corev1.Pod, error) { return nil, nil }
+func (emptyPodLister) Pods(string) corelisters.PodNamespaceLister  { return nil }
+
+// stubDeviceMax mirrors the production Spec.DeviceMax, which reports the constant
+// maxDevices (16) rather than the live device count.
+const stubDeviceMax = 16
+
+// stubInfo mocks nvidia.UsageInfo. The container's real device UUIDs occupy the
+// leading slots of a fixed-size table; DeviceMax still reports the constant slot
+// count and the trailing slots read back invalid, so the check functions walk the
+// same 16 slots they do in production.
+type stubInfo struct {
+	priority   int
+	uuids      []string
+	total      []uint64
+	limit      []uint64
+	ctxSize    []uint64
+	modSize    []uint64
+	bufSize    []uint64
+	smUtil     []uint64
+	lastKernel int64
+	// recentKernel and utilSwitch back the feedback fields Observe reads and
+	// writes, so a test can drive a full Observe pass.
+	recentKernel int32
+	utilSwitch   int32
+}
+
+func slot(v []uint64, i int) uint64 {
+	if i >= 0 && i < len(v) {
+		return v[i]
+	}
+	return 0
+}
+
+func (s *stubInfo) DeviceMax() int { return stubDeviceMax }
+func (s *stubInfo) DeviceNum() int { return len(s.uuids) }
+func (s *stubInfo) DeviceUUID(i int) string {
+	if i < len(s.uuids) {
+		return s.uuids[i]
+	}
+	return ""
+}
+func (s *stubInfo) DeviceMemoryContextSize(i int) uint64 { return slot(s.ctxSize, i) }
+func (s *stubInfo) DeviceMemoryModuleSize(i int) uint64  { return slot(s.modSize, i) }
+func (s *stubInfo) DeviceMemoryBufferSize(i int) uint64  { return slot(s.bufSize, i) }
+func (s *stubInfo) DeviceMemoryOffset(int) uint64        { return 0 }
+func (s *stubInfo) DeviceMemoryTotal(i int) uint64       { return slot(s.total, i) }
+func (s *stubInfo) DeviceSmUtil(i int) uint64            { return slot(s.smUtil, i) }
+func (s *stubInfo) SetDeviceSmLimit(uint64)              {}
+func (s *stubInfo) IsValidUUID(i int) bool {
+	return i >= 0 && i < len(s.uuids) && len(s.uuids[i]) > 0 && s.uuids[i][0] != 0
+}
+func (s *stubInfo) DeviceMemoryLimit(i int) uint64 { return slot(s.limit, i) }
+func (s *stubInfo) SetDeviceMemoryLimit(uint64)    {}
+func (s *stubInfo) LastKernelTime() int64          { return s.lastKernel }
+func (s *stubInfo) GetPriority() int               { return s.priority }
+func (s *stubInfo) GetRecentKernel() int32         { return s.recentKernel }
+func (s *stubInfo) SetRecentKernel(v int32)        { s.recentKernel = v }
+func (s *stubInfo) GetUtilizationSwitch() int32    { return s.utilSwitch }
+func (s *stubInfo) SetUtilizationSwitch(v int32)   { s.utilSwitch = v }
 
 func TestCheckFunctionsHighPriority(t *testing.T) {
-	sw := map[string]UtilizationPerDevice{"gpu-0": {0, 1}}
-	c := &nvidia.ContainerUsage{Info: &stubInfo{priority: 3}}
+	sw := map[string]UtilizationPerDevice{"gpu-0": {0: 0, 1: 1}}
+	c := &nvidia.ContainerUsage{Info: &stubInfo{priority: 3, uuids: []string{"gpu-0"}}}
 	if !CheckBlocking(sw, 3, c) {
 		t.Error("CheckBlocking: expected true")
 	}
 	if !CheckPriority(sw, 3, c) {
 		t.Error("CheckPriority: expected true")
 	}
-	sw2 := map[string]UtilizationPerDevice{"gpu-0": {0, 0}}
+	sw2 := map[string]UtilizationPerDevice{"gpu-0": {0: 0, 1: 0}}
 	if CheckBlocking(sw2, 2, c) {
 		t.Error("CheckBlocking: expected false")
+	}
+}
+
+// TestCheckBlocking_MultiDevice verifies that CheckBlocking inspects every device
+// the container uses, not just the first one that appears in the switch map. The
+// cases cover several device counts, all-clear, contention isolated to the last
+// device, and UUIDs missing from the switch map. In every case contention (when
+// present) sits at an index below the priority, so CheckPriority agrees and is
+// asserted for parity.
+func TestCheckBlocking_MultiDevice(t *testing.T) {
+	tests := []struct {
+		name     string
+		priority int
+		uuids    []string
+		sw       map[string]UtilizationPerDevice
+		want     bool
+	}{
+		{
+			name:     "two devices, contention on the second",
+			priority: 1,
+			uuids:    []string{"gpu-0", "gpu-1"},
+			sw:       map[string]UtilizationPerDevice{"gpu-0": {0: 0, 1: 0}, "gpu-1": {0: 1, 1: 0}},
+			want:     true,
+		},
+		{
+			name:     "three devices, all clear",
+			priority: 1,
+			uuids:    []string{"gpu-0", "gpu-1", "gpu-2"},
+			sw:       map[string]UtilizationPerDevice{"gpu-0": {0: 0, 1: 0}, "gpu-1": {0: 0, 1: 0}, "gpu-2": {0: 0, 1: 0}},
+			want:     false,
+		},
+		{
+			name:     "four devices, contention only on the last",
+			priority: 1,
+			uuids:    []string{"gpu-0", "gpu-1", "gpu-2", "gpu-3"},
+			sw:       map[string]UtilizationPerDevice{"gpu-0": {0: 0, 1: 0}, "gpu-1": {0: 0, 1: 0}, "gpu-2": {0: 0, 1: 0}, "gpu-3": {0: 1, 1: 0}},
+			want:     true,
+		},
+		{
+			name:     "some device UUIDs missing from switch map, present one contended",
+			priority: 1,
+			uuids:    []string{"gpu-0", "gpu-1", "gpu-2"},
+			sw:       map[string]UtilizationPerDevice{"gpu-1": {0: 1, 1: 0}},
+			want:     true,
+		},
+		{
+			name:     "none of the container UUIDs are in the switch map",
+			priority: 1,
+			uuids:    []string{"gpu-0", "gpu-1"},
+			sw:       map[string]UtilizationPerDevice{"gpu-9": {0: 1, 1: 0}},
+			want:     false,
+		},
+		{
+			name:     "empty switch map",
+			priority: 1,
+			uuids:    []string{"gpu-0", "gpu-1"},
+			sw:       map[string]UtilizationPerDevice{},
+			want:     false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := &nvidia.ContainerUsage{Info: &stubInfo{priority: test.priority, uuids: test.uuids}}
+			if got := CheckBlocking(test.sw, test.priority, c); got != test.want {
+				t.Errorf("CheckBlocking: want %v, got %v", test.want, got)
+			}
+			// The sibling CheckPriority scans all devices too and, for these
+			// inputs, agrees with CheckBlocking.
+			if got := CheckPriority(test.sw, test.priority, c); got != test.want {
+				t.Errorf("CheckPriority: want %v, got %v", test.want, got)
+			}
+		})
+	}
+}
+
+// observeWith runs a full Observe pass over the given containers and reports
+// the blocking and utilization decisions it recorded on each of them.
+func observeWith(t *testing.T, priorities []int) (blocked, throttled []bool) {
+	t.Helper()
+
+	lister := &nvidia.ContainerLister{}
+	containers := map[string]*nvidia.ContainerUsage{}
+	infos := make([]*stubInfo, len(priorities))
+	for i, p := range priorities {
+		// recentKernel 2 survives Observe's decrement, which is what gates the
+		// counting pass.
+		infos[i] = &stubInfo{priority: p, uuids: []string{"gpu-0"}, recentKernel: 2}
+		containers[fmt.Sprintf("pod-%d_ctr", i)] = &nvidia.ContainerUsage{Info: infos[i]}
+	}
+	lister.SetContainersForTest(containers)
+
+	Observe(lister)
+
+	for _, info := range infos {
+		blocked = append(blocked, info.recentKernel < 0)
+		throttled = append(throttled, info.utilSwitch == 1)
+	}
+	return blocked, throttled
+}
+
+// TestObserveKeepsPriorityClassesDistinct pins the contention semantics across
+// more than the two documented priority classes. A container is blocked when a
+// strictly higher priority one shares the device, and throttled when another
+// container shares its own class. Counting by a keyed priority rather than a
+// slice index has to leave both of those unchanged.
+func TestObserveKeepsPriorityClassesDistinct(t *testing.T) {
+	tests := []struct {
+		name          string
+		priorities    []int
+		wantBlocked   []bool
+		wantThrottled []bool
+	}{
+		{
+			name:          "two documented classes",
+			priorities:    []int{0, 1},
+			wantBlocked:   []bool{false, true},
+			wantThrottled: []bool{false, true},
+		},
+		{
+			name:          "a third class stays distinct from the second",
+			priorities:    []int{1, 2},
+			wantBlocked:   []bool{false, true},
+			wantThrottled: []bool{false, true},
+		},
+		{
+			name:          "three classes",
+			priorities:    []int{0, 1, 2},
+			wantBlocked:   []bool{false, true, true},
+			wantThrottled: []bool{false, true, true},
+		},
+		{
+			name:          "same class contends with itself",
+			priorities:    []int{1, 1},
+			wantBlocked:   []bool{false, false},
+			wantThrottled: []bool{true, true},
+		},
+		{
+			name:          "a lone container contends with nobody",
+			priorities:    []int{5},
+			wantBlocked:   []bool{false},
+			wantThrottled: []bool{false},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			blocked, throttled := observeWith(t, test.priorities)
+			assert.DeepEqual(t, blocked, test.wantBlocked)
+			assert.DeepEqual(t, throttled, test.wantThrottled)
+		})
+	}
+}
+
+// TestObserveDoesNotAllocatePerPriorityValue is the regression guard for the
+// original defect. The priority is read from a region the container mounts
+// read-write, so a large value must not size an allocation. Counting it in a
+// slice indexed by priority allocated one entry per unit, which reached
+// gigabytes for a single container.
+func TestObserveDoesNotAllocatePerPriorityValue(t *testing.T) {
+	const hugePriority = 1 << 26 // 512 MiB if one int is allocated per unit
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	blocked, throttled := observeWith(t, []int{hugePriority})
+	runtime.ReadMemStats(&after)
+
+	grewMiB := float64(after.TotalAlloc-before.TotalAlloc) / (1 << 20)
+	if grewMiB > 8 {
+		t.Errorf("Observe allocated %.1f MiB for one container at priority %d", grewMiB, hugePriority)
+	}
+	// The container still has to be accounted for, not skipped.
+	assert.DeepEqual(t, blocked, []bool{false})
+	assert.DeepEqual(t, throttled, []bool{false})
+}
+
+// blockingFeedbackInfo pauses Observe inside either a read or a feedback write.
+type blockingFeedbackInfo struct {
+	*stubInfo
+	blockRead bool
+	entered   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+// pause blocks the selected feedback access until the test releases it.
+func (b *blockingFeedbackInfo) pause() {
+	b.once.Do(func() { close(b.entered); <-b.release })
+}
+
+// GetRecentKernel pauses reads when requested to expose concurrent mapping cleanup.
+func (b *blockingFeedbackInfo) GetRecentKernel() int32 {
+	if b.blockRead {
+		b.pause()
+	}
+	return b.stubInfo.GetRecentKernel()
+}
+
+// SetRecentKernel pauses writes when requested to expose concurrent mapping cleanup.
+func (b *blockingFeedbackInfo) SetRecentKernel(value int32) {
+	if !b.blockRead {
+		b.pause()
+	}
+	b.stubInfo.SetRecentKernel(value)
+}
+
+// TestObserveProtectsUsageUntilReadsAndWritesFinish checks that Update cannot remove mappings
+// during feedback reads or writes.
+func TestObserveProtectsUsageUntilReadsAndWritesFinish(t *testing.T) {
+	for _, blockRead := range []bool{true, false} {
+		t.Run(fmt.Sprintf("blockRead=%v", blockRead), func(t *testing.T) {
+			info := &blockingFeedbackInfo{
+				stubInfo:  &stubInfo{recentKernel: 2, uuids: []string{"gpu-0"}},
+				blockRead: blockRead, entered: make(chan struct{}), release: make(chan struct{}),
+			}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(info.release) }) }
+			defer release()
+			lister := &nvidia.ContainerLister{}
+			lister.SetContainersForTest(map[string]*nvidia.ContainerUsage{"pod_gpu": {Info: info}})
+			lister.SetPodListerForTest(emptyPodLister{})
+			observed := make(chan struct{})
+			go func() { Observe(lister); close(observed) }()
+			select {
+			case <-info.entered:
+			case <-time.After(time.Second):
+				t.Fatal("Observe did not access Info")
+			}
+			started, updated := make(chan struct{}), make(chan error, 1)
+			go func() { close(started); updated <- lister.Update() }()
+			<-started
+			select {
+			case <-updated:
+				release()
+				<-observed
+				t.Fatal("Update removed containers while Observe was still accessing Info")
+			case <-time.After(30 * time.Millisecond):
+			}
+			release()
+			select {
+			case <-observed:
+			case <-time.After(time.Second):
+				t.Fatal("Observe did not finish")
+			}
+			select {
+			case err := <-updated:
+				// The zero-value lister has no root; Update releases its entries.
+				if !os.IsNotExist(err) {
+					t.Fatalf("Update error = %v, want missing root", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Update remained blocked after Observe finished")
+			}
+			lister.Lock()
+			defer lister.UnLock()
+			assert.Equal(t, len(lister.ListContainers()), 0)
+		})
+	}
+}
+
+func TestWatchAndFeedbackStandsByOnLupineServer(t *testing.T) {
+	if nvret := nvml.Init(); nvret == nvml.SUCCESS {
+		_ = nvml.Shutdown()
+		t.Skip("NVML is available, so the standby branch is not distinguished by an init failure")
+	}
+	previousInterval := feedbackInterval
+	feedbackInterval = 15 * time.Millisecond
+	t.Cleanup(func() { feedbackInterval = previousInterval })
+
+	lister := &nvidia.ContainerLister{}
+	onLupine := true
+	lister.SetLupineServerForTest(func(context.Context) (bool, error) { return onLupine, nil })
+	lockAbsent := func() bool { return false }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	if err := watchAndFeedback(ctx, lister, nil, lockAbsent); err != nil {
+		t.Fatalf("lupine server: %v", err)
+	}
+
+	onLupine = false
+	err := watchAndFeedback(context.Background(), lister, nil, lockAbsent)
+	if err == nil || !strings.Contains(err.Error(), "failed to initialize NVML") {
+		t.Fatalf("left the lupine server: got %v, want collection to resume", err)
 	}
 }

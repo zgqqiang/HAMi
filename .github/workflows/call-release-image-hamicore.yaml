@@ -21,11 +21,17 @@ on:
       tagoverride:
         required: false
         type: string
-permissions: write-all
+permissions:
+  contents: read
 
 jobs:
   docker-build:
     runs-on: ubuntu-latest
+    # id-token is needed for keyless cosign signing
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Free disk space
         # https://github.com/actions/virtual-environments/issues/709
@@ -38,15 +44,23 @@ jobs:
           df -h
       - name: Getting Image Ref
         id: ref
+        # inputs reach the script through the environment, not expression
+        # interpolation, so their contents cannot become part of the command
+        env:
+          IN_REF: ${{ inputs.ref }}
+          IN_SUFFIX: ${{ inputs.suffix }}
+          IN_TAGOVERRIDE: ${{ inputs.tagoverride }}
+          DISPATCH_REF: ${{ github.event.inputs.ref }}
+          DISPATCH_SUFFIX: ${{ github.event.inputs.suffix }}
         run: |
           if ${{ inputs.ref != '' }} ; then
               echo "call by workflow_call"
-              image_ref=${{ inputs.ref }}
-              image_suffix=${{ inputs.suffix }}
+              image_ref="$IN_REF"
+              image_suffix="$IN_SUFFIX"
           elif ${{ github.event_name == 'workflow_dispatch' }} ; then
               echo "call by workflow_dispatch"
-              image_ref=${{ github.event.inputs.ref }}
-              image_suffix=${{ github.event.inputs.suffix }}
+              image_ref="$DISPATCH_REF"
+              image_suffix="$DISPATCH_SUFFIX"
           else
               echo "unexpected event: ${{ github.event_name }}"
               exit 1
@@ -54,7 +68,7 @@ jobs:
           echo "ref=${image_ref}" >> $GITHUB_ENV
           [ -n "${image_suffix}" ] && echo "suffix=-${image_suffix}" >> $GITHUB_ENV
           if ${{ inputs.tagoverride != '' }} ; then
-              echo "imagetag=${{ inputs.tagoverride }}" >> $GITHUB_ENV
+              echo "imagetag=${IN_TAGOVERRIDE}" >> $GITHUB_ENV
           else
               # it is invalid if the ref is branch name "xx/xx/xx"
               echo "imagetag=${image_ref##*/}" >> $GITHUB_ENV
@@ -63,13 +77,13 @@ jobs:
   
 
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           ref: ${{ steps.ref.outputs.ref }}
       
       - name: Checkout submodule
-        uses: Mushus/checkout-submodule@v1.0.1
+        uses: Mushus/checkout-submodule@f6a7fddc9798c8f8728b252594243ced3b56e550 # v1.0.1
         with:
           basePath: # optional, default is .
           submodulePath: libvgpu 
@@ -79,27 +93,31 @@ jobs:
           make lint_dockerfile
 
       - name: Docker Login
-        uses: docker/login-action@v4.2.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
             username: ${{ secrets.DOCKERHUB_TOKEN }}
             password: ${{ secrets.DOCKERHUB_PASSWD }}
 
+      - name: Read image pins from version.mk
+        run: grep -E '^(GOLANG|NVIDIA)_IMAGE=' version.mk >> "$GITHUB_ENV"
+
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
         with:
-          driver-opts: image=moby/buildkit:master
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_REPO_HAMICORE }}
 
       - name: Build & Pushing hami-core image
-        uses: docker/build-push-action@v7.2.0
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
             context: .
             file: ${{ env.IMAGE_ROOT_PATH }}/Dockerfile.hamicore
@@ -107,9 +125,19 @@ jobs:
             platforms: ${{ env.BUILD_PLATFORM }}
             build-args: |
               VERSION=${{ env.ref }}
-              GOLANG_IMAGE=golang:1.26.2-bookworm
-              NVIDIA_IMAGE=nvidia/cuda:12.9.1-cudnn-devel-ubuntu20.04
+              GOLANG_IMAGE=${{ env.GOLANG_IMAGE }}
+              NVIDIA_IMAGE=${{ env.NVIDIA_IMAGE }}
               DEST_DIR=/usr/local
             tags: ${{ steps.meta.outputs.tags }}
             push: true
+            provenance: mode=max
+            sbom: true
             github-token: ${{ env.REGISTER_PASSWORD }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Sign hami-core image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${REGISTRY}/${IMAGE_REPO_HAMICORE}@${DIGEST}"

@@ -17,9 +17,9 @@ limitations under the License.
 package mthreads
 
 import (
-	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -46,29 +46,101 @@ const (
 	// MthreadsNoUseUUID annotation specifies a comma-separated list of Mthreads UUIDs to exclude.
 	MthreadsNoUseUUID        = "mthreads.ai/nouse-gpuuuid"
 	MthreadsAssignedGPUIndex = "mthreads.com/gpu-index"
+	// MthreadsWholeGPUResource is the vendor whole-card resource advertised
+	// by the Moore Threads device plugin for GPUs NOT carved into sGPU
+	// slices. Requests for it are delivered by the vendor stack directly
+	// (outside HAMi scheduling) and must not be mixed with slice requests.
+	MthreadsWholeGPUResource = "mthreads.com/gpu"
 	MthreadsAssignedNode     = "mthreads.com/predicate-node"
 	MthreadsPredicateTime    = "mthreads.com/predicate-time"
 	coresPerMthreadsGPU      = 16
-	memoryPerMthreadsGPU     = 96
+	// defaultMemoryPerMthreadsGPU is the memory units per card for the MTT
+	// S4000 (96 x 512MiB = 48GiB). It seeds the accepted-request set when no
+	// card models are configured; other cards (e.g. S5000 with 80GiB = 160
+	// units) are declared via device-config `mthreads.memoryPerCard`.
+	defaultMemoryPerMthreadsGPU = 96
+	// MemoryFactor converts the vmemory unit used in the pod spec into the MiB
+	// HAMi accounts internally. One mthreads vmemory unit is 512 MiB.
+	MemoryFactor = 512
 )
 
 var (
 	MthreadsResourceCount  string
 	MthreadsResourceMemory string
 	MthreadsResourceCores  string
-	legalMemoryslices      = []int64{2, 4, 8, 16, 32, 64, 96}
+	legalMemoryslices      = buildLegalMemorySlices(defaultMemoryPerMthreadsGPU)
 )
+
+// buildLegalMemorySlices returns the valid per-slice memory unit requests:
+// powers of two starting at 2, always ending with the full-card capacity.
+// For 96 this yields [2 4 8 16 32 64 96], matching the historical list.
+// The doubling stops before it could overflow int64, so absurd capacities
+// cannot hang scheduler initialization.
+func buildLegalMemorySlices(memoryPerCard int64) []int64 {
+	if memoryPerCard < 2 {
+		return []int64{memoryPerCard}
+	}
+	out := make([]int64, 0, 12)
+	for v := int64(2); v < memoryPerCard; v *= 2 {
+		out = append(out, v)
+		if v > math.MaxInt64/2 {
+			break // doubling again would overflow
+		}
+	}
+	out = append(out, memoryPerCard)
+	return out
+}
+
+// buildLegalMemorySliceUnion returns the sorted, deduplicated union of the
+// valid per-slice memory requests across every configured card capacity.
+// Admission runs before a node is chosen, so on a mixed S4000/S5000 cluster a
+// request must be accepted if it is valid on any of the card models present;
+// the scheduler then enforces the real per-card size of the node it selects.
+func buildLegalMemorySliceUnion(capacities []int64) []int64 {
+	seen := map[int64]bool{}
+	out := []int64{}
+	for _, capacity := range capacities {
+		if capacity <= 0 {
+			continue
+		}
+		for _, v := range buildLegalMemorySlices(capacity) {
+			if !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return buildLegalMemorySlices(defaultMemoryPerMthreadsGPU)
+	}
+	slices.Sort(out)
+	return out
+}
 
 type MthreadsConfig struct {
 	ResourceCountName  string `yaml:"resourceCountName"`
 	ResourceMemoryName string `yaml:"resourceMemoryName"`
 	ResourceCoreName   string `yaml:"resourceCoreName"`
+	// MemoryPerCard lists the per-card memory capacities (in 512MiB units) of
+	// the card models present in the cluster, e.g. [96, 160] for a mixed
+	// S4000/S5000 fleet. It only affects which explicit sgpu-memory requests
+	// admission accepts; pods that omit memory get the selected node's real
+	// per-card size from the scheduler. Defaults to [96] (MTT S4000, 48GiB)
+	// when unset.
+	MemoryPerCard []int64 `yaml:"memoryPerCard"`
 }
 
 func InitMthreadsDevice(config MthreadsConfig) *MthreadsDevices {
 	MthreadsResourceCount = config.ResourceCountName
 	MthreadsResourceCores = config.ResourceCoreName
 	MthreadsResourceMemory = config.ResourceMemoryName
+	// Rebuild from the configured capacities on every call so re-initialization
+	// with an unset MemoryPerCard does not inherit a previous override.
+	capacities := config.MemoryPerCard
+	if len(capacities) == 0 {
+		capacities = []int64{defaultMemoryPerMthreadsGPU}
+	}
+	legalMemoryslices = buildLegalMemorySliceUnion(capacities)
 	_, ok := device.InRequestDevices[MthreadsGPUDevice]
 	if !ok {
 		device.InRequestDevices[MthreadsGPUDevice] = "hami.io/mthreads-vgpu-devices-to-allocate"
@@ -88,50 +160,136 @@ func ParseConfig(fs *flag.FlagSet) {
 }
 
 func (dev *MthreadsDevices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) (bool, error) {
+	// Reject pods that mix whole-card and slice delivery: the whole-card
+	// resource is allocated by the vendor device plugin outside HAMi's
+	// accounting, so combining both would silently overcommit the node.
+	// The check aggregates Limits and Requests: splitting whole-card and
+	// slice resources across the two lists must not bypass it.
+	contains := func(rl corev1.ResourceList, names ...string) bool {
+		if rl == nil {
+			return false
+		}
+		for _, n := range names {
+			if _, ok := rl[corev1.ResourceName(n)]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	hasWhole := contains(ctr.Resources.Limits, MthreadsWholeGPUResource) || contains(ctr.Resources.Requests, MthreadsWholeGPUResource)
+	hasSlice := contains(ctr.Resources.Limits, MthreadsResourceCount, MthreadsResourceMemory, MthreadsResourceCores) ||
+		contains(ctr.Resources.Requests, MthreadsResourceCount, MthreadsResourceMemory, MthreadsResourceCores)
+	if hasWhole && hasSlice {
+		return true, fmt.Errorf("cannot mix %s (whole card, delivered outside HAMi) with %s/%s/%s (sGPU slices) in the same container",
+			MthreadsWholeGPUResource, MthreadsResourceCount, MthreadsResourceMemory, MthreadsResourceCores)
+	}
 	count, ok := ctr.Resources.Limits[corev1.ResourceName(MthreadsResourceCount)]
+	if !ok {
+		count, ok = ctr.Resources.Requests[corev1.ResourceName(MthreadsResourceCount)]
+	}
 	if ok {
+		if count.Value() <= 0 {
+			return false, fmt.Errorf("%s must be greater than 0", MthreadsResourceCount)
+		}
+		if ctr.Resources.Limits == nil {
+			ctr.Resources.Limits = corev1.ResourceList{}
+		}
 		if count.Value() > 1 {
-			ctr.Resources.Limits[corev1.ResourceName(MthreadsResourceCores)] = *resource.NewQuantity(count.Value()*int64(coresPerMthreadsGPU), resource.DecimalSI)
-			ctr.Resources.Limits[corev1.ResourceName(MthreadsResourceMemory)] = *resource.NewQuantity(count.Value()*int64(memoryPerMthreadsGPU), resource.DecimalSI)
+			// Pin every requested slice to a full card's cores, but leave memory
+			// unset so the scheduler derives it from the selected node's real
+			// per-card capacity. Injecting a fixed unit count here would be
+			// wrong on a node whose card differs from the configured default.
+			ctr.Resources.Limits[corev1.ResourceName(MthreadsResourceCores)] = *resource.NewQuantity(count.Value()*coresPerMthreadsGPU, resource.DecimalSI)
+			if p.Annotations == nil {
+				p.Annotations = make(map[string]string)
+			}
 			p.Annotations["mthreads.com/request-gpu-num"] = fmt.Sprint(count.Value())
 			return ok, nil
 		}
 		mem, memok := ctr.Resources.Limits[corev1.ResourceName(MthreadsResourceMemory)]
 		if !memok {
-			ctr.Resources.Limits[corev1.ResourceName(MthreadsResourceCores)] = *resource.NewQuantity(count.Value()*int64(coresPerMthreadsGPU), resource.DecimalSI)
-			ctr.Resources.Limits[corev1.ResourceName(MthreadsResourceMemory)] = *resource.NewQuantity(count.Value()*int64(memoryPerMthreadsGPU), resource.DecimalSI)
+			ctr.Resources.Limits[corev1.ResourceName(MthreadsResourceCores)] = *resource.NewQuantity(count.Value()*coresPerMthreadsGPU, resource.DecimalSI)
 		} else {
 			memnum, _ := mem.AsInt64()
 			found := slices.Contains(legalMemoryslices, memnum)
 			if !found {
-				return true, errors.New("sGPU memory request value is invalid, valid values are [1, 2, 4, 8, 16, 32, 64, 96]")
+				return true, fmt.Errorf("sGPU memory request value is invalid, valid values are %v", legalMemoryslices)
 			}
 		}
 	}
 	return ok, nil
 }
 
+// SGPUCoresLabel is written by the vendor toolkit/GFD on nodes with
+// sgpu-enabled cards and lists the physical card ids that are sliced,
+// e.g. "0-2-3" for cards 0, 2 and 3.
+const SGPUCoresLabel = "mthreads.com/sgpu.cores"
+
+// parseSGPUCoresLabel parses the vendor card-id list label. Accepts '-'
+// or ',' separators, deduplicates and drops unparsable or out-of-range
+// entries while preserving the first-seen order. Ids are parsed as unsigned
+// 32-bit values, so the result fits DeviceInfo.Index (a uint) with no
+// sign-changing or narrowing conversion.
+func parseSGPUCoresLabel(raw string) []uint {
+	seen := map[uint]bool{}
+	var ids []uint
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == '-' || r == ',' }) {
+		parsed, err := strconv.ParseUint(strings.TrimSpace(part), 10, 32)
+		if err != nil {
+			continue
+		}
+		id := uint(parsed)
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func (dev *MthreadsDevices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo, error) {
 	nodedevices := []*device.DeviceInfo{}
-	i := 0
 	cores, ok := n.Status.Capacity.Name(corev1.ResourceName(MthreadsResourceCores), resource.DecimalSI).AsInt64()
 	if !ok || cores == 0 {
 		return []*device.DeviceInfo{}, fmt.Errorf("device not found %s", MthreadsResourceCores)
 	}
 	memoryTotal, _ := n.Status.Capacity.Name(corev1.ResourceName(MthreadsResourceMemory), resource.DecimalSI).AsInt64()
-	for int64(i)*coresPerMthreadsGPU < cores {
+
+	// Prefer the vendor label listing the physical card ids: with a
+	// non-contiguous sgpu_km binding (gpu_ids=0,2,3) the card numbers are
+	// NOT 0..N-1, and the scheduler-selected card index is consumed by the
+	// vendor stack as a physical card id. Synthesizing 0..N-1 would make
+	// HAMi bind containers to the wrong physical card.
+	var cardIDs []uint
+	if raw := n.Labels[SGPUCoresLabel]; raw != "" {
+		// Label path: strict — a listed card set whose capacity does not
+		// add up is a config contradiction worth surfacing.
+		cardIDs = parseSGPUCoresLabel(raw)
+		if int64(len(cardIDs))*coresPerMthreadsGPU != cores {
+			return []*device.DeviceInfo{}, fmt.Errorf("sgpu capacity mismatch on %s: %s=%d units is not %d x %d per card (label %s=%q)",
+				n.Name, MthreadsResourceCores, cores, len(cardIDs), coresPerMthreadsGPU, SGPUCoresLabel, raw)
+		}
+	} else {
+		// Fallback: contiguous derivation (upstream behavior).
+		for i := uint(0); int64(i)*coresPerMthreadsGPU < cores; i++ {
+			cardIDs = append(cardIDs, i)
+		}
+	}
+	devmemPerCard := memoryTotal * MemoryFactor * coresPerMthreadsGPU / cores
+
+	for _, cardID := range cardIDs {
 		nodedevices = append(nodedevices, &device.DeviceInfo{
-			Index:        uint(i),
-			ID:           n.Name + "-mthreads-" + fmt.Sprint(i),
+			Index:        cardID,
+			ID:           n.Name + "-mthreads-" + strconv.FormatUint(uint64(cardID), 10),
 			Count:        100,
-			Devmem:       int32(memoryTotal * 512 * coresPerMthreadsGPU / cores),
+			Devmem:       devmemPerCard,
 			Devcore:      coresPerMthreadsGPU,
 			Type:         MthreadsGPUDevice,
 			Numa:         0,
 			Health:       true,
 			DeviceVendor: MthreadsGPUCommonWord,
 		})
-		i++
 	}
 	return nodedevices, nil
 }
@@ -180,10 +338,28 @@ func (dev *MthreadsDevices) checkType(annos map[string]string, d device.DeviceUs
 }
 
 func (dev *MthreadsDevices) CheckHealth(devType string, n *corev1.Node) (bool, bool) {
-	return true, true
+	if n == nil {
+		return false, false
+	}
+	// Cards are derived from the core resource, which is what the plugin publishes.
+	coreQty := n.Status.Allocatable[corev1.ResourceName(MthreadsResourceCores)]
+	memQty := n.Status.Capacity[corev1.ResourceName(MthreadsResourceMemory)]
+	capacityQty := n.Status.Capacity[corev1.ResourceName(MthreadsResourceCores)]
+	cores := coreQty.Value()
+	mem := memQty.Value()
+	capacityCores := capacityQty.Value()
+	cards := int64(0)
+	if cores > 0 {
+		cards = (cores + coresPerMthreadsGPU - 1) / coresPerMthreadsGPU
+	}
+	label := ""
+	if n.Labels != nil {
+		label = n.Labels[SGPUCoresLabel]
+	}
+	return device.AllocatableHealth(devType, n.Name, cores, cards, fmt.Sprintf("%s\n%d\n%d", label, mem, capacityCores))
 }
 
-func (dev *MthreadsDevices) GenerateResourceRequests(ctr *corev1.Container) device.ContainerDeviceRequest {
+func (dev *MthreadsDevices) GenerateResourceRequests(ctr *corev1.Container) (device.ContainerDeviceRequest, error) {
 	klog.Info("Start to count mthreads devices for container ", ctr.Name)
 	mthreadsResourceCount := corev1.ResourceName(MthreadsResourceCount)
 	mthreadsResourceMem := corev1.ResourceName(MthreadsResourceMemory)
@@ -197,31 +373,68 @@ func (dev *MthreadsDevices) GenerateResourceRequests(ctr *corev1.Container) devi
 			klog.InfoS("Detected mthreads device request",
 				"container", ctr.Name,
 				"deviceCount", n)
+			if n == 0 {
+				// An explicit zero count means no device is requested,
+				// not an invalid request. See the nvidia backend.
+				return device.ContainerDeviceRequest{}, nil
+			}
+			if n < 0 {
+				return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "mthreads", Reason: fmt.Sprintf("device count %d is out of range", n)}
+			}
 			memnum := 0
 			mem, ok := ctr.Resources.Limits[mthreadsResourceMem]
 			if !ok {
 				mem, ok = ctr.Resources.Requests[mthreadsResourceMem]
 			}
 			if ok {
-				memnums, ok := mem.AsInt64()
-				if ok {
-					memnum = int(memnums) * 512
-					klog.InfoS("Memory allocation calculated",
-						"container", ctr.Name,
-						"requestedMem", memnums,
-						"allocatedMem", memnum)
+				memnums, parsed := mem.AsInt64()
+				if !parsed || memnums < 0 || memnums > math.MaxInt64/int64(MemoryFactor) {
+					klog.ErrorS(nil, "mthreads memory request is not a non-negative integer or overflows after applying the memory factor",
+						"container", ctr.Name)
+					return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "mthreads", Reason: fmt.Sprintf("memory request %s is not a non-negative integer or overflows after applying the memory factor", mem.String())}
 				}
+				memnum = int(memnums) * MemoryFactor
+				klog.InfoS("Memory allocation calculated",
+					"container", ctr.Name,
+					"requestedMem", memnums,
+					"allocatedMem", memnum)
 			}
-			corenum := int32(0)
+			corenum := int64(0)
 			core, ok := ctr.Resources.Limits[mthreadsResourceCores]
 			if !ok {
 				core, ok = ctr.Resources.Requests[mthreadsResourceCores]
 			}
 			if ok {
 				corenums, ok := core.AsInt64()
-				if ok {
-					corenum = int32(corenums)
+				if !ok || corenums < 0 {
+					klog.ErrorS(nil, "mthreads core request is not a non-negative integer", "container", ctr.Name, "request", core.String())
+					return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "mthreads", Reason: fmt.Sprintf("core request %s is not a non-negative integer", core.String())}
 				}
+				// Coresreq is a per card value. With more than one device the
+				// limit held here is always a total across the cards, never a
+				// per card value, because MutateAdmission overwrites the core
+				// limit with count*coresPerMthreadsGPU (16) whenever count > 1.
+				// So the total is divided back unconditionally.
+				//
+				// This deliberately does not copy the iluvatar backend's
+				// "corenums > 100 && n > 1" gate. That gate works there because
+				// iluvatar writes count*100, so every multi card total exceeds
+				// 100. Here a total is count*16, which for 2 to 6 cards is 32 to
+				// 96, all at or below 100, so gating on > 100 would leave those
+				// totals undivided and report 16 times too many cores per card.
+				// The per card limit is still enforced, just after the division.
+				if n > 1 {
+					if corenums%n != 0 {
+						klog.ErrorS(nil, "mthreads core request does not divide evenly across the requested devices", "container", ctr.Name, "request", core.String(), "devices", n)
+						return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "mthreads", Reason: fmt.Sprintf("core request %d does not divide evenly across %d devices", corenums, n)}
+					}
+					corenums /= n
+				}
+				if corenums > 100 {
+					klog.ErrorS(nil, "mthreads core request exceeds the per card limit", "container", ctr.Name, "request", core.String())
+					return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "mthreads", Reason: fmt.Sprintf("core request %d exceeds the per card limit of 100", corenums)}
+				}
+				corenum = corenums
 			}
 
 			mempnum := 0
@@ -230,15 +443,21 @@ func (dev *MthreadsDevices) GenerateResourceRequests(ctr *corev1.Container) devi
 			}
 
 			return device.ContainerDeviceRequest{
-				Nums:             int32(n),
+				Nums:             n,
 				Type:             MthreadsGPUDevice,
-				Memreq:           int32(memnum) / int32(n),
-				MemPercentagereq: int32(mempnum),
-				Coresreq:         corenum / int32(n),
-			}
+				Memreq:           int64(memnum) / n,
+				MemPercentagereq: int64(mempnum),
+				Coresreq:         corenum,
+			}, nil
 		}
+		// A quantity the apiserver accepts as an integer can still be too
+		// large for int64 (1Ei, 1e19). Falling through would report the
+		// container as device-less, which is the fail-open this change
+		// exists to remove.
+		klog.ErrorS(nil, "mthreads device count request is not a plain integer", "container", ctr.Name, "request", v.String())
+		return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "mthreads", Reason: fmt.Sprintf("device count %s is not a plain integer", v.String())}
 	}
-	return device.ContainerDeviceRequest{}
+	return device.ContainerDeviceRequest{}, nil
 }
 
 func (dev *MthreadsDevices) customFilterRule(allocated *device.PodDevices, request device.ContainerDeviceRequest, toAllocate device.ContainerDevices, device *device.DeviceUsage) bool {
@@ -272,10 +491,19 @@ func (mth *MthreadsDevices) Fit(devices []*device.DeviceUsage, request device.Co
 	var tmpDevs map[string]device.ContainerDevices
 	tmpDevs = make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
+	if k.Coresreq > 100 || k.Coresreq < 0 {
+		klog.ErrorS(nil, "core limit out of range (must be 0-100)", "pod", klog.KObj(pod), "coresreq", k.Coresreq)
+		return false, tmpDevs, "core limit out of range"
+	}
+	isMutex := util.PolicyContains(util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod), util.GPUSchedulerPolicyMutex)
 	for i, v := range slices.Backward(devices) {
 		dev := v
 		klog.V(4).InfoS("scoring pod", "pod", klog.KObj(pod), "device", dev.ID, "Memreq", k.Memreq, "MemPercentagereq", k.MemPercentagereq, "Coresreq", k.Coresreq, "Nums", k.Nums, "device index", i)
-
+		if !dev.Health {
+			reason[common.CardNotHealth]++
+			klog.V(5).InfoS(common.CardNotHealth, "pod", klog.KObj(pod), "device", dev.ID, "health", dev.Health)
+			continue
+		}
 		klog.V(3).InfoS("Type check", "device", dev.Type, "req", k.Type)
 		if !strings.Contains(dev.Type, k.Type) {
 			reason[common.CardTypeMismatch]++
@@ -290,7 +518,7 @@ func (mth *MthreadsDevices) Fit(devices []*device.DeviceUsage, request device.Co
 		}
 		if numa && prevnuma != dev.Numa {
 			if k.Nums != originReq {
-				reason[common.NumaNotFit] += len(tmpDevs)
+				reason[common.NumaNotFit] += len(tmpDevs[k.Type])
 				klog.V(5).InfoS(common.NumaNotFit, "pod", klog.KObj(pod), "device", dev.ID, "k.nums", k.Nums, "numa", numa, "prevnuma", prevnuma, "device numa", dev.Numa)
 			}
 			k.Nums = originReq
@@ -303,16 +531,16 @@ func (mth *MthreadsDevices) Fit(devices []*device.DeviceUsage, request device.Co
 			continue
 		}
 
-		memreq := int32(0)
+		memreq := int64(0)
 		if dev.Count <= dev.Used {
 			reason[common.CardTimeSlicingExhausted]++
 			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used)
 			continue
 		}
-		if k.Coresreq > 100 {
-			klog.ErrorS(nil, "core limit can't exceed 100", "pod", klog.KObj(pod), "device", dev.ID)
-			k.Coresreq = 100
-			//return false, tmpDevs
+		if isMutex && dev.Used > 0 {
+			reason[common.ExclusiveDeviceAllocateConflict]++
+			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used)
+			continue
 		}
 		if k.Memreq > 0 {
 			memreq = k.Memreq
@@ -366,9 +594,9 @@ func (mth *MthreadsDevices) Fit(devices []*device.DeviceUsage, request device.Co
 			return true, tmpDevs, ""
 		}
 	}
-	if len(tmpDevs) > 0 {
-		reason[common.AllocatedCardsInsufficientRequest] = len(tmpDevs)
-		klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(tmpDevs))
+	if len(tmpDevs[k.Type]) > 0 {
+		reason[common.AllocatedCardsInsufficientRequest] = len(tmpDevs[k.Type])
+		klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(tmpDevs[k.Type]))
 	}
 	return false, tmpDevs, common.GenReason(reason, len(devices))
 }
@@ -378,5 +606,6 @@ func (dev *MthreadsDevices) GetResourceNames() device.ResourceNames {
 		ResourceCountName:  MthreadsResourceCount,
 		ResourceMemoryName: MthreadsResourceMemory,
 		ResourceCoreName:   MthreadsResourceCores,
+		MemoryFactor:       MemoryFactor,
 	}
 }

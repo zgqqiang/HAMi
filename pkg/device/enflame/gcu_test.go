@@ -379,7 +379,7 @@ func TestGCUDevices_GenerateResourceRequests(t *testing.T) {
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(3),
+				Nums:             int64(3),
 				Type:             EnflameGCUDevice,
 				Memreq:           100,
 				MemPercentagereq: 100,
@@ -397,7 +397,7 @@ func TestGCUDevices_GenerateResourceRequests(t *testing.T) {
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(2),
+				Nums:             int64(2),
 				Type:             EnflameGCUDevice,
 				Memreq:           100,
 				MemPercentagereq: 100,
@@ -424,7 +424,7 @@ func TestGCUDevices_GenerateResourceRequests(t *testing.T) {
 			}
 			InitGCUDevice(config)
 			dev := &GCUDevices{}
-			result := dev.GenerateResourceRequests(test.args)
+			result, _ := dev.GenerateResourceRequests(test.args)
 			assert.DeepEqual(t, result, test.want)
 		})
 	}
@@ -573,6 +573,77 @@ func TestGCUDevices_Fit(t *testing.T) {
 			wantDevIDs: []string{"dev-0"},
 			wantReason: "1/1 AllocatedCardsInsufficientRequest",
 		},
+		{
+			name: "fit fail: partial allocation AllocatedCardsInsufficientRequest for multiple cards",
+			devices: []*device.DeviceUsage{
+				{
+					ID:        "dev-0",
+					Index:     0,
+					Used:      0,
+					Count:     1,
+					Usedmem:   0,
+					Totalmem:  100,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      EnflameGCUDevice,
+					Health:    true,
+				},
+				{
+					ID:        "dev-1",
+					Index:     1,
+					Used:      0,
+					Count:     1,
+					Usedmem:   0,
+					Totalmem:  100,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      EnflameGCUDevice,
+					Health:    true,
+				},
+			},
+			request: device.ContainerDeviceRequest{
+				Nums:             3,
+				Memreq:           100,
+				MemPercentagereq: 100,
+				Coresreq:         100,
+				Type:             EnflameGCUDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    2,
+			wantDevIDs: []string{},
+			wantReason: "2/2 AllocatedCardsInsufficientRequest",
+		},
+		{
+			name: "fit fail: CardNotHealth",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     1,
+				Usedmem:   0,
+				Totalmem:  100,
+				Totalcore: 100,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      EnflameGCUDevice,
+				Health:    false,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Memreq:           100,
+				MemPercentagereq: 100,
+				Coresreq:         100,
+				Type:             EnflameGCUDevice,
+			},
+			annos:      map[string]string{},
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardNotHealth",
+		},
 	}
 
 	for _, test := range tests {
@@ -587,10 +658,10 @@ func TestGCUDevices_Fit(t *testing.T) {
 			if fit != test.wantFit {
 				t.Errorf("Fit: got %v, want %v", fit, test.wantFit)
 			}
+			if len(result[EnflameGCUDevice]) != test.wantLen {
+				t.Errorf("expected len: %d, got len %d", test.wantLen, len(result[EnflameGCUDevice]))
+			}
 			if test.wantFit {
-				if len(result[EnflameGCUDevice]) != test.wantLen {
-					t.Errorf("expected len: %d, got len %d", test.wantLen, len(result[EnflameGCUDevice]))
-				}
 				for idx, id := range test.wantDevIDs {
 					if id != result[EnflameGCUDevice][idx].UUID {
 						t.Errorf("expected device id: %s, got device id %s", id, result[EnflameGCUDevice][idx].UUID)
@@ -655,4 +726,33 @@ func TestGCUDevices_AddResourceUsage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGCUDevices_GenerateResourceRequests_CountRange(t *testing.T) {
+	dev := GCUDevices{}
+	for _, count := range []string{"-1"} {
+		ctr := &corev1.Container{
+			Resources: corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceName(EnflameResourceNameGCU): resource.MustParse(count),
+				},
+			},
+		}
+		result, err := dev.GenerateResourceRequests(ctr)
+		assert.DeepEqual(t, device.ContainerDeviceRequest{}, result)
+		assert.ErrorContains(t, err, "out of range")
+	}
+
+	// A count of zero says "no device", so the container is device-less
+	// rather than invalid and must not be rejected.
+	zero := &corev1.Container{
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				corev1.ResourceName(EnflameResourceNameGCU): resource.MustParse("0"),
+			},
+		},
+	}
+	zeroResult, err := dev.GenerateResourceRequests(zero)
+	assert.NilError(t, err)
+	assert.DeepEqual(t, device.ContainerDeviceRequest{}, zeroResult)
 }

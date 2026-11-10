@@ -17,11 +17,14 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,13 +34,18 @@ import (
 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
 	"github.com/fsnotify/fsnotify"
 	cli "github.com/urfave/cli/v2"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	errorsutil "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	kubeletdevicepluginv1beta1 "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 
 	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/info"
+	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/nodepodinformer"
 	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/plugin"
 	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/rm"
+	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/vgpucache"
 	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/watch"
 	"github.com/Project-HAMi/HAMi/pkg/util"
 	"github.com/Project-HAMi/HAMi/pkg/util/client"
@@ -49,6 +57,25 @@ type options struct {
 	configFile    string
 	kubeletSocket string
 }
+
+const (
+	autoNvidiaDriverRoot         = "auto"
+	hostNvidiaDriverRoot         = "/"
+	defaultVGPUCacheRoot         = "/usr/local/vgpu/containers"
+	defaultVGPUCacheScanInterval = 5 * time.Second
+	defaultVGPUCacheGracePeriod  = 5 * time.Minute
+	vgpuCacheRootEnvName         = "HAMI_VGPU_CACHE_ROOT"
+	vgpuCacheGracePeriodEnvName  = "HAMI_VGPU_CACHE_GRACE_PERIOD"
+	gpuOperatorNvidiaDriverRoot  = "/run/nvidia/driver"
+	toolkitContainerDriverRoot   = "/"
+)
+
+var (
+	gpuOperatorDriverReadyFile = "/run/nvidia/validations/driver-ready"
+	// hostContainerRoot is where the chart mounts the host root when a CDI
+	// device list strategy is used with an auto-detected driver root.
+	hostContainerRoot = "/host"
+)
 
 func main() {
 	c := cli.NewApp()
@@ -259,9 +286,27 @@ func loadConfig(c *cli.Context, flags []cli.Flag) (*spec.Config, error) {
 	return config, nil
 }
 
-func start(c *cli.Context, o *options) error {
+// start owns the process lifecycle, including Pod synchronization, cache GC, and plugin
+// restarts.
+func start(c *cli.Context, o *options) (resultErr error) {
 	util.NodeName = os.Getenv(util.NodeNameEnvName)
 	client.InitGlobalClient()
+	processCtx, cancelProcess := context.WithCancel(c.Context)
+	defer cancelProcess()
+
+	nodePods, err := nodepodinformer.New(client.GetClient(), util.NodeName)
+	if err != nil {
+		return fmt.Errorf("create device-plugin node Pod informer: %w", err)
+	}
+	listLiveNodePods := func() ([]*corev1.Pod, error) { return nodePods.ListFresh(processCtx) }
+	cacheConfig := resolveVGPUCacheConfig()
+	cacheConfig.OnAbandoned = startVGPUCacheEvents(processCtx, client.GetClient(), util.NodeName)
+	cacheManager, err := vgpucache.New(cacheConfig, nodePods.List, listLiveNodePods)
+	if err != nil {
+		return fmt.Errorf("create vGPU cache manager: %w", err)
+	}
+	nodePods.Start(processCtx)
+	go cacheManager.Run(processCtx)
 
 	kubeletSocketDir := filepath.Dir(o.kubeletSocket)
 	klog.Infof("Starting FS watcher for %v", kubeletSocketDir)
@@ -270,6 +315,23 @@ func start(c *cli.Context, o *options) error {
 		return fmt.Errorf("failed to create FS watcher for %s: %v", kubeletdevicepluginv1beta1.DevicePluginPath, err)
 	}
 	defer watcher.Close()
+
+	hostPIDBroker, err := startHostPIDBroker()
+	if err != nil {
+		return fmt.Errorf("failed to start host PID broker: %w", err)
+	}
+	var hostPIDBrokerDone <-chan struct{}
+	hostPIDBrokerFailureReported := false
+	if hostPIDBroker != nil {
+		hostPIDBrokerDone = hostPIDBroker.done
+		defer func() {
+			stopErr := hostPIDBroker.stop()
+			if !hostPIDBrokerFailureReported {
+				stopErr = errors.Join(stopErr, hostPIDBroker.serveErr)
+			}
+			resultErr = errors.Join(resultErr, stopErr)
+		}()
+	}
 
 	/*Loading config files*/
 	klog.Infof("Start working on node %s", util.NodeName)
@@ -289,7 +351,7 @@ restart:
 	}
 
 	klog.Info("Starting Plugins.")
-	plugins, restartPlugins, err := startPlugins(c, o)
+	plugins, restartPlugins, err := startPlugins(processCtx, c, o, hostPIDBroker, nodePods.List, listLiveNodePods, nodePods.WaitForSync, cacheManager.Prepare)
 	if err != nil {
 		return fmt.Errorf("error starting plugins: %v", err)
 	}
@@ -304,6 +366,11 @@ restart:
 	// some messages, trigger a restart of the plugins, or exit the program.
 	for {
 		select {
+		case <-hostPIDBrokerDone:
+			hostPIDBrokerFailureReported = true
+			resultErr = hostPIDBroker.failure()
+			goto exit
+
 		// If the restart timeout has expired, then restart the plugins
 		case <-restartTimeout:
 			goto restart
@@ -336,19 +403,61 @@ restart:
 		}
 	}
 exit:
-	err = stopPlugins(plugins)
-	if err != nil {
-		return fmt.Errorf("error stopping plugins: %v", err)
+	if err := stopPlugins(plugins); err != nil {
+		resultErr = errors.Join(resultErr,
+			fmt.Errorf("error stopping plugins: %v", err))
 	}
-	return nil
+	return resultErr
 }
 
-func startPlugins(c *cli.Context, o *options) ([]plugin.Interface, bool, error) {
+// resolveVGPUCacheConfig resolves the shared cache root and GC grace period from the deployment
+// environment.
+func resolveVGPUCacheConfig() vgpucache.Config {
+	root := os.Getenv(vgpuCacheRootEnvName)
+	if root == "" {
+		hookPath := os.Getenv("HOOK_PATH")
+		if hookPath == "" {
+			root = defaultVGPUCacheRoot
+		} else {
+			root = filepath.Join(hookPath, "vgpu", "containers")
+		}
+	}
+
+	gracePeriod := defaultVGPUCacheGracePeriod
+	if raw := os.Getenv(vgpuCacheGracePeriodEnvName); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil {
+			klog.Warningf("Invalid %s value %q, using default %v", vgpuCacheGracePeriodEnvName, raw, gracePeriod)
+		} else {
+			gracePeriod = parsed
+		}
+	}
+	return vgpucache.Config{
+		Root:         root,
+		ScanInterval: defaultVGPUCacheScanInterval,
+		GracePeriod:  gracePeriod,
+	}
+}
+
+// startPlugins builds and starts plugins with process-scoped Pod and cache callbacks, reporting
+// whether startup should retry.
+func startPlugins(
+	processCtx context.Context,
+	c *cli.Context,
+	o *options,
+	hostPIDBroker *runningHostPIDBroker,
+	listNodePods, listLiveNodePods func() ([]*corev1.Pod, error),
+	waitForNodePodSync func(context.Context) error,
+	prepareVGPUCache func(string, string) (string, error),
+) ([]plugin.Interface, bool, error) {
 	// Load the configuration file
 	klog.Info("Loading configuration.")
 	config, err := loadConfig(c, o.flags)
 	if err != nil {
 		return nil, false, fmt.Errorf("unable to load config: %v", err)
+	}
+	if err := resolveNvidiaDriverRoot(config); err != nil {
+		return nil, false, fmt.Errorf("unable to resolve NVIDIA driver root: %v", err)
 	}
 	disableResourceRenamingInConfig(config)
 
@@ -393,27 +502,18 @@ func startPlugins(c *cli.Context, o *options) ([]plugin.Interface, bool, error) 
 
 	// Get the set of plugins.
 	klog.Info("Retrieving plugins.")
-	plugins, err := GetPlugins(c.Context, infolib, nvmllib, devicelib, &devConfig)
+	plugins, err := GetPlugins(processCtx, infolib, nvmllib, devicelib, &devConfig, listNodePods, listLiveNodePods, waitForNodePodSync, prepareVGPUCache)
 	if err != nil {
 		return nil, false, fmt.Errorf("error getting plugins: %v", err)
 	}
 
-	// Loop through all plugins, starting them if they have any devices
-	// to serve. If even one plugin fails to start properly, try
-	// starting them all again.
-	started := 0
-	for _, p := range plugins {
-		// Just continue if there are no devices to serve for plugin p.
-		if len(p.Devices()) == 0 {
-			continue
-		}
-
-		// Start the gRPC server for plugin p and connect it with the kubelet.
-		if err := p.Start(o.kubeletSocket); err != nil {
-			klog.Errorf("Failed to start plugin: %v", err)
-			return plugins, true, nil
-		}
-		started++
+	started, restartPlugins, err := startPluginServers(plugins,
+		o.kubeletSocket, hostPIDBroker)
+	if err != nil {
+		return nil, false, err
+	}
+	if restartPlugins {
+		return plugins, true, nil
 	}
 
 	if started == 0 {
@@ -421,6 +521,158 @@ func startPlugins(c *cli.Context, o *options) ([]plugin.Interface, bool, error) 
 	}
 
 	return plugins, false, nil
+}
+
+// resolveNvidiaDriverRoot resolves the special "auto" driver root from the
+// contract written by the GPU Operator validator. If the contract does not
+// exist, no GPU Operator installation is assumed and host driver roots are
+// used. An explicitly configured NVIDIA_DEV_ROOT is always preserved.
+func resolveNvidiaDriverRoot(config *spec.Config) error {
+	if config.Flags.NvidiaDriverRoot == nil || *config.Flags.NvidiaDriverRoot != autoNvidiaDriverRoot {
+		return nil
+	}
+
+	driverRoot, devRoot, err := readGPUOperatorDriverRoots(gpuOperatorDriverReadyFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		driverRoot = hostNvidiaDriverRoot
+		devRoot = hostNvidiaDriverRoot
+		klog.InfoS("GPU Operator driver-ready contract not found; using host NVIDIA driver roots",
+			"path", gpuOperatorDriverReadyFile,
+			"driverRoot", driverRoot,
+			"devRoot", devRoot)
+	} else {
+		klog.InfoS("Automatically resolved NVIDIA driver roots from GPU Operator",
+			"path", gpuOperatorDriverReadyFile,
+			"driverRoot", driverRoot,
+			"devRoot", devRoot)
+	}
+
+	containerDriverRoot, err := autoContainerDriverRoot(config, driverRoot)
+	if err != nil {
+		return err
+	}
+
+	// Assign distinct pointers because the NVIDIA configuration loader makes
+	// NvidiaDevRoot point to NvidiaDriverRoot when no dev root is specified.
+	config.Flags.NvidiaDriverRoot = &driverRoot
+	config.Flags.Plugin.ContainerDriverRoot = &containerDriverRoot
+	if config.Flags.NvidiaDevRoot != nil && *config.Flags.NvidiaDevRoot == autoNvidiaDriverRoot {
+		config.Flags.NvidiaDevRoot = &devRoot
+	}
+	klog.InfoS("Selected container NVIDIA driver root", "containerDriverRoot", containerDriverRoot)
+	return nil
+}
+
+// autoContainerDriverRoot returns where the plugin reads the NVIDIA driver
+// inside its own container. Host-side roots only describe what is returned to
+// the runtime, so they do not require the host filesystem to be mounted:
+// NVML initialization and GPU discovery use the driver injected into this
+// container by the NVIDIA Container Toolkit. Only CDI spec generation needs to
+// walk the host driver layout, because library paths inside the container may
+// not match the host (for example /usr/lib64 versus /usr/lib/x86_64-linux-gnu).
+func autoContainerDriverRoot(config *spec.Config, driverRoot string) (string, error) {
+	cdiEnabled, err := anyCDIEnabled(config)
+	if err != nil {
+		return "", err
+	}
+	if !cdiEnabled {
+		return toolkitContainerDriverRoot, nil
+	}
+
+	var containerDriverRoot string
+	cleaned := filepath.Clean(driverRoot)
+	switch cleaned {
+	case hostNvidiaDriverRoot:
+		containerDriverRoot = hostContainerRoot
+	case gpuOperatorNvidiaDriverRoot:
+		// GPU Operator's driver root is under the host root, so reuse the
+		// single host-root mount and append the host path as a suffix.
+		containerDriverRoot = filepath.Join(hostContainerRoot, strings.TrimPrefix(cleaned, "/"))
+	default:
+		return "", fmt.Errorf("unsupported auto-detected NVIDIA driver root %q", driverRoot)
+	}
+	if _, err := os.Stat(hostContainerRoot); err != nil {
+		return "", fmt.Errorf("CDI device list strategies with an auto-detected NVIDIA driver root require the host root to be mounted at %s: %w", hostContainerRoot, err)
+	}
+	return containerDriverRoot, nil
+}
+
+func anyCDIEnabled(config *spec.Config) (bool, error) {
+	if config.Flags.Plugin == nil || config.Flags.Plugin.DeviceListStrategy == nil {
+		return false, nil
+	}
+	strategies, err := spec.NewDeviceListStrategies(*config.Flags.Plugin.DeviceListStrategy)
+	if err != nil {
+		return false, fmt.Errorf("invalid device list strategy: %w", err)
+	}
+	return strategies.AnyCDIEnabled(), nil
+}
+
+func readGPUOperatorDriverRoots(path string) (string, string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", err
+	}
+
+	values := make(map[string]string)
+	for lineNumber, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || key == "" || value == "" {
+			return "", "", fmt.Errorf("invalid GPU Operator driver-ready entry at line %d", lineNumber+1)
+		}
+		values[key] = value
+	}
+
+	driverRoot, ok := values["NVIDIA_DRIVER_ROOT"]
+	if !ok {
+		return "", "", fmt.Errorf("GPU Operator driver-ready contract is missing NVIDIA_DRIVER_ROOT")
+	}
+	devRoot, ok := values["NVIDIA_DEV_ROOT"]
+	if !ok {
+		return "", "", fmt.Errorf("GPU Operator driver-ready contract is missing NVIDIA_DEV_ROOT")
+	}
+	if !filepath.IsAbs(driverRoot) || !filepath.IsAbs(devRoot) {
+		return "", "", fmt.Errorf("GPU Operator driver roots must be absolute: driverRoot=%q devRoot=%q", driverRoot, devRoot)
+	}
+
+	return filepath.Clean(driverRoot), filepath.Clean(devRoot), nil
+}
+
+func startPluginServers(plugins []plugin.Interface, kubeletSocket string,
+	hostPIDBroker *runningHostPIDBroker) (int, bool, error) {
+	started := 0
+	startedPlugins := make([]plugin.Interface, 0, len(plugins))
+	for _, p := range plugins {
+		// Just continue if there are no devices to serve for plugin p.
+		if len(p.Devices()) == 0 {
+			continue
+		}
+
+		if err := hostPIDBroker.failure(); err != nil {
+			return started, false,
+				errors.Join(err, stopPlugins(startedPlugins))
+		}
+
+		// Start the gRPC server for plugin p and connect it with the kubelet.
+		if err := p.Start(kubeletSocket); err != nil {
+			klog.Errorf("Failed to start plugin: %v", err)
+			return started, true, nil
+		}
+		startedPlugins = append(startedPlugins, p)
+		if err := hostPIDBroker.failure(); err != nil {
+			return started, false,
+				errors.Join(err, stopPlugins(startedPlugins))
+		}
+		started++
+	}
+	return started, false, nil
 }
 
 func stopPlugins(plugins []plugin.Interface) error {
@@ -468,5 +720,54 @@ func disableResourceRenamingInConfig(config *spec.Config) {
 	}
 	if setsDevices {
 		klog.Warning("Customizing the 'devices' field in sharing.timeSlicing.resources is not yet supported in the config. Ignoring...")
+	}
+}
+
+// startVGPUCacheEvents queues one warning per abandoned directory. A bounded
+// worker issues no LISTs, limits reports to one per five seconds, and does not
+// retry failed notifications: the cleanup decision and Error log remain valid.
+func startVGPUCacheEvents(ctx context.Context, kubeClient kubernetes.Interface, nodeName string) func(string, int, error) {
+	messages := make(chan string, 16)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case message := <-messages:
+				if ctx.Err() != nil {
+					return
+				}
+				reportCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				node, err := kubeClient.CoreV1().Nodes().Get(reportCtx, nodeName, metav1.GetOptions{})
+				if err == nil {
+					now := metav1.Now()
+					_, err = kubeClient.CoreV1().Events(corev1.NamespaceDefault).Create(reportCtx, &corev1.Event{
+						ObjectMeta:     metav1.ObjectMeta{GenerateName: "vgpu-cache-cleanup-", Namespace: corev1.NamespaceDefault},
+						InvolvedObject: corev1.ObjectReference{APIVersion: "v1", Kind: "Node", Name: node.Name, UID: node.UID},
+						Type:           corev1.EventTypeWarning, Reason: "VGPUCacheCleanupAbandoned", Message: message,
+						Source:         corev1.EventSource{Component: "hami-device-plugin", Host: nodeName},
+						FirstTimestamp: now, LastTimestamp: now, Count: 1,
+					}, metav1.CreateOptions{})
+				}
+				cancel()
+				if err != nil {
+					klog.ErrorS(err, "Failed to report abandoned vGPU cache cleanup", "node", nodeName, "message", message)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+				}
+			}
+		}
+	}()
+	return func(path string, attempts int, err error) {
+		message := fmt.Sprintf("Stopped cleaning %s after %d deletion failures: %v. Remove it manually or restart the device plugin after fixing the cause.", path, attempts, err)
+		select {
+		case <-ctx.Done():
+		case messages <- message:
+		default:
+			klog.ErrorS(nil, "vGPU cache warning queue is full; notification dropped", "message", message)
+		}
 	}
 }

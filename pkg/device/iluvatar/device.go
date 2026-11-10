@@ -20,6 +20,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
@@ -32,6 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 )
+
+// MemoryFactor converts the vmemory unit used in the pod spec into the MiB
+// HAMi accounts internally. One iluvatar vmemory unit is 256 MiB.
+const MemoryFactor = 256
 
 var (
 	enableIluvatar bool
@@ -149,14 +154,7 @@ func (dev *IluvatarDevices) PatchAnnotations(pod *corev1.Pod, annoinput *map[str
 }
 
 func (dev *IluvatarDevices) LockNode(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 
@@ -164,14 +162,7 @@ func (dev *IluvatarDevices) LockNode(n *corev1.Node, p *corev1.Pod) error {
 }
 
 func (dev *IluvatarDevices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 
@@ -179,7 +170,7 @@ func (dev *IluvatarDevices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error
 }
 
 func (dev *IluvatarDevices) NodeCleanUp(nn string) error {
-	return nil
+	return util.MarkAnnotationsToDelete(dev.handshakeAnno, nn)
 }
 
 func (dev *IluvatarDevices) checkType(annos map[string]string, d device.DeviceUsage, n device.ContainerDeviceRequest) (bool, bool, bool) {
@@ -190,10 +181,34 @@ func (dev *IluvatarDevices) checkType(annos map[string]string, d device.DeviceUs
 }
 
 func (dev *IluvatarDevices) CheckHealth(devType string, n *corev1.Node) (bool, bool) {
-	return device.CheckHealth(devType, dev.GetResourceNames().ResourceCountName, n)
+	if n == nil {
+		return false, false
+	}
+	device.RemoveObsoleteHandshake(devType, n)
+	memQty := n.Status.Allocatable[corev1.ResourceName(dev.config.ResourceMemoryName)]
+	coreQty := n.Status.Allocatable[corev1.ResourceName(dev.config.ResourceCoreName)]
+	mem := memQty.Value()
+	core := coreQty.Value()
+	signal := int64(0)
+	if mem > 0 || core > 0 {
+		signal = 1
+	}
+	anno := ""
+	if n.Annotations != nil {
+		anno = n.Annotations[dev.nodeRegisterAnno]
+	}
+	return device.AllocatableHealth(devType, n.Name, signal, iluvatarAnnotationDevices(anno), anno)
 }
 
-func (dev *IluvatarDevices) GenerateResourceRequests(ctr *corev1.Container) device.ContainerDeviceRequest {
+func iluvatarAnnotationDevices(raw string) int64 {
+	devices, err := device.DecodeNodeDevices(raw)
+	if err != nil {
+		return 0
+	}
+	return int64(len(devices))
+}
+
+func (dev *IluvatarDevices) GenerateResourceRequests(ctr *corev1.Container) (device.ContainerDeviceRequest, error) {
 	klog.Info("Start to count iluvatar devices for container ", ctr.Name)
 	iluvatarResourceCount := corev1.ResourceName(dev.config.ResourceCountName)
 	iluvatarResourceMem := corev1.ResourceName(dev.config.ResourceMemoryName)
@@ -204,6 +219,15 @@ func (dev *IluvatarDevices) GenerateResourceRequests(ctr *corev1.Container) devi
 	}
 	if ok {
 		if n, ok := v.AsInt64(); ok {
+			if n == 0 {
+				// An explicit zero count means no device is requested,
+				// not an invalid request. See the nvidia backend.
+				return device.ContainerDeviceRequest{}, nil
+			}
+			if n < 0 {
+				klog.ErrorS(nil, "iluvatar device count request is out of range", "container", ctr.Name, "request", n)
+				return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "iluvatar", Reason: fmt.Sprintf("device count %d is out of range", n)}
+			}
 			klog.Info("Found iluvatar devices")
 			memnum := 0
 			mem, ok := ctr.Resources.Limits[iluvatarResourceMem]
@@ -211,21 +235,47 @@ func (dev *IluvatarDevices) GenerateResourceRequests(ctr *corev1.Container) devi
 				mem, ok = ctr.Resources.Requests[iluvatarResourceMem]
 			}
 			if ok {
-				memnums, ok := mem.AsInt64()
-				if ok {
-					memnum = int(memnums) * 256
+				memnums, parsed := mem.AsInt64()
+				if !parsed || memnums < 0 || memnums > math.MaxInt64/int64(MemoryFactor) {
+					klog.ErrorS(nil, "iluvatar memory request is not a non-negative integer or overflows after applying the memory factor",
+						"container", ctr.Name)
+					return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "iluvatar", Reason: fmt.Sprintf("memory request %s is not a non-negative integer or overflows after applying the memory factor", mem.String())}
 				}
+				memnum = int(memnums) * MemoryFactor
 			}
-			corenum := int32(0)
+			corenum := int64(0)
 			core, ok := ctr.Resources.Limits[iluvatarResourceCores]
 			if !ok {
 				core, ok = ctr.Resources.Requests[iluvatarResourceCores]
 			}
 			if ok {
 				corenums, ok := core.AsInt64()
-				if ok {
-					corenum = int32(corenums)
+				if !ok || corenums < 0 {
+					klog.ErrorS(nil, "iluvatar core request is not a non-negative integer", "container", ctr.Name, "request", core.String())
+					return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "iluvatar", Reason: fmt.Sprintf("core request %s is not a non-negative integer", core.String())}
 				}
+				// Coresreq is a per card percentage, but MutateAdmission rewrites
+				// the limit to count*100 only when more than one device is
+				// requested, so a value above 100 with multiple devices is a
+				// total across the cards and has to be divided back. A value at
+				// or below 100 is already per card, and a value above 100 with a
+				// single requested device is plain invalid because
+				// MutateAdmission never writes one.
+				if corenums > 100 && n > 1 {
+					if corenums%n != 0 {
+						klog.ErrorS(nil, "iluvatar core request does not divide evenly across the requested devices", "container", ctr.Name, "request", core.String(), "devices", n)
+						return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "iluvatar", Reason: fmt.Sprintf("core request %d does not divide evenly across %d devices", corenums, n)}
+					}
+					corenums /= n
+				}
+				// Re-check after the division: a total that divides evenly can
+				// still leave a per card value above 100, and a value above 100
+				// with a single device never entered the branch above.
+				if corenums > 100 {
+					klog.ErrorS(nil, "iluvatar core request exceeds the per card limit", "container", ctr.Name, "request", core.String())
+					return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "iluvatar", Reason: fmt.Sprintf("core request %d exceeds the per card limit of 100", corenums)}
+				}
+				corenum = corenums
 			}
 
 			mempnum := 0
@@ -234,15 +284,21 @@ func (dev *IluvatarDevices) GenerateResourceRequests(ctr *corev1.Container) devi
 			}
 
 			return device.ContainerDeviceRequest{
-				Nums:             int32(n),
+				Nums:             n,
 				Type:             dev.config.CommonWord,
-				Memreq:           int32(memnum),
-				MemPercentagereq: int32(mempnum),
+				Memreq:           int64(memnum),
+				MemPercentagereq: int64(mempnum),
 				Coresreq:         corenum,
-			}
+			}, nil
 		}
+		// A quantity the apiserver accepts as an integer can still be too
+		// large for int64 (1Ei, 1e19). Falling through would report the
+		// container as device-less, which is the fail-open this change
+		// exists to remove.
+		klog.ErrorS(nil, "iluvatar device count request is not a plain integer", "container", ctr.Name, "request", v.String())
+		return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "iluvatar", Reason: fmt.Sprintf("device count %s is not a plain integer", v.String())}
 	}
-	return device.ContainerDeviceRequest{}
+	return device.ContainerDeviceRequest{}, nil
 }
 
 func (dev *IluvatarDevices) ScoreNode(node *corev1.Node, podDevices device.PodSingleDevice, previous []*device.DeviceUsage, policy string) float32 {
@@ -264,10 +320,19 @@ func (ilu *IluvatarDevices) Fit(devices []*device.DeviceUsage, request device.Co
 	var tmpDevs map[string]device.ContainerDevices
 	tmpDevs = make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
+	if k.Coresreq > 100 || k.Coresreq < 0 {
+		klog.ErrorS(nil, "core limit out of range (must be 0-100)", "pod", klog.KObj(pod), "coresreq", k.Coresreq)
+		return false, tmpDevs, "core limit out of range"
+	}
+	isMutex := util.PolicyContains(util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod), util.GPUSchedulerPolicyMutex)
 	for i, v := range slices.Backward(devices) {
 		dev := v
 		klog.V(4).InfoS("scoring pod", "pod", klog.KObj(pod), "device", dev.ID, "Memreq", k.Memreq, "MemPercentagereq", k.MemPercentagereq, "Coresreq", k.Coresreq, "Nums", k.Nums, "device index", i)
-
+		if !dev.Health {
+			reason[common.CardNotHealth]++
+			klog.V(5).InfoS(common.CardNotHealth, "pod", klog.KObj(pod), "device", dev.ID, "health", dev.Health)
+			continue
+		}
 		_, found, numa := ilu.checkType(pod.GetAnnotations(), *dev, k)
 		if !found {
 			reason[common.CardTypeMismatch]++
@@ -276,7 +341,7 @@ func (ilu *IluvatarDevices) Fit(devices []*device.DeviceUsage, request device.Co
 		}
 		if numa && prevnuma != dev.Numa {
 			if k.Nums != originReq {
-				reason[common.NumaNotFit] += len(tmpDevs)
+				reason[common.NumaNotFit] += len(tmpDevs[k.Type])
 				klog.V(5).InfoS(common.NumaNotFit, "pod", klog.KObj(pod), "device", dev.ID, "k.nums", k.Nums, "numa", numa, "prevnuma", prevnuma, "device numa", dev.Numa)
 			}
 			k.Nums = originReq
@@ -289,16 +354,16 @@ func (ilu *IluvatarDevices) Fit(devices []*device.DeviceUsage, request device.Co
 			continue
 		}
 
-		memreq := int32(0)
+		memreq := int64(0)
 		if dev.Count <= dev.Used {
 			reason[common.CardTimeSlicingExhausted]++
 			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used)
 			continue
 		}
-		if k.Coresreq > 100 {
-			klog.ErrorS(nil, "core limit can't exceed 100", "pod", klog.KObj(pod), "device", dev.ID)
-			k.Coresreq = 100
-			//return false, tmpDevs
+		if isMutex && dev.Used > 0 {
+			reason[common.ExclusiveDeviceAllocateConflict]++
+			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used)
+			continue
 		}
 		if k.Memreq > 0 {
 			memreq = k.Memreq
@@ -346,9 +411,9 @@ func (ilu *IluvatarDevices) Fit(devices []*device.DeviceUsage, request device.Co
 		}
 
 	}
-	if len(tmpDevs) > 0 {
-		reason[common.AllocatedCardsInsufficientRequest] = len(tmpDevs)
-		klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(tmpDevs))
+	if len(tmpDevs[k.Type]) > 0 {
+		reason[common.AllocatedCardsInsufficientRequest] = len(tmpDevs[k.Type])
+		klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(tmpDevs[k.Type]))
 	}
 	return false, tmpDevs, common.GenReason(reason, len(devices))
 }
@@ -358,5 +423,6 @@ func (dev *IluvatarDevices) GetResourceNames() device.ResourceNames {
 		ResourceCountName:  dev.config.ResourceCountName,
 		ResourceMemoryName: dev.config.ResourceMemoryName,
 		ResourceCoreName:   dev.config.ResourceCoreName,
+		MemoryFactor:       MemoryFactor,
 	}
 }

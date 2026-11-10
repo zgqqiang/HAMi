@@ -1,4 +1,4 @@
-name: Call Release webiste
+name: Call Release website
 
 on:
   workflow_call:
@@ -6,7 +6,8 @@ on:
       ref:
         required: true
         type: string
-permissions: write-all
+permissions:
+  contents: read
 
 jobs:
   build-website:

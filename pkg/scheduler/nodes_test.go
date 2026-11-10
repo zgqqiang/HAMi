@@ -18,6 +18,7 @@ package scheduler
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
@@ -92,9 +93,9 @@ func Test_addNode_ListNodes(t *testing.T) {
 					Devices: map[string][]device.DeviceInfo{
 						"vendor1": {{
 							ID:      "node-02",
-							Count:   int32(1),
-							Devcore: int32(1),
-							Devmem:  int32(2000),
+							Count:   int64(1),
+							Devcore: int64(1),
+							Devmem:  int64(2000),
 						}},
 					},
 				},
@@ -106,9 +107,9 @@ func Test_addNode_ListNodes(t *testing.T) {
 					Devices: map[string][]device.DeviceInfo{
 						"vendor1": {{
 							ID:      "GPU-0",
-							Count:   int32(1),
-							Devcore: int32(1),
-							Devmem:  int32(2000),
+							Count:   int64(1),
+							Devcore: int64(1),
+							Devmem:  int64(2000),
 						}},
 					},
 				},
@@ -118,9 +119,9 @@ func Test_addNode_ListNodes(t *testing.T) {
 					Devices: map[string][]device.DeviceInfo{
 						"vendor1": {{
 							ID:      "node-02",
-							Count:   int32(1),
-							Devcore: int32(1),
-							Devmem:  int32(2000),
+							Count:   int64(1),
+							Devcore: int64(1),
+							Devmem:  int64(2000),
 						}},
 					},
 				},
@@ -139,9 +140,9 @@ func Test_addNode_ListNodes(t *testing.T) {
 						Devices: map[string][]device.DeviceInfo{
 							"vendor1": {{
 								ID:      "GPU-0",
-								Count:   int32(1),
-								Devcore: int32(1),
-								Devmem:  int32(2000),
+								Count:   int64(1),
+								Devcore: int64(1),
+								Devmem:  int64(2000),
 							}},
 						},
 					},
@@ -180,9 +181,9 @@ func Test_GetNode(t *testing.T) {
 				Devices: map[string][]device.DeviceInfo{
 					"vendor1": {{
 						ID:      "GPU-0",
-						Count:   int32(1),
-						Devcore: int32(1),
-						Devmem:  int32(2000),
+						Count:   int64(1),
+						Devcore: int64(1),
+						Devmem:  int64(2000),
 					}},
 				},
 			},
@@ -199,9 +200,9 @@ func Test_GetNode(t *testing.T) {
 						Devices: map[string][]device.DeviceInfo{
 							"vendor1": {{
 								ID:      "GPU-0",
-								Count:   int32(1),
-								Devcore: int32(1),
-								Devmem:  int32(2000),
+								Count:   int64(1),
+								Devcore: int64(1),
+								Devmem:  int64(2000),
 							}},
 						},
 					},
@@ -213,6 +214,40 @@ func Test_GetNode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetNodesReturnsOnlyRequestedDeepCopies(t *testing.T) {
+	m := newNodeManager()
+	for _, name := range []string{"node-1", "node-2", "node-3"} {
+		m.addNode(name, &device.NodeInfo{
+			ID:   name,
+			Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}},
+			Devices: map[string][]device.DeviceInfo{
+				"vendor": {{ID: name + "-device"}},
+			},
+		})
+	}
+	m.mutex.Lock()
+	m.nodes["nil-node-info"] = nil
+	m.mutex.Unlock()
+
+	got := m.GetNodes([]string{"node-2", "nil-node-info", "missing"})
+	assert.Equal(t, 2, len(got))
+	_, found := got["node-1"]
+	assert.Assert(t, !found, "unrequested node must not be returned")
+	_, found = got["node-3"]
+	assert.Assert(t, !found, "unrequested node must not be returned")
+	_, found = got["missing"]
+	assert.Assert(t, !found, "unregistered node must not be returned")
+	assert.Assert(t, got["nil-node-info"] == nil, "nil cache entries must be retained")
+
+	got["node-2"].Node.Labels = map[string]string{"copied": "true"}
+	got["node-2"].Devices["vendor"][0].ID = "changed"
+
+	stored, err := m.GetNode("node-2")
+	assert.NilError(t, err)
+	assert.Assert(t, stored.Node.Labels == nil, "node must be deep copied")
+	assert.Equal(t, "node-2-device", stored.Devices["vendor"][0].ID)
 }
 
 func TestNodeUsageDeepCopy(t *testing.T) {
@@ -237,6 +272,38 @@ func TestNodeUsageDeepCopy(t *testing.T) {
 				Node: &corev1.Node{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "test-node",
+					},
+				},
+				NodeInfo: &device.NodeInfo{
+					ID: "test-node",
+					Node: &corev1.Node{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "test-node-info",
+						},
+					},
+					Devices: map[string][]device.DeviceInfo{
+						"NVIDIA": {{
+							ID:      "GPU-info-0",
+							Count:   10,
+							Devmem:  8192,
+							Devcore: 100,
+							Type:    "NVIDIA-A100",
+							Mode:    "mig",
+							MIGTemplate: []device.Geometry{
+								{
+									{Name: "1g.5gb", Core: 14, Memory: 5120, Count: 1},
+								},
+							},
+							CustomInfo: map[string]any{
+								"profile": "gold",
+							},
+							DevicePairScore: device.DevicePairScore{
+								ID: "GPU-info-0",
+								Scores: map[string]int{
+									"GPU-info-1": 42,
+								},
+							},
+						}},
 					},
 				},
 				Devices: policy.DeviceUsageList{
@@ -294,6 +361,24 @@ func TestNodeUsageDeepCopy(t *testing.T) {
 				copy.Devices.DeviceLists[0].Device.ID = "mutated-gpu"
 				assert.Equal(t, tt.original.Devices.DeviceLists[0].Score, originalScore)
 				assert.Equal(t, tt.original.Devices.DeviceLists[0].Device.ID, originalDeviceID)
+			}
+			if copy.NodeInfo != nil {
+				if copy.NodeInfo.Node != nil {
+					originalNodeInfoName := tt.original.NodeInfo.Node.Name
+					copy.NodeInfo.Node.Name = "mutated-node-info"
+					assert.Equal(t, tt.original.NodeInfo.Node.Name, originalNodeInfoName)
+				}
+				if len(copy.NodeInfo.Devices["NVIDIA"]) > 0 {
+					originalTemplateName := tt.original.NodeInfo.Devices["NVIDIA"][0].MIGTemplate[0][0].Name
+					originalCustomInfo := tt.original.NodeInfo.Devices["NVIDIA"][0].CustomInfo["profile"]
+					originalPairScore := tt.original.NodeInfo.Devices["NVIDIA"][0].DevicePairScore.Scores["GPU-info-1"]
+					copy.NodeInfo.Devices["NVIDIA"][0].MIGTemplate[0][0].Name = "mutated-template"
+					copy.NodeInfo.Devices["NVIDIA"][0].CustomInfo["profile"] = "silver"
+					copy.NodeInfo.Devices["NVIDIA"][0].DevicePairScore.Scores["GPU-info-1"] = 7
+					assert.Equal(t, tt.original.NodeInfo.Devices["NVIDIA"][0].MIGTemplate[0][0].Name, originalTemplateName)
+					assert.Equal(t, tt.original.NodeInfo.Devices["NVIDIA"][0].CustomInfo["profile"], originalCustomInfo)
+					assert.Equal(t, tt.original.NodeInfo.Devices["NVIDIA"][0].DevicePairScore.Scores["GPU-info-1"], originalPairScore)
+				}
 			}
 		})
 	}
@@ -357,9 +442,9 @@ func Test_rmNodeDevices(t *testing.T) {
 						Devices: map[string][]device.DeviceInfo{
 							"NVIDIA": {{
 								ID:           "GPU-0",
-								Count:        int32(1),
-								Devcore:      int32(1),
-								Devmem:       int32(2000),
+								Count:        int64(1),
+								Devcore:      int64(1),
+								Devmem:       int64(2000),
 								DeviceVendor: "NVIDIA",
 							}},
 						},
@@ -375,9 +460,9 @@ func Test_rmNodeDevices(t *testing.T) {
 						Devices: map[string][]device.DeviceInfo{
 							"test1": {{
 								ID:           "GPU-0",
-								Count:        int32(1),
-								Devcore:      int32(1),
-								Devmem:       int32(2000),
+								Count:        int64(1),
+								Devcore:      int64(1),
+								Devmem:       int64(2000),
 								DeviceVendor: "test",
 							}},
 						},
@@ -388,16 +473,16 @@ func Test_rmNodeDevices(t *testing.T) {
 						Devices: map[string][]device.DeviceInfo{
 							"NVIDIA": {{
 								ID:           "GPU-0",
-								Count:        int32(1),
-								Devcore:      int32(1),
-								Devmem:       int32(2000),
+								Count:        int64(1),
+								Devcore:      int64(1),
+								Devmem:       int64(2000),
 								DeviceVendor: "NVIDIA",
 							},
 								{
 									ID:           "GPU-0",
-									Count:        int32(1),
-									Devcore:      int32(1),
-									Devmem:       int32(2000),
+									Count:        int64(1),
+									Devcore:      int64(1),
+									Devmem:       int64(2000),
 									DeviceVendor: "NVIDIA",
 								}},
 						},
@@ -407,4 +492,146 @@ func Test_rmNodeDevices(t *testing.T) {
 			m.rmNodeDevices(test.args.nodeID, test.args.deviceVendor)
 		})
 	}
+}
+
+func TestGetNode_DeepCopy(t *testing.T) {
+	m := newNodeManager()
+	m.addNode("node-copy", &device.NodeInfo{
+		ID:   "node-copy",
+		Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-copy"}},
+		Devices: map[string][]device.DeviceInfo{
+			"NVIDIA": {{
+				ID:           "GPU-0",
+				Count:        int64(1),
+				Devcore:      int64(100),
+				Devmem:       int64(8000),
+				DeviceVendor: "NVIDIA",
+			}},
+		},
+	})
+
+	got, err := m.GetNode("node-copy")
+	if err != nil {
+		t.Fatalf("GetNode returned unexpected error: %v", err)
+	}
+
+	got.Devices["NVIDIA"][0].Devmem = int64(9999)
+
+	m.mutex.RLock()
+	internalMem := m.nodes["node-copy"].Devices["NVIDIA"][0].Devmem
+	m.mutex.RUnlock()
+
+	if internalMem == int64(9999) {
+		t.Errorf("GetNode returned a live pointer instead of a deep copy: internal Devmem was mutated to %d", internalMem)
+	}
+
+	got.Node.Name = "mutated-name"
+
+	m.mutex.RLock()
+	internalNodeName := m.nodes["node-copy"].Node.Name
+	m.mutex.RUnlock()
+
+	if internalNodeName == "mutated-name" {
+		t.Errorf("GetNode returned a live Node pointer instead of a deep copy: internal Node.Name was mutated to %s", internalNodeName)
+	}
+
+	_, err = m.GetNode("nonexistent-node")
+	if err == nil {
+		t.Error("expected error for nonexistent node, got nil")
+	}
+}
+
+// RegisterFromNodeAnnotations hands addNode a *corev1.Node straight from
+// nodeLister.List, and cambricon's ReleaseNodeLock deletes an annotation from
+// that same shared object. Storing the pointer left GetNode and ListNodes
+// deep-copying it while that delete ran.
+func TestAddNodeCopiesSharedNodeObject(t *testing.T) {
+	m := newNodeManager()
+
+	shared := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "node1",
+			Annotations: map[string]string{"cambricon.com/dsmlu.lock": "held"},
+		},
+	}
+	m.addNode("node1", &device.NodeInfo{
+		ID:   "node1",
+		Node: shared,
+		Devices: map[string][]device.DeviceInfo{
+			"NVIDIA": {{ID: "dev-0", Count: 10, Devmem: 1024}},
+		},
+	})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				delete(shared.Annotations, "cambricon.com/dsmlu.lock")
+				shared.Annotations["cambricon.com/dsmlu.lock"] = "held"
+			}
+		}
+	})
+
+	wg.Go(func() {
+		for range 20000 {
+			if n, err := m.GetNode("node1"); err == nil && n.Node != nil {
+				_ = n.Node.Annotations
+			}
+			_, _ = m.ListNodes()
+		}
+		close(stop)
+	})
+
+	wg.Wait()
+}
+
+// What the caller keeps must not reach into the manager, and vice versa.
+func TestAddNodeStoresDetachedCopy(t *testing.T) {
+	m := newNodeManager()
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node1", Annotations: map[string]string{"k": "v"}},
+	}
+	info := &device.NodeInfo{
+		ID:   "node1",
+		Node: node,
+		Devices: map[string][]device.DeviceInfo{
+			"NVIDIA": {{ID: "dev-0", Count: 10, Devmem: 1024}},
+		},
+	}
+	m.addNode("node1", info)
+
+	// mutate everything the caller still holds
+	node.Annotations["k"] = "tampered"
+	info.Devices["NVIDIA"][0].Devmem = 9999
+
+	got, err := m.GetNode("node1")
+	assert.NilError(t, err)
+	assert.Equal(t, "v", got.Node.Annotations["k"])
+	assert.Equal(t, int64(1024), got.Devices["NVIDIA"][0].Devmem)
+
+	// and the update path must copy too
+	node2 := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node1", Annotations: map[string]string{"k": "v2"}},
+	}
+	info2 := &device.NodeInfo{
+		ID:   "node1",
+		Node: node2,
+		Devices: map[string][]device.DeviceInfo{
+			"NVIDIA": {{ID: "dev-0", Count: 10, Devmem: 2048}},
+		},
+	}
+	m.addNode("node1", info2)
+	node2.Annotations["k"] = "tampered2"
+	info2.Devices["NVIDIA"][0].Devmem = 7777
+
+	got, err = m.GetNode("node1")
+	assert.NilError(t, err)
+	assert.Equal(t, "v2", got.Node.Annotations["k"])
+	assert.Equal(t, int64(2048), got.Devices["NVIDIA"][0].Devmem)
 }

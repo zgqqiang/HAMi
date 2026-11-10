@@ -18,6 +18,7 @@ package enflame
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 
@@ -28,6 +29,61 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+func TestEnflameDevices_CheckHealth(t *testing.T) {
+	InitEnflameDevice(EnflameConfig{
+		ResourceNameDRSGCU: "enflame.com/drs-gcu",
+		ResourceNameMemory: "enflame.com/gcu-memory",
+		ResourceNameCore:   "enflame.com/gcu-core",
+	})
+	dev := &EnflameDevices{}
+	oneCard := `{"devices":[{"index":"0","minor":"0","capacity":6}],"profiles":{"1g.6gb":"0"}}`
+	twoCards := `{"devices":[{"index":"0","minor":"0","capacity":6},{"index":"1","minor":"1","capacity":6}],"profiles":{"1g.6gb":"0"}}`
+
+	node := func(name string, mem, core int64, capacity string) *corev1.Node {
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{}},
+			Status:     corev1.NodeStatus{Allocatable: corev1.ResourceList{}},
+		}
+		if capacity != "" {
+			n.Annotations[GCUDrsCapacity] = capacity
+		}
+		if mem > 0 {
+			n.Status.Allocatable[corev1.ResourceName(EnflameResourceNameGCUMemory)] = *resource.NewQuantity(mem, resource.DecimalSI)
+		}
+		if core > 0 {
+			n.Status.Allocatable[corev1.ResourceName(EnflameResourceNameGCUCore)] = *resource.NewQuantity(core, resource.DecimalSI)
+		}
+		return n
+	}
+
+	healthy, needUpdate := dev.CheckHealth(EnflameVGCUCommonWord, node("enflame-health-none", 0, 0, oneCard))
+	assert.Equal(t, healthy, false)
+	assert.Equal(t, needUpdate, false)
+
+	countOnly := node("enflame-health-count-only", 0, 0, oneCard)
+	countOnly.Status.Allocatable[corev1.ResourceName(EnflameResourceNameDRSGCU)] = *resource.NewQuantity(2, resource.DecimalSI)
+	healthy, needUpdate = dev.CheckHealth(EnflameVGCUCommonWord, countOnly)
+	assert.Equal(t, healthy, false)
+	assert.Equal(t, needUpdate, false)
+
+	present := node("enflame-health-mem", 40960, 0, oneCard)
+	healthy, needUpdate = dev.CheckHealth(EnflameVGCUCommonWord, present)
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+	healthy, needUpdate = dev.CheckHealth(EnflameVGCUCommonWord, present)
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, false)
+
+	present.Annotations[GCUDrsCapacity] = twoCards
+	healthy, needUpdate = dev.CheckHealth(EnflameVGCUCommonWord, present)
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+
+	healthy, needUpdate = dev.CheckHealth(EnflameVGCUCommonWord, node("enflame-health-core", 0, 100, oneCard))
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+}
 
 func TestGetNodeDevices_DRSAnnotation(t *testing.T) {
 	InitEnflameDevice(EnflameConfig{ResourceNameDRSGCU: "enflame.com/drs-gcu"})
@@ -45,8 +101,8 @@ func TestGetNodeDevices_DRSAnnotation(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Equal(t, len(got), 1)
 	assert.Equal(t, got[0].Type, EnflameVGCUDevice)
-	assert.Equal(t, got[0].Devmem, int32(40960))
-	assert.Equal(t, got[0].Count, int32(6))
+	assert.Equal(t, got[0].Devmem, int64(40960))
+	assert.Equal(t, got[0].Count, int64(6))
 	assert.Equal(t, got[0].CustomInfo["minor"], "0")
 }
 
@@ -127,9 +183,9 @@ func TestGenerateResourceRequests(t *testing.T) {
 			},
 		},
 	}
-	req := dev.GenerateResourceRequests(container)
-	assert.Equal(t, req.Nums, int32(1))
-	assert.Equal(t, req.Memreq, int32(3))
+	req, _ := dev.GenerateResourceRequests(container)
+	assert.Equal(t, req.Nums, int64(1))
+	assert.Equal(t, req.Memreq, int64(3))
 	assert.Equal(t, req.MemPercentagereq, enflameRequestModeDirect)
 	assert.Equal(t, req.Type, EnflameVGCUDevice)
 }
@@ -148,11 +204,11 @@ func TestGenerateResourceRequests_ByMemoryCore(t *testing.T) {
 			},
 		},
 	}
-	req := dev.GenerateResourceRequests(container)
-	assert.Equal(t, req.Nums, int32(1))
+	req, _ := dev.GenerateResourceRequests(container)
+	assert.Equal(t, req.Nums, int64(1))
 	assert.Equal(t, req.Type, EnflameVGCUDevice)
-	assert.Equal(t, req.Memreq, int32(20480))
-	assert.Equal(t, req.Coresreq, int32(40))
+	assert.Equal(t, req.Memreq, int64(20480))
+	assert.Equal(t, req.Coresreq, int64(40))
 	assert.Equal(t, req.MemPercentagereq, enflameRequestModeBySpec)
 }
 
@@ -166,6 +222,7 @@ func TestFit_SelectProfileByRequest(t *testing.T) {
 			Used:     0,
 			Totalmem: 40960,
 			Type:     EnflameVGCUDevice,
+			Health:   true,
 			CustomInfo: map[string]any{
 				"minor": "0",
 				"index": "0",
@@ -186,8 +243,8 @@ func TestFit_SelectProfileByRequest(t *testing.T) {
 	assert.Equal(t, fit, true)
 	assert.Equal(t, reason, "")
 	assert.Equal(t, len(result[EnflameVGCUDevice]), 1)
-	assert.Equal(t, result[EnflameVGCUDevice][0].Usedmem, int32(20480))
-	assert.Equal(t, result[EnflameVGCUDevice][0].Usedcores, int32(50))
+	assert.Equal(t, result[EnflameVGCUDevice][0].Usedmem, int64(20480))
+	assert.Equal(t, result[EnflameVGCUDevice][0].Usedcores, int64(50))
 	assert.Equal(t, result[EnflameVGCUDevice][0].CustomInfo["profileName"], "3g.20gb")
 	assert.Equal(t, result[EnflameVGCUDevice][0].CustomInfo["profileID"], "1")
 }
@@ -202,6 +259,7 @@ func TestFit_SelectProfileByMemoryCoreRequest(t *testing.T) {
 			Used:     0,
 			Totalmem: 40960,
 			Type:     EnflameVGCUDevice,
+			Health:   true,
 			CustomInfo: map[string]any{
 				"minor": "0",
 				"index": "0",
@@ -224,8 +282,8 @@ func TestFit_SelectProfileByMemoryCoreRequest(t *testing.T) {
 	assert.Equal(t, fit, true)
 	assert.Equal(t, reason, "")
 	assert.Equal(t, len(result[EnflameVGCUDevice]), 1)
-	assert.Equal(t, result[EnflameVGCUDevice][0].Usedmem, int32(20480))
-	assert.Equal(t, result[EnflameVGCUDevice][0].Usedcores, int32(50))
+	assert.Equal(t, result[EnflameVGCUDevice][0].Usedmem, int64(20480))
+	assert.Equal(t, result[EnflameVGCUDevice][0].Usedcores, int64(50))
 	assert.Equal(t, result[EnflameVGCUDevice][0].CustomInfo["profileName"], "3g.20gb")
 	assert.Equal(t, result[EnflameVGCUDevice][0].CustomInfo["profileID"], "1")
 }
@@ -278,6 +336,73 @@ func TestFit_ProfileNotFound(t *testing.T) {
 	assert.Assert(t, strings.Contains(reason, "ModeNotFit"))
 }
 
+func TestFit_MutexRejectsUsedDevice(t *testing.T) {
+	dev := InitEnflameDevice(EnflameConfig{ResourceNameDRSGCU: "enflame.com/drs-gcu"})
+	devices := []*device.DeviceUsage{
+		{
+			ID: "node-a-enflame-drs-0",
+			// 5 of 6 slices free, so the 3-slice profile clears the slice guard
+			// and the mutex check is the binding constraint.
+			Index:    0,
+			Count:    6,
+			Used:     1,
+			Totalmem: 40960,
+			Type:     EnflameVGCUDevice,
+			Health:   true,
+			CustomInfo: map[string]any{
+				"minor": "0",
+				"index": "0",
+				"profiles": map[string]string{
+					"1g.6gb":  "0",
+					"3g.20gb": "1",
+					"6g.40gb": "2",
+				},
+			},
+		},
+	}
+	req := device.ContainerDeviceRequest{
+		Nums:   1,
+		Type:   EnflameVGCUDevice,
+		Memreq: 3,
+	}
+	annos := map[string]string{"hami.io/gpu-scheduler-policy": "mutex"}
+	fit, _, reason := dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: annos}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, reason, "1/1 ExclusiveDeviceAllocateConflict")
+}
+
+func TestFit_UnhealthyDeviceRejected(t *testing.T) {
+	dev := InitEnflameDevice(EnflameConfig{ResourceNameDRSGCU: "enflame.com/drs-gcu"})
+	devices := []*device.DeviceUsage{
+		{
+			ID:       "node-a-enflame-drs-0",
+			Index:    0,
+			Count:    6,
+			Used:     0,
+			Totalmem: 40960,
+			Type:     EnflameVGCUDevice,
+			Health:   false,
+			CustomInfo: map[string]any{
+				"minor": "0",
+				"index": "0",
+				"profiles": map[string]string{
+					"1g.6gb":  "0",
+					"3g.20gb": "1",
+					"6g.40gb": "2",
+				},
+			},
+		},
+	}
+	req := device.ContainerDeviceRequest{
+		Nums:   1,
+		Type:   EnflameVGCUDevice,
+		Memreq: 3,
+	}
+	fit, _, reason := dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Assert(t, strings.Contains(reason, "CardNotHealth"))
+}
+
 func TestPatchAnnotations_DRSFields(t *testing.T) {
 	dev := InitEnflameDevice(EnflameConfig{ResourceNameDRSGCU: "enflame.com/drs-gcu"})
 	pod := &corev1.Pod{
@@ -322,7 +447,282 @@ func TestPatchAnnotations_DRSFields(t *testing.T) {
 	err := json.Unmarshal([]byte(got[AssignedContainers]), &assigned)
 	assert.NilError(t, err)
 	assert.Equal(t, assigned["pod-gcu-example1"].Allocated, false)
-	assert.Equal(t, assigned["pod-gcu-example1"].Request, int32(3))
+	assert.Equal(t, assigned["pod-gcu-example1"].Request, int64(3))
 	assert.Equal(t, assigned["pod-gcu-example1"].ProfileName, "3g.20gb")
 	assert.Equal(t, assigned["pod-gcu-example1"].ProfileID, "1")
+}
+
+func TestAddResourceUsage_AccumulatesSlices(t *testing.T) {
+	dev := &EnflameDevices{}
+	n := &device.DeviceUsage{}
+	ctr := &device.ContainerDevice{
+		CustomInfo: map[string]any{"drsSlice": 3},
+	}
+
+	err := dev.AddResourceUsage(&corev1.Pod{}, n, ctr)
+	assert.NilError(t, err)
+	assert.Equal(t, n.Used, int64(3))
+
+	err = dev.AddResourceUsage(&corev1.Pod{}, n, ctr)
+	assert.NilError(t, err)
+	assert.Equal(t, n.Used, int64(6))
+}
+
+func TestParseDRSCapacity_RejectsNaNAndInf(t *testing.T) {
+	_, err := parseDRSCapacity(math.NaN())
+	assert.Assert(t, err != nil)
+
+	_, err = parseDRSCapacity(math.Inf(1))
+	assert.Assert(t, err != nil)
+
+	_, err = parseDRSCapacity(1e300)
+	assert.Assert(t, err != nil)
+
+	capacity, err := parseDRSCapacity(float64(42))
+	assert.NilError(t, err)
+	assert.Equal(t, capacity, int64(42))
+
+	capacity, err = parseDRSCapacity("2147483648")
+	assert.NilError(t, err)
+	assert.Equal(t, capacity, int64(2147483648))
+}
+
+func TestReadCustomInfoInt_RejectsNaNAndInf(t *testing.T) {
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": math.NaN()}, "k"), int64(0))
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": math.Inf(-1)}, "k"), int64(0))
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": 1e300}, "k"), int64(0))
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": float64(7)}, "k"), int64(7))
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": "7"}, "k"), int64(7))
+}
+
+func TestAddResourceUsage_ReadsSliceString(t *testing.T) {
+	dev := &EnflameDevices{}
+	n := &device.DeviceUsage{}
+	ctr := &device.ContainerDevice{
+		CustomInfo: map[string]any{"drsSlice": "2147483648"},
+	}
+
+	err := dev.AddResourceUsage(&corev1.Pod{}, n, ctr)
+	assert.NilError(t, err)
+	assert.Equal(t, n.Used, int64(2147483648))
+}
+
+func TestFit_OversizedProfileRejected(t *testing.T) {
+	dev := InitEnflameDevice(EnflameConfig{ResourceNameDRSGCU: "enflame.com/drs-gcu"})
+	devices := []*device.DeviceUsage{
+		{
+			ID:       "node-a-enflame-drs-0",
+			Index:    0,
+			Count:    6,
+			Used:     0,
+			Totalmem: 40960,
+			Type:     EnflameVGCUDevice,
+			CustomInfo: map[string]any{
+				"minor":    "0",
+				"index":    "0",
+				"profiles": map[string]string{"4294967299g.4294967299gb": "0"},
+			},
+		},
+	}
+	req := device.ContainerDeviceRequest{Nums: 1, Type: EnflameVGCUDevice, Memreq: 3, MemPercentagereq: 101}
+	fit, result, _ := dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, len(result[EnflameVGCUDevice]), 0)
+
+	devices[0].CustomInfo["profiles"] = map[string]string{"4294967299g.20gb": "0"}
+	fit, result, _ = dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, len(result[EnflameVGCUDevice]), 0)
+
+	devices[0].CustomInfo["profiles"] = map[string]string{"2g.4294967299gb": "0"}
+	fit, result, _ = dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, len(result[EnflameVGCUDevice]), 0)
+
+	devices[0].CustomInfo["maxSlice"] = "1"
+	devices[0].CustomInfo["profiles"] = map[string]string{"2147483647g.20gb": "0"}
+	fit, result, _ = dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, len(result[EnflameVGCUDevice]), 0)
+
+	// MemoryGB above MaxInt64/1024. Multiplying by 1024 would wrap negative and
+	// the card would look large enough.
+	devices[0].CustomInfo["maxSlice"] = ""
+	devices[0].CustomInfo["profiles"] = map[string]string{"1g.9007199254740992gb": "0"}
+	fit, result, _ = dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, len(result[EnflameVGCUDevice]), 0)
+}
+
+func TestAddResourceUsage_RejectsOverflow(t *testing.T) {
+	dev := &EnflameDevices{}
+	n := &device.DeviceUsage{Used: math.MaxInt64}
+	ctr := &device.ContainerDevice{Slots: 1}
+
+	err := dev.AddResourceUsage(&corev1.Pod{}, n, ctr)
+	assert.Assert(t, err != nil)
+	assert.Equal(t, n.Used, int64(math.MaxInt64))
+}
+
+func Test_GenerateResourceRequests_CoresValidation(t *testing.T) {
+	dev := InitEnflameDevice(EnflameConfig{
+		ResourceNameDRSGCU: "enflame.com/drs-gcu",
+		ResourceNameMemory: "enflame.com/gcu-memory",
+		ResourceNameCore:   "enflame.com/gcu-core",
+	})
+
+	tests := []struct {
+		name    string
+		cores   int64
+		rawCore string
+		wantReq bool
+	}{
+		{
+			name:    "cores 0 accepted",
+			cores:   0,
+			wantReq: true,
+		},
+		{
+			name:    "cores 50 accepted",
+			cores:   50,
+			wantReq: true,
+		},
+		{
+			name:    "cores 100 accepted",
+			cores:   100,
+			wantReq: true,
+		},
+		{
+			name:    "cores 101 rejected",
+			cores:   101,
+			wantReq: false,
+		},
+		{
+			name:    "cores 150 rejected",
+			cores:   150,
+			wantReq: false,
+		},
+		{
+			name:    "cores 200 rejected",
+			cores:   200,
+			wantReq: false,
+		},
+		{
+			name:    "negative cores -1 rejected",
+			cores:   -1,
+			wantReq: false,
+		},
+		{
+			name:    "fractional cores 50m rejected",
+			rawCore: "50m",
+			wantReq: false,
+		},
+		{
+			name:    "fractional cores 99.1 rejected",
+			rawCore: "99.1",
+			wantReq: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			coreQty := *resource.NewQuantity(tt.cores, resource.DecimalSI)
+			if tt.rawCore != "" {
+				coreQty = resource.MustParse(tt.rawCore)
+			}
+			ctr := &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"enflame.com/gcu-memory": resource.MustParse("20480"),
+						"enflame.com/gcu-core":   coreQty,
+					},
+				},
+			}
+			req, _ := dev.GenerateResourceRequests(ctr)
+			if tt.wantReq {
+				assert.Equal(t, req.Nums, int64(1))
+				assert.Equal(t, req.Coresreq, tt.cores)
+			} else {
+				assert.Equal(t, req.Nums, int64(0))
+			}
+		})
+	}
+}
+
+func TestMutateAdmission_CoresValidation(t *testing.T) {
+	dev := InitEnflameDevice(EnflameConfig{
+		ResourceNameDRSGCU: "enflame.com/drs-gcu",
+		ResourceNameMemory: "enflame.com/gcu-memory",
+		ResourceNameCore:   "enflame.com/gcu-core",
+	})
+
+	tests := []struct {
+		name      string
+		cores     string
+		wantValid bool
+	}{
+		{name: "0 cores accepted", cores: "0", wantValid: true},
+		{name: "50 cores accepted", cores: "50", wantValid: true},
+		{name: "100 cores accepted", cores: "100", wantValid: true},
+		{name: "-1 cores rejected", cores: "-1", wantValid: false},
+		{name: "101 cores rejected", cores: "101", wantValid: false},
+		{name: "50m cores rejected", cores: "50m", wantValid: false},
+		{name: "99.1 cores rejected", cores: "99.1", wantValid: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctr := &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"enflame.com/gcu-core": resource.MustParse(tt.cores),
+					},
+				},
+			}
+			_, err := dev.MutateAdmission(ctr, &corev1.Pod{})
+			if tt.wantValid {
+				assert.NilError(t, err)
+			} else {
+				assert.ErrorContains(t, err, "must be in range [0,100]")
+			}
+		})
+	}
+}
+
+func TestFit_CoresValidation(t *testing.T) {
+	dev := InitEnflameDevice(EnflameConfig{
+		ResourceNameDRSGCU: "enflame.com/drs-gcu",
+		ResourceNameMemory: "enflame.com/gcu-memory",
+		ResourceNameCore:   "enflame.com/gcu-core",
+	})
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+	}
+
+	t.Run("empty devices with invalid coresreq returns out of range", func(t *testing.T) {
+		req := device.ContainerDeviceRequest{
+			Nums:     1,
+			Type:     EnflameVGCUDevice,
+			Memreq:   1024,
+			Coresreq: 150,
+		}
+		ok, _, reason := dev.Fit([]*device.DeviceUsage{}, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+		assert.Equal(t, ok, false)
+		assert.Equal(t, reason, "core limit out of range")
+	})
+
+	t.Run("negative coresreq with empty devices returns out of range", func(t *testing.T) {
+		req := device.ContainerDeviceRequest{
+			Nums:     1,
+			Type:     EnflameVGCUDevice,
+			Memreq:   1024,
+			Coresreq: -1,
+		}
+		ok, _, reason := dev.Fit([]*device.DeviceUsage{}, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+		assert.Equal(t, ok, false)
+		assert.Equal(t, reason, "core limit out of range")
+	})
 }

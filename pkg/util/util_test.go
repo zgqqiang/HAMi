@@ -18,12 +18,22 @@ package util
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"gotest.tools/v3/assert"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/Project-HAMi/HAMi/pkg/util/client"
 	"github.com/Project-HAMi/HAMi/pkg/util/nodelock"
@@ -35,7 +45,7 @@ func init() {
 	inRequestDevices = make(map[string]string)
 	inRequestDevices["NVIDIA"] = "hami.io/vgpu-devices-to-allocate"
 }
-func TestMarkAnnotationsToDelete(t *testing.T) {
+func TestRemoveAnnotation(t *testing.T) {
 	client.KubeClient = fake.NewClientset()
 	client.KubeClient.CoreV1().Nodes().Create(context.TODO(), &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-worker2"},
@@ -58,7 +68,7 @@ func TestMarkAnnotationsToDelete(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "mark annotations to delete",
+			name: "remove annotations",
 			args: args{
 				devType: "huawei.com/Ascend910",
 				nn:      "node-worker2",
@@ -69,7 +79,7 @@ func TestMarkAnnotationsToDelete(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := MarkAnnotationsToDelete(tt.args.devType, tt.args.nn); (err != nil) != tt.wantErr {
-				t.Errorf("MarkAnnotationsToDelete() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("RemoveAnnotation() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
@@ -196,8 +206,6 @@ func TestGetPendingPod(t *testing.T) {
 	}
 	client.KubeClient.CoreV1().Nodes().Create(context.TODO(), node1, metav1.CreateOptions{})
 
-	pendingPod := podList[0]
-
 	tests := []struct {
 		name    string
 		node    string
@@ -205,10 +213,12 @@ func TestGetPendingPod(t *testing.T) {
 		want    *corev1.Pod
 	}{
 		{
-			name:    "find pending pod",
+			// test-node-0 carries no lock. A pending pod whose own annotations
+			// name the node used to be served from here, which is how one pod's
+			// devices reached another (issue #3076).
+			name:    "node without a lock serves nothing",
 			node:    "test-node-0",
-			wantErr: false,
-			want:    pendingPod,
+			wantErr: true,
 		},
 		{
 			name:    "find allocated pod",
@@ -229,6 +239,48 @@ func TestGetPendingPod(t *testing.T) {
 				assert.Equal(t, got.Name, tt.want.Name)
 			}
 		})
+	}
+}
+
+// TestGetPendingPodIgnoresHandWrittenAnnotations guards the fix for issue
+// #3076. GetPendingPod used to fall back to picking a pending pod out of the
+// node's list by hami.io/bind-time, hami.io/bind-phase and hami.io/vgpu-node
+// alone, none of which need more rbac than creating the pod. Writing the node
+// lock does. Only the lock now decides, so a pod that carries the annotations
+// without one is no longer served, whether it wrote them itself or gained them
+// through a path admission does not see (issue #3041).
+func TestGetPendingPodIgnoresHandWrittenAnnotations(t *testing.T) {
+	client.KubeClient = fake.NewClientset()
+
+	// Nothing about this pod says the scheduler produced it: no NodeName set
+	// by a Binding, no bind-phase transition through PatchPodAnnotations. It
+	// is exactly what a hand-written manifest, or a post-create PATCH, would
+	// produce.
+	handWritten := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hand-written",
+			Namespace: "default",
+			Annotations: map[string]string{
+				BindTimeAnnotations:     "2024-01-01T00:00:00Z",
+				DeviceBindPhase:         DeviceBindAllocating,
+				AssignedNodeAnnotations: "gpu-node-1",
+			},
+		},
+		Spec:   corev1.PodSpec{NodeName: "gpu-node-1"},
+		Status: corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	if _, err := client.KubeClient.CoreV1().Pods("default").Create(context.TODO(), handWritten, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to seed the pod: %v", err)
+	}
+	if _, err := client.KubeClient.CoreV1().Nodes().Create(context.TODO(), &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-node-1"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to seed the node: %v", err)
+	}
+
+	got, err := GetPendingPod(context.TODO(), "gpu-node-1")
+	if err == nil {
+		t.Fatalf("GetPendingPod() served %s, which no node lock names", got.Name)
 	}
 }
 
@@ -364,6 +416,14 @@ func TestPatchPodAnnotations(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "patch nil pod",
+			pod:  nil,
+			annotations: map[string]string{
+				"test-key": "test-value",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -427,6 +487,11 @@ func Test_IsPodInTerminatedState(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			name: "pod is nil",
+			args: nil,
+			want: false,
+		},
 	}
 
 	for _, test := range tests {
@@ -442,6 +507,11 @@ func Test_AllContainersCreated(t *testing.T) {
 		args *corev1.Pod
 		want bool
 	}{
+		{
+			name: "pod is nil",
+			args: nil,
+			want: false,
+		},
 		{
 			name: "all containers created",
 			args: &corev1.Pod{
@@ -513,6 +583,98 @@ func Test_AllContainersCreated(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := AllContainersCreated(test.args)
+			assert.Equal(t, test.want, got)
+		})
+	}
+}
+
+func TestIsPodGroupMember(t *testing.T) {
+	podGroupName := "my-training-job"
+	emptyPodGroupName := ""
+
+	tests := []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{
+			name: "nil pod",
+			pod:  nil,
+			want: false,
+		},
+		{
+			name: "no group membership at all",
+			pod:  &corev1.Pod{},
+			want: false,
+		},
+		{
+			name: "scheduler-plugins Coscheduling label present",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{PodGroupLabel: podGroupName},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "coscheduling label present but empty",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{PodGroupLabel: ""},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "native GenericWorkload PodGroup via Spec.SchedulingGroup",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					SchedulingGroup: &corev1.PodSchedulingGroup{
+						PodGroupName: &podGroupName,
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Spec.SchedulingGroup set but PodGroupName nil",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					SchedulingGroup: &corev1.PodSchedulingGroup{},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "Spec.SchedulingGroup set but PodGroupName empty",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					SchedulingGroup: &corev1.PodSchedulingGroup{
+						PodGroupName: &emptyPodGroupName,
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "both coscheduling label and native SchedulingGroup present",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{PodGroupLabel: podGroupName},
+				},
+				Spec: corev1.PodSpec{
+					SchedulingGroup: &corev1.PodSchedulingGroup{
+						PodGroupName: &podGroupName,
+					},
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := IsPodGroupMember(test.pod)
 			assert.Equal(t, test.want, got)
 		})
 	}
@@ -633,6 +795,11 @@ func Test_IsPodTerminating(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			name: "pod is nil",
+			args: nil,
+			want: false,
+		},
 	}
 
 	for _, test := range tests {
@@ -670,6 +837,29 @@ func TestGetGPUSchedulerPolicyByPod(t *testing.T) {
 	}
 }
 
+func TestPolicyContains(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy string
+		target SchedulerPolicyName
+		want   bool
+	}{
+		{"single value match", "mutex", GPUSchedulerPolicyMutex, true},
+		{"single value no match", "spread", GPUSchedulerPolicyMutex, false},
+		{"empty policy", "", GPUSchedulerPolicyMutex, false},
+		{"comma list match first", "mutex,spread", GPUSchedulerPolicyMutex, true},
+		{"comma list match last", "spread,numa,mutex", GPUSchedulerPolicyMutex, true},
+		{"comma list no match", "binpack,spread", GPUSchedulerPolicyMutex, false},
+		{"comma list with spaces", "mutex, spread, numa", GPUSchedulerPolicyNuma, true},
+		{"chain of sort keys, no filter", "binpack,spread,numa", GPUSchedulerPolicyTopology, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, PolicyContains(tt.policy, tt.target))
+		})
+	}
+}
+
 func TestSchedulerPolicyName_String(t *testing.T) {
 	tests := []struct {
 		policy SchedulerPolicyName
@@ -685,4 +875,555 @@ func TestSchedulerPolicyName_String(t *testing.T) {
 			assert.Equal(t, tt.want, tt.policy.String())
 		})
 	}
+}
+
+func TestEmitNodeWarningEvent(t *testing.T) {
+	const (
+		nodeName = "test-node"
+		nodeUID  = types.UID("test-uid-1234")
+		reason   = "AsymmetricGPUP2PLink"
+		msg1     = "first message"
+		msg2     = "updated message"
+	)
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nodeName,
+			UID:  nodeUID,
+		},
+	}
+	dedupWindow := time.Hour
+
+	t.Run("no existing event creates new event", func(t *testing.T) {
+		client.KubeClient = fake.NewClientset()
+
+		EmitNodeWarningEvent(node, reason, msg1, dedupWindow)
+
+		events, err := client.KubeClient.CoreV1().Events(corev1.NamespaceDefault).List(
+			context.TODO(), metav1.ListOptions{})
+		assert.NilError(t, err)
+		assert.Equal(t, 1, len(events.Items))
+		assert.Equal(t, reason, events.Items[0].Reason)
+		assert.Equal(t, msg1, events.Items[0].Message)
+		assert.Equal(t, int32(1), events.Items[0].Count)
+		assert.Equal(t, corev1.EventTypeWarning, events.Items[0].Type)
+	})
+
+	t.Run("existing event within dedupWindow updates count and message", func(t *testing.T) {
+		past := metav1.NewTime(time.Now().Add(-30 * time.Minute)) // within 1h window
+		existing := &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      nodeName + "-existing",
+				Namespace: corev1.NamespaceDefault,
+			},
+			InvolvedObject: corev1.ObjectReference{
+				Kind: "Node",
+				Name: nodeName,
+				UID:  nodeUID,
+			},
+			Reason:         reason,
+			Message:        msg1,
+			Type:           corev1.EventTypeWarning,
+			Count:          3,
+			FirstTimestamp: past,
+			LastTimestamp:  past,
+		}
+		client.KubeClient = fake.NewClientset(existing)
+
+		EmitNodeWarningEvent(node, reason, msg2, dedupWindow)
+
+		events, err := client.KubeClient.CoreV1().Events(corev1.NamespaceDefault).List(
+			context.TODO(), metav1.ListOptions{})
+		assert.NilError(t, err)
+		// Must still be exactly one event, no new object created.
+		assert.Equal(t, 1, len(events.Items))
+		assert.Equal(t, int32(4), events.Items[0].Count)
+		assert.Equal(t, msg2, events.Items[0].Message)
+	})
+
+	t.Run("existing event outside dedupWindow creates new event", func(t *testing.T) {
+		old := metav1.NewTime(time.Now().Add(-2 * time.Hour)) // outside 1h window
+		existing := &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      nodeName + "-old",
+				Namespace: corev1.NamespaceDefault,
+			},
+			InvolvedObject: corev1.ObjectReference{
+				Kind: "Node",
+				Name: nodeName,
+				UID:  nodeUID,
+			},
+			Reason:         reason,
+			Message:        msg1,
+			Type:           corev1.EventTypeWarning,
+			Count:          1,
+			FirstTimestamp: old,
+			LastTimestamp:  old,
+		}
+		client.KubeClient = fake.NewClientset(existing)
+
+		EmitNodeWarningEvent(node, reason, msg2, dedupWindow)
+
+		events, err := client.KubeClient.CoreV1().Events(corev1.NamespaceDefault).List(
+			context.TODO(), metav1.ListOptions{})
+		assert.NilError(t, err)
+		// Old event still present plus one new event.
+		assert.Equal(t, 2, len(events.Items))
+	})
+}
+
+func TestIsSidecarContainer(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	other := corev1.ContainerRestartPolicy("Never")
+
+	assert.Assert(t, !IsSidecarContainer(nil))
+	assert.Assert(t, !IsSidecarContainer(&corev1.Container{Name: "c"}))
+	assert.Assert(t, !IsSidecarContainer(&corev1.Container{Name: "c", RestartPolicy: &other}))
+	assert.Assert(t, IsSidecarContainer(&corev1.Container{Name: "c", RestartPolicy: &always}))
+}
+
+func TestAllNonSidecarInitContainersSucceeded(t *testing.T) {
+	always := corev1.ContainerRestartPolicyAlways
+	sidecar := corev1.Container{Name: "sc", RestartPolicy: &always}
+	initC := corev1.Container{Name: "init"} // nil restartPolicy → regular init
+
+	term0 := corev1.ContainerStatus{Name: "init",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}}
+	term1 := corev1.ContainerStatus{Name: "init",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}}
+	running := corev1.ContainerStatus{Name: "init",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}
+	scRunning := corev1.ContainerStatus{Name: "sc",
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}
+	// A crash-looping sidecar momentarily shows Terminated exit 0, the
+	// exit-0 gap from the design. It must be irrelevant to the gate.
+	scGap := corev1.ContainerStatus{Name: "sc",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}}
+
+	cases := []struct {
+		name   string
+		spec   []corev1.Container
+		status []corev1.ContainerStatus
+		want   bool
+	}{
+		{"no init containers", nil, nil, false},
+		{"init running, sidecar running", []corev1.Container{initC, sidecar}, []corev1.ContainerStatus{running, scRunning}, false},
+		{"init exit0, sidecar running", []corev1.Container{initC, sidecar}, []corev1.ContainerStatus{term0, scRunning}, true},
+		{"init exit0, sidecar in exit-0 gap", []corev1.Container{initC, sidecar}, []corev1.ContainerStatus{term0, scGap}, true},
+		{"init running, sidecar in exit-0 gap must NOT open gate", []corev1.Container{initC, sidecar}, []corev1.ContainerStatus{running, scGap}, false},
+		{"init nonzero exit holds", []corev1.Container{initC, sidecar}, []corev1.ContainerStatus{term1, scRunning}, false},
+		{"all sidecars: gate immediately satisfied", []corev1.Container{sidecar}, []corev1.ContainerStatus{scRunning}, true},
+		{"missing status for non-sidecar init", []corev1.Container{initC, sidecar}, []corev1.ContainerStatus{scRunning}, false},
+		{"plain init pod, all exit0 (legacy behavior)", []corev1.Container{initC}, []corev1.ContainerStatus{term0}, true},
+		{"plain init pod, still running (legacy behavior)", []corev1.Container{initC}, []corev1.ContainerStatus{running}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				Spec:   corev1.PodSpec{InitContainers: tc.spec},
+				Status: corev1.PodStatus{InitContainerStatuses: tc.status},
+			}
+			got := AllNonSidecarInitContainersSucceeded(pod)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestPatchNodeLabels_NilNode(t *testing.T) {
+	err := PatchNodeLabels(nil, map[string]string{"hami.io/test": "bar"})
+	assert.ErrorContains(t, err, "node is nil")
+}
+
+func TestPatchNodeLabels_ValidNode(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node-labels",
+		},
+	}
+	oldClient := client.KubeClient
+	t.Cleanup(func() { client.KubeClient = oldClient })
+	client.KubeClient = fake.NewClientset(node)
+
+	err := PatchNodeLabels(node, map[string]string{"hami.io/lupine-server": ""})
+	assert.NilError(t, err)
+
+	updated, err := client.KubeClient.CoreV1().Nodes().Get(context.TODO(), "test-node-labels", metav1.GetOptions{})
+	assert.NilError(t, err)
+	value, ok := updated.Labels["hami.io/lupine-server"]
+	assert.Assert(t, ok)
+	assert.Equal(t, "", value)
+}
+
+func TestRemoveNodeLabels_ValidNode(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node-remove-labels",
+			Labels: map[string]string{
+				"hami.io/lupine-server": "",
+			},
+		},
+	}
+	oldClient := client.KubeClient
+	t.Cleanup(func() { client.KubeClient = oldClient })
+	client.KubeClient = fake.NewClientset(node)
+
+	err := RemoveNodeLabels(node, "hami.io/lupine-server")
+	assert.NilError(t, err)
+
+	updated, err := client.KubeClient.CoreV1().Nodes().Get(context.TODO(), "test-node-remove-labels", metav1.GetOptions{})
+	assert.NilError(t, err)
+	_, hasLabel := updated.Labels["hami.io/lupine-server"]
+	assert.Assert(t, !hasLabel)
+}
+
+func TestPatchNodeAnnotations_NilNode(t *testing.T) {
+	err := PatchNodeAnnotations(nil, map[string]string{"hami.io/test": "bar"})
+	assert.ErrorContains(t, err, "node is nil")
+}
+
+func TestPatchNodeAnnotations_ValidNode(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+		},
+	}
+	oldClient := client.KubeClient
+	t.Cleanup(func() { client.KubeClient = oldClient })
+	client.KubeClient = fake.NewClientset(node)
+
+	err := PatchNodeAnnotations(node, map[string]string{"hami.io/test": "bar"})
+	assert.NilError(t, err)
+
+	updated, err := client.KubeClient.CoreV1().Nodes().Get(context.TODO(), "test-node", metav1.GetOptions{})
+	assert.NilError(t, err)
+	assert.Equal(t, "bar", updated.Annotations["hami.io/test"])
+}
+
+func TestRemoveNodeAnnotation_NilNode(t *testing.T) {
+	err := RemoveNodeAnnotation(nil, "hami.io/test")
+	assert.ErrorContains(t, err, "node is nil")
+}
+
+func TestRemoveNodeAnnotation_ValidNode(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+			Annotations: map[string]string{
+				"hami.io/test": "bar",
+			},
+		},
+	}
+	oldClient := client.KubeClient
+	t.Cleanup(func() { client.KubeClient = oldClient })
+	client.KubeClient = fake.NewClientset(node)
+
+	err := RemoveNodeAnnotation(node, "hami.io/test")
+	assert.NilError(t, err)
+
+	updated, err := client.KubeClient.CoreV1().Nodes().Get(context.TODO(), "test-node", metav1.GetOptions{})
+	assert.NilError(t, err)
+	_, hasAnno := updated.Annotations["hami.io/test"]
+	assert.Assert(t, !hasAnno)
+}
+
+func TestPatchNodeAnnotations_NilClient(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	oldClient := client.KubeClient
+	t.Cleanup(func() { client.KubeClient = oldClient })
+	client.KubeClient = nil
+	err := PatchNodeAnnotations(node, map[string]string{"hami.io/test": "bar"})
+	assert.ErrorContains(t, err, "kubernetes client is not initialized")
+}
+
+func TestGetNode(t *testing.T) {
+	tests := []struct {
+		name        string
+		setupClient func() kubernetes.Interface
+		nodeName    string
+		wantErr     bool
+		checkNode   func(*testing.T, *corev1.Node)
+		checkErr    func(*testing.T, error)
+	}{
+		{
+			name: "empty node name",
+			setupClient: func() kubernetes.Interface {
+				return fake.NewClientset()
+			},
+			nodeName: "",
+			wantErr:  true,
+		},
+		{
+			name: "client not initialized",
+			setupClient: func() kubernetes.Interface {
+				return nil
+			},
+			nodeName: "test-node",
+			wantErr:  true,
+		},
+		{
+			name: "node not found",
+			setupClient: func() kubernetes.Interface {
+				clientset := fake.NewClientset()
+				return clientset
+			},
+			nodeName: "non-existent-node",
+			wantErr:  true,
+			checkErr: func(t *testing.T, err error) {
+				var statusErr *apierrors.StatusError
+				if !errors.As(err, &statusErr) {
+					t.Fatalf("errors.As(*StatusError) = false; want true (got type %T)", err)
+				}
+				if !apierrors.IsNotFound(statusErr) {
+					t.Errorf("expected unwrapped error to be NotFound, got %v", statusErr)
+				}
+				if !apierrors.IsNotFound(err) {
+					t.Errorf("apierrors.IsNotFound(wrappedErr) = false; wrapping with %%w is required to preserve the error chain")
+				}
+			},
+		},
+		{
+			name: "success",
+			setupClient: func() kubernetes.Interface {
+				clientset := fake.NewClientset()
+				clientset.CoreV1().Nodes().Create(context.TODO(), &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				}, metav1.CreateOptions{})
+				return clientset
+			},
+			nodeName: "test-node",
+			wantErr:  false,
+			checkNode: func(t *testing.T, node *corev1.Node) {
+				assert.Equal(t, node.Name, "test-node")
+			},
+		},
+		{
+			name: "unauthorized",
+			setupClient: func() kubernetes.Interface {
+				clientset := fake.NewClientset()
+				clientset.PrependReactor("get", "nodes", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
+					return true, nil, apierrors.NewUnauthorized("get nodes")
+				})
+				return clientset
+			},
+			nodeName: "test-node",
+			wantErr:  true,
+			checkErr: func(t *testing.T, err error) {
+				var statusErr *apierrors.StatusError
+				if !errors.As(err, &statusErr) {
+					t.Fatalf("errors.As(*StatusError) = false; want true (got type %T)", err)
+				}
+				if !apierrors.IsUnauthorized(statusErr) {
+					t.Errorf("expected unwrapped error to be Unauthorized, got %v", statusErr)
+				}
+				if !apierrors.IsUnauthorized(err) {
+					t.Errorf("apierrors.IsUnauthorized(wrappedErr) = false; wrapping with %%w is required to preserve the error chain")
+				}
+			},
+		},
+		{
+			name: "generic error",
+			setupClient: func() kubernetes.Interface {
+				clientset := fake.NewClientset()
+				clientset.PrependReactor("get", "nodes", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
+					return true, nil, apierrors.NewBadRequest("generic error")
+				})
+				return clientset
+			},
+			nodeName: "test-node",
+			wantErr:  true,
+			checkErr: func(t *testing.T, err error) {
+				var statusErr *apierrors.StatusError
+				if !errors.As(err, &statusErr) {
+					t.Errorf("expected error to wrap *apierrors.StatusError, got %T", err)
+					return
+				}
+				if !apierrors.IsBadRequest(statusErr) {
+					t.Errorf("expected wrapped error to be BadRequest, got %v", statusErr)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			previousClient := client.KubeClient
+			client.KubeClient = tt.setupClient()
+			t.Cleanup(func() { client.KubeClient = previousClient })
+
+			got, err := GetNode(tt.nodeName)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetNode() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.checkErr != nil {
+				tt.checkErr(t, err)
+			}
+			if !tt.wantErr && tt.checkNode != nil {
+				tt.checkNode(t, got)
+			}
+		})
+	}
+}
+
+func TestPatchNodeStatusCapacity(t *testing.T) {
+	fakeClient := fake.NewClientset()
+	client.KubeClient = fakeClient
+	nodeName := "capacity-node"
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+	}
+	_, err := fakeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	assert.NilError(t, err)
+
+	resList := corev1.ResourceList{
+		corev1.ResourceName("nvidia.com/gpumem"):   *resource.NewQuantity(65536, resource.DecimalSI),
+		corev1.ResourceName("nvidia.com/gpucores"): *resource.NewQuantity(200, resource.DecimalSI),
+	}
+
+	err = PatchNodeStatusCapacity(node, resList)
+	assert.NilError(t, err)
+
+	updatedNode, err := fakeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	assert.NilError(t, err)
+
+	gpuMem := updatedNode.Status.Capacity["nvidia.com/gpumem"]
+	assert.Equal(t, gpuMem.Value(), int64(65536))
+	gpuCores := updatedNode.Status.Capacity["nvidia.com/gpucores"]
+	assert.Equal(t, gpuCores.Value(), int64(200))
+}
+
+func TestPatchNodeStatusCapacityEmptyResources(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "capacity-node-empty"}}
+	err := PatchNodeStatusCapacity(node, corev1.ResourceList{})
+	assert.NilError(t, err)
+}
+
+func TestPatchNodeStatusCapacityNilClient(t *testing.T) {
+	previousClient := client.KubeClient
+	client.KubeClient = nil
+	t.Cleanup(func() { client.KubeClient = previousClient })
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "capacity-node-nil-client"}}
+	resList := corev1.ResourceList{
+		corev1.ResourceName("nvidia.com/gpumem"): *resource.NewQuantity(1024, resource.DecimalSI),
+	}
+
+	err := PatchNodeStatusCapacity(node, resList)
+	assert.ErrorContains(t, err, "kubernetes client is not initialized")
+}
+
+func TestPatchNodeStatusCapacityPatchError(t *testing.T) {
+	previousClient := client.KubeClient
+	fakeClient := fake.NewClientset()
+	client.KubeClient = fakeClient
+	t.Cleanup(func() { client.KubeClient = previousClient })
+
+	nodeName := "capacity-node-patch-error"
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+	_, err := fakeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	assert.NilError(t, err)
+
+	wantErr := fmt.Errorf("patch failed")
+	fakeClient.PrependReactor("patch", "nodes", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
+		return true, nil, wantErr
+	})
+
+	resList := corev1.ResourceList{
+		corev1.ResourceName("nvidia.com/gpumem"): *resource.NewQuantity(1024, resource.DecimalSI),
+	}
+	err = PatchNodeStatusCapacity(node, resList)
+	assert.ErrorContains(t, err, wantErr.Error())
+}
+
+// A merge patch is addressed by name alone, so a patch computed for one pod
+// can land on a different pod that later took the same name. Carrying the UID
+// makes the write conditional: Kubernetes refuses an update that changes it.
+func TestPatchPodAnnotationsPinsPodUID(t *testing.T) {
+	fakeClient := fake.NewClientset()
+	var patchBody []byte
+	fakeClient.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
+		patch, ok := action.(k8stesting.PatchAction)
+		if !ok {
+			return false, nil, nil
+		}
+		patchBody = patch.GetPatch()
+		return true, &corev1.Pod{}, nil
+	})
+	oldClient := client.KubeClient
+	client.KubeClient = fakeClient
+	t.Cleanup(func() { client.KubeClient = oldClient })
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-pod", Namespace: "team-a", UID: "gpu-pod-uid"},
+	}
+	assert.NilError(t, PatchPodAnnotations(pod, map[string]string{AssignedNodeAnnotations: "node-1"}))
+
+	var patch struct {
+		Metadata struct {
+			UID types.UID `json:"uid"`
+		} `json:"metadata"`
+	}
+	assert.NilError(t, json.Unmarshal(patchBody, &patch))
+	assert.Equal(t, types.UID("gpu-pod-uid"), patch.Metadata.UID, "the patch does not pin the pod's UID")
+}
+
+// TestPatchPodAnnotationsRejectsStaleUID covers delete-and-recreate: same
+// name and namespace, new UID, and a caller still holding a patch built for
+// the old one. The fake clientset does not enforce UID immutability like a
+// real API server does, so the reactor below stands in for that check.
+func TestPatchPodAnnotationsRejectsStaleUID(t *testing.T) {
+	const (
+		staleUID = types.UID("old-pod-uid")
+		liveUID  = types.UID("new-pod-uid")
+	)
+
+	fakeClient := fake.NewClientset()
+	live := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "gpu-pod",
+			Namespace:   "team-a",
+			UID:         liveUID,
+			Annotations: map[string]string{"pre-existing": "untouched"},
+		},
+	}
+	_, err := fakeClient.CoreV1().Pods(live.Namespace).Create(context.TODO(), live, metav1.CreateOptions{})
+	assert.NilError(t, err)
+
+	fakeClient.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, k8sruntime.Object, error) {
+		patchAction, ok := action.(k8stesting.PatchAction)
+		if !ok {
+			return false, nil, nil
+		}
+		var patch struct {
+			Metadata struct {
+				UID types.UID `json:"uid"`
+			} `json:"metadata"`
+		}
+		if err := json.Unmarshal(patchAction.GetPatch(), &patch); err != nil {
+			return false, nil, err
+		}
+		if patch.Metadata.UID != "" && patch.Metadata.UID != liveUID {
+			return true, nil, apierrors.NewConflict(
+				corev1.Resource("pods"), patchAction.GetName(),
+				fmt.Errorf("Precondition failed: UID in precondition: %q, UID in object meta: %q", patch.Metadata.UID, liveUID),
+			)
+		}
+		return false, nil, nil
+	})
+	oldClient := client.KubeClient
+	client.KubeClient = fakeClient
+	t.Cleanup(func() { client.KubeClient = oldClient })
+
+	stalePodRef := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu-pod", Namespace: "team-a", UID: staleUID},
+	}
+	patchErr := PatchPodAnnotations(stalePodRef, map[string]string{AssignedNodeAnnotations: "node-1"})
+	assert.Assert(t, apierrors.IsConflict(patchErr), "a patch carrying a stale UID must return a conflict, got: %v", patchErr)
+
+	current, err := fakeClient.CoreV1().Pods("team-a").Get(context.TODO(), "gpu-pod", metav1.GetOptions{})
+	assert.NilError(t, err)
+	assert.Equal(t, liveUID, current.UID, "the recreated pod's identity changed")
+	_, forged := current.Annotations[AssignedNodeAnnotations]
+	assert.Equal(t, false, forged, "the stale patch landed on the pod that replaced the original")
+	assert.Equal(t, "untouched", current.Annotations["pre-existing"])
 }

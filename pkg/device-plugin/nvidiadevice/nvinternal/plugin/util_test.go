@@ -17,150 +17,26 @@
 package plugin
 
 import (
+	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	kubeletdevicepluginv1beta1 "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 	"tags.cncf.io/container-device-interface/specs-go"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/rm"
 	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
+	"github.com/Project-HAMi/HAMi/pkg/scheduler/config"
 	"github.com/Project-HAMi/HAMi/pkg/util"
 	"github.com/Project-HAMi/HAMi/pkg/util/client"
+	"github.com/Project-HAMi/HAMi/pkg/util/nodelock"
 )
-
-func TestGenerateMigTemplate(t *testing.T) {
-	sconfig := nvidia.NvidiaConfig{
-		MigGeometriesList: []device.AllowedMigGeometries{
-			{
-				Models: []string{"A30"},
-				Geometries: []device.Geometry{
-					{device.MigTemplate{Name: "1g.6gb", Core: 25, Memory: 6144, Count: 4}},
-					{device.MigTemplate{Name: "2g.12gb", Core: 50, Memory: 12288, Count: 2}},
-					{device.MigTemplate{Name: "4g.24gb", Core: 100, Memory: 24576, Count: 1}},
-				},
-			},
-			{
-				Models: []string{"A100-SXM4-40GB", "A100-40GB-PCIe", "A100-PCIE-40GB", "A100-SXM4-40GB"},
-				Geometries: []device.Geometry{
-					{device.MigTemplate{Name: "1g.5gb", Core: 14, Memory: 5120, Count: 7}},
-					{device.MigTemplate{Name: "1g.5gb", Core: 14, Memory: 5120, Count: 1}, device.MigTemplate{Name: "2g.10gb", Core: 28, Memory: 10240, Count: 3}},
-					{device.MigTemplate{Name: "3g.20gb", Core: 42, Memory: 20480, Count: 2}},
-					{device.MigTemplate{Name: "7g.40gb", Core: 100, Memory: 40960, Count: 1}},
-				},
-			},
-			{
-				Models: []string{"A100-SXM4-80GB", "A100-80GB-PCIe", "A100-PCIE-80GB"},
-				Geometries: []device.Geometry{
-					{device.MigTemplate{Name: "1g.10gb", Core: 14, Memory: 10240, Count: 7}},
-					{device.MigTemplate{Name: "1g.10gb", Core: 14, Memory: 10240, Count: 1}, device.MigTemplate{Name: "2g.20gb", Core: 28, Memory: 20480, Count: 3}},
-					{device.MigTemplate{Name: "3g.40gb", Core: 42, Memory: 40960, Count: 2}},
-					{device.MigTemplate{Name: "7g.80gb", Core: 100, Memory: 81920, Count: 1}},
-				},
-			},
-		},
-	}
-
-	plugin := NvidiaDevicePlugin{
-		operatingMode:   "mig",
-		schedulerConfig: sconfig,
-	}
-	plugin.migCurrent = nvidia.MigPartedSpec{
-		Version:    "v1",
-		MigConfigs: make(map[string]nvidia.MigConfigSpecSlice),
-	}
-	plugin.migCurrent.MigConfigs["current"] = nvidia.MigConfigSpecSlice{
-		nvidia.MigConfigSpec{
-			Devices:    []int32{0, 1},
-			MigEnabled: true,
-			MigDevices: make(map[string]int32), // Ensure this map is initialized
-		},
-	}
-
-	testCases := []struct {
-		name          string
-		model         string
-		deviceIdx     int
-		containerDev  device.ContainerDevice
-		expectedPos   int
-		expectedReset bool
-		expectedMig   map[string]int32
-	}{
-		{
-			name:      "2g.10gb template",
-			model:     "A100-SXM4-40GB",
-			deviceIdx: 0,
-			containerDev: device.ContainerDevice{
-				Idx:     0,
-				UUID:    "aaaaabbbb[1-1]",
-				Usedmem: 8000,
-			},
-			expectedPos:   1,
-			expectedReset: true,
-			expectedMig: map[string]int32{
-				"1g.5gb":  1,
-				"2g.10gb": 3,
-			},
-		},
-		{
-			name:      "1g.5gb template",
-			model:     "A100-SXM4-40GB",
-			deviceIdx: 0,
-			containerDev: device.ContainerDevice{
-				Idx:     0,
-				UUID:    "aaaaabbbb[0-1]",
-				Usedmem: 3000,
-			},
-			expectedPos:   1,
-			expectedReset: true,
-			expectedMig: map[string]int32{
-				"1g.5gb": 7,
-			},
-		},
-		{
-			name:      "no reset needed",
-			model:     "A100-SXM4-40GB",
-			deviceIdx: 0,
-			containerDev: device.ContainerDevice{
-				Idx:     0,
-				UUID:    "aaaaabbbb[0-2]",
-				Usedmem: 3000,
-			},
-			expectedPos:   2,
-			expectedReset: false,
-			expectedMig: map[string]int32{
-				"1g.5gb": 7,
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			pos, needsreset := plugin.GenerateMigTemplate(tc.model, tc.deviceIdx, tc.containerDev)
-
-			// Check if the position matches the expected value
-			if pos != tc.expectedPos {
-				t.Errorf("expected position %d, got %d", tc.expectedPos, pos)
-			}
-
-			// Check if the reset flag matches the expected value
-			if needsreset != tc.expectedReset {
-				t.Errorf("expected reset %v, got %v", tc.expectedReset, needsreset)
-			}
-
-			// Check if the mig devices match the expected values
-			migDevices := plugin.migCurrent.MigConfigs["current"][0].MigDevices
-			for k, v := range tc.expectedMig {
-				actual, ok := migDevices[k]
-				if !ok || actual != v {
-					t.Errorf("expected %s count %d, got %d", k, v, actual)
-				}
-			}
-		})
-	}
-}
 
 func TestGetNextDeviceRequest_DeviceInRegularContainer(t *testing.T) {
 	// Save and restore InRequestDevices
@@ -388,7 +264,7 @@ func Test_PodAllocationTrySuccess(t *testing.T) {
 	lockName := "test-lock"
 
 	// Call the function under test
-	podAllocationTrySuccess(nodeName, devName, lockName, pod)
+	PodAllocationTrySuccess(nodeName, devName, lockName, pod)
 
 	// Refresh the pod state from the fake clientset and check the annotations
 	refreshedPod, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
@@ -403,7 +279,6 @@ func Test_PodAllocationTrySuccess(t *testing.T) {
 }
 
 func Test_PodAllocationSuccess(t *testing.T) {
-	// Initialize fake clientset and pre-load test data
 	client.KubeClient = fake.NewClientset()
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -414,35 +289,18 @@ func Test_PodAllocationSuccess(t *testing.T) {
 			},
 		},
 	}
-
-	// Add the pod to the fake clientset
-	_, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("Failed to create test pod: %v", err)
-	}
-
 	nodeName := "test-node"
-	lockName := "test-lock"
-
-	// Update pod annotations and release the lock as part of the setup for the test
-	updatePodAnnotationsAndReleaseLock(nodeName, pod, lockName, util.DeviceBindSuccess)
-
-	// Call the function under test
-	PodAllocationSuccess(nodeName, pod, lockName)
-
-	// Refresh the pod state from the fake clientset and check the DeviceBindPhase annotation
-	refreshedPod, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Failed to get refreshed pod: %v", err)
+	if err := createPodAndLockedNode(t, pod, nodeName); err != nil {
+		t.Fatal(err)
 	}
 
-	annos, ok := refreshedPod.Annotations[util.DeviceBindPhase]
-	if !ok || annos != util.DeviceBindSuccess {
-		t.Errorf("Expected DeviceBindPhase annotation to be '%s', got '%s'", util.DeviceBindSuccess, annos)
-	}
+	PodAllocationSuccess(nodeName, pod, "test-lock")
+
+	assertDeviceBindPhase(t, pod, util.DeviceBindSuccess)
+	assertNodeLockAbsent(t, nodeName)
 }
-func Test_PodAllocationFailed(t *testing.T) {
 
+func Test_PodAllocationFailed(t *testing.T) {
 	client.KubeClient = fake.NewClientset()
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -451,30 +309,140 @@ func Test_PodAllocationFailed(t *testing.T) {
 			Annotations: map[string]string{"test-annotation-key": "test-annotation-value"},
 		},
 	}
-
-	// add pod to the fake client
-	_, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{})
-	if err != nil {
-		t.Fatalf("Failed to create test pod: %v", err)
+	nodeName := "test-node"
+	if err := createPodAndLockedNode(t, pod, nodeName); err != nil {
+		t.Fatal(err)
 	}
 
-	nodeName := "test-node"
-	lockName := "test-lock"
+	PodAllocationFailed(nodeName, pod, "test-lock")
 
-	// simulate a failed pod allocation
-	podAllocationFailed(nodeName, pod, lockName)
+	assertDeviceBindPhase(t, pod, util.DeviceBindFailed)
+	assertNodeLockAbsent(t, nodeName)
+}
 
-	// retrieve the pod from the fake client
+func TestUpdatePodAnnotationsAndReleaseLock(t *testing.T) {
+	t.Run("releases lock when patch fails", func(t *testing.T) {
+		for _, phase := range []string{util.DeviceBindFailed, util.DeviceBindSuccess} {
+			t.Run(phase, func(t *testing.T) {
+				client.KubeClient = fake.NewClientset()
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "testpod",
+						Namespace: "default",
+					},
+				}
+				nodeName := "test-node"
+				if _, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), lockedNode(pod, nodeName), metav1.CreateOptions{}); err != nil {
+					t.Fatalf("Failed to create test node: %v", err)
+				}
+
+				updatePodAnnotationsAndReleaseLock(nodeName, pod, "test-lock", phase)
+
+				assertNodeLockAbsent(t, nodeName)
+			})
+		}
+	})
+
+	t.Run("patches phase and releases lock when patch succeeds", func(t *testing.T) {
+		for _, phase := range []string{util.DeviceBindFailed, util.DeviceBindSuccess} {
+			t.Run(phase, func(t *testing.T) {
+				client.KubeClient = fake.NewClientset()
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "testpod",
+						Namespace: "default",
+					},
+				}
+				nodeName := "test-node"
+				if err := createPodAndLockedNode(t, pod, nodeName); err != nil {
+					t.Fatal(err)
+				}
+
+				updatePodAnnotationsAndReleaseLock(nodeName, pod, "test-lock", phase)
+
+				assertDeviceBindPhase(t, pod, phase)
+				assertNodeLockAbsent(t, nodeName)
+			})
+		}
+	})
+
+	t.Run("does not clear another pod lock when patch fails", func(t *testing.T) {
+		client.KubeClient = fake.NewClientset()
+		owner := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "owner-pod",
+				Namespace: "default",
+			},
+		}
+		caller := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "caller-pod",
+				Namespace: "default",
+			},
+		}
+		nodeName := "test-node"
+		if _, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), lockedNode(owner, nodeName), metav1.CreateOptions{}); err != nil {
+			t.Fatalf("Failed to create test node: %v", err)
+		}
+
+		updatePodAnnotationsAndReleaseLock(nodeName, caller, "test-lock", util.DeviceBindFailed)
+
+		refreshedNode, err := client.KubeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("Failed to get refreshed node: %v", err)
+		}
+		lockStr, ok := refreshedNode.Annotations[nodelock.NodeLockKey]
+		if !ok {
+			t.Fatal("expected other pod's node lock to remain")
+		}
+		if !strings.HasSuffix(lockStr, nodelock.NodeLockSep+nodelock.GeneratePodNamespaceName(owner, nodelock.NodeLockSep)) {
+			t.Fatalf("expected lock owned by %s/%s, got %q", owner.Namespace, owner.Name, lockStr)
+		}
+	})
+}
+
+func lockedNode(pod *corev1.Pod, nodeName string) *corev1.Node {
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nodeName,
+			Annotations: map[string]string{
+				nodelock.NodeLockKey: nodelock.GenerateNodeLockKeyByPod(pod),
+			},
+		},
+	}
+}
+
+func createPodAndLockedNode(t *testing.T, pod *corev1.Pod, nodeName string) error {
+	t.Helper()
+	if _, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		return err
+	}
+	if _, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), lockedNode(pod, nodeName), metav1.CreateOptions{}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func assertDeviceBindPhase(t *testing.T, pod *corev1.Pod, want string) {
+	t.Helper()
 	refreshedPod, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Failed to get refreshed pod: %v", err)
 	}
+	got, ok := refreshedPod.Annotations[util.DeviceBindPhase]
+	if !ok || got != want {
+		t.Fatalf("Expected DeviceBindPhase annotation to be %q, got %q", want, got)
+	}
+}
 
-	annos, ok := refreshedPod.Annotations[util.DeviceBindPhase]
-	if !ok {
-		t.Error("Expected DeviceBindPhase annotation to be present")
-	} else if annos != util.DeviceBindFailed {
-		t.Errorf("Expected DeviceBindPhase annotation to be '%s', got '%s'", util.DeviceBindFailed, annos)
+func assertNodeLockAbsent(t *testing.T, nodeName string) {
+	t.Helper()
+	refreshedNode, err := client.KubeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Failed to get refreshed node: %v", err)
+	}
+	if _, ok := refreshedNode.Annotations[nodelock.NodeLockKey]; ok {
+		t.Fatal("expected node lock to be released")
 	}
 }
 
@@ -767,5 +735,335 @@ func TestCheckCDISpec(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func gpuContainer(limits corev1.ResourceList) *corev1.Container {
+	return &corev1.Container{
+		Name:      "main",
+		Resources: corev1.ResourceRequirements{Limits: limits},
+	}
+}
+
+// cardPlugin builds a plugin that knows one card of the given size, the way the
+// registered node annotation tells the scheduler about it.
+func cardPlugin(mode string, uuid string, totalMemoryMB uint64, scaling float64) *NvidiaDevicePlugin {
+	return &NvidiaDevicePlugin{
+		operatingMode:   mode,
+		schedulerConfig: nvidia.NvidiaConfig{DeviceMemoryScaling: &scaling},
+		rm: &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices {
+			return rm.Devices{uuid: &rm.Device{TotalMemory: totalMemoryMB * 1024 * 1024}}
+		}},
+	}
+}
+
+// A forged hami.io/vgpu-devices-to-allocate annotation must not raise a
+// container's memory limit past what it requested (issue #3041).
+func TestValidateContainerAllocation(t *testing.T) {
+	restore := device.DevicesMap
+	defer func() { device.DevicesMap = restore }()
+
+	if err := config.InitDevicesWithConfig(&config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultGPUNum:                1,
+		},
+	}); err != nil {
+		t.Fatalf("failed to initialize devices: %v", err)
+	}
+
+	const uuid = "GPU-1"
+	tests := []struct {
+		name      string
+		plugin    *NvidiaDevicePlugin
+		limits    corev1.ResourceList
+		allocated device.ContainerDevices
+		wantErr   bool
+	}{
+		{
+			name:      "within the requested memory",
+			plugin:    cardPlugin("hami-core", uuid, 24000, 1),
+			limits:    corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem": resource.MustParse("3000")},
+			allocated: device.ContainerDevices{{UUID: uuid, Usedmem: 3000}},
+		},
+		{
+			name:      "more memory than requested",
+			plugin:    cardPlugin("hami-core", uuid, 24000, 1),
+			limits:    corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem": resource.MustParse("3000")},
+			allocated: device.ContainerDevices{{UUID: uuid, Usedmem: 20000}},
+			wantErr:   true,
+		},
+		{
+			name:      "more cores than requested",
+			plugin:    cardPlugin("hami-core", uuid, 24000, 1),
+			limits:    corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpucores": resource.MustParse("10")},
+			allocated: device.ContainerDevices{{UUID: uuid, Usedcores: 100}},
+			wantErr:   true,
+		},
+		{
+			name:      "within the requested percentage",
+			plugin:    cardPlugin("hami-core", uuid, 24000, 1),
+			limits:    corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem-percentage": resource.MustParse("50")},
+			allocated: device.ContainerDevices{{UUID: uuid, Usedmem: 12000}},
+		},
+		{
+			name:      "more than the requested percentage",
+			plugin:    cardPlugin("hami-core", uuid, 24000, 1),
+			limits:    corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem-percentage": resource.MustParse("50")},
+			allocated: device.ContainerDevices{{UUID: uuid, Usedmem: 20000}},
+			wantErr:   true,
+		},
+		{
+			name:      "percentage of an oversubscribed card",
+			plugin:    cardPlugin("hami-core", uuid, 24000, 2),
+			limits:    corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem-percentage": resource.MustParse("50")},
+			allocated: device.ContainerDevices{{UUID: uuid, Usedmem: 24000}},
+		},
+		{
+			name:      "percentage on a card this plugin does not know",
+			plugin:    cardPlugin("hami-core", "GPU-other", 24000, 1),
+			limits:    corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem-percentage": resource.MustParse("50")},
+			allocated: device.ContainerDevices{{UUID: uuid, Usedmem: 20000}},
+		},
+		{
+			name:      "memory left to the default",
+			plugin:    cardPlugin("hami-core", uuid, 24000, 1),
+			limits:    corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+			allocated: device.ContainerDevices{{UUID: uuid, Usedmem: 24000}},
+		},
+		{
+			name:      "mig slice charged its profile",
+			plugin:    cardPlugin("mig", uuid, 24000, 1),
+			limits:    corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem": resource.MustParse("3000")},
+			allocated: device.ContainerDevices{{UUID: uuid, Usedmem: 20000}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.plugin.validateContainerAllocation(gpuContainer(tt.limits), tt.allocated)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("the allocation was accepted")
+				}
+				if !strings.Contains(err.Error(), "main") {
+					t.Errorf("error %q does not name the container", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("the allocation was rejected: %v", err)
+			}
+		})
+	}
+}
+
+// A forged MIG allocation must name a profile this node registered and that is
+// large enough for the container's own memory request (issue #3077).
+func TestValidateMigAllocation(t *testing.T) {
+	restore := device.DevicesMap
+	defer func() { device.DevicesMap = restore }()
+
+	if err := config.InitDevicesWithConfig(&config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultGPUNum:                1,
+		},
+	}); err != nil {
+		t.Fatalf("failed to initialize devices: %v", err)
+	}
+
+	const uuid = "GPU-1"
+	registered := []device.MigProfile{
+		{Name: "1g.10gb", MemoryMB: 9984},
+		{Name: "3g.40gb", MemoryMB: 40448},
+	}
+	placement := device.MigPlacement{Start: 0, Size: 1}
+	gpu := func(mem string) corev1.ResourceList {
+		return corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem": resource.MustParse(mem)}
+	}
+
+	tests := []struct {
+		name        string
+		limits      corev1.ResourceList
+		allocations []nvidia.MigAllocation
+		unknownCard bool
+		scaling     float64
+		wantErr     string
+	}{
+		{
+			name:        "registered profile that covers the request",
+			limits:      gpu("8000"),
+			allocations: []nvidia.MigAllocation{{ContainerIndex: 1, GPUUUID: uuid, Profile: "1g.10gb", Placement: placement}},
+		},
+		{
+			name:        "profile the node does not offer",
+			limits:      gpu("8000"),
+			allocations: []nvidia.MigAllocation{{ContainerIndex: 1, GPUUUID: uuid, Profile: "7g.80gb", Placement: placement}},
+			wantErr:     "does not offer",
+		},
+		{
+			name:        "profile too small for the request",
+			limits:      gpu("20000"),
+			allocations: []nvidia.MigAllocation{{ContainerIndex: 1, GPUUUID: uuid, Profile: "1g.10gb", Placement: placement}},
+			wantErr:     "requests 20000 MB",
+		},
+		{
+			name:        "percentage of the card",
+			limits:      corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem-percentage": resource.MustParse("50")},
+			allocations: []nvidia.MigAllocation{{ContainerIndex: 1, GPUUUID: uuid, Profile: "1g.10gb", Placement: placement}},
+			wantErr:     "requests 20480 MB",
+		},
+		{
+			name:        "memory scaling does not apply to a MIG card",
+			limits:      corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem-percentage": resource.MustParse("50")},
+			scaling:     2,
+			allocations: []nvidia.MigAllocation{{ContainerIndex: 1, GPUUUID: uuid, Profile: "3g.40gb", Placement: placement}},
+		},
+		{
+			name:        "another container's allocation is not judged",
+			limits:      gpu("8000"),
+			allocations: []nvidia.MigAllocation{{ContainerIndex: 0, GPUUUID: uuid, Profile: "7g.80gb", Placement: placement}},
+		},
+		{
+			name:        "card with no registered profiles yet",
+			limits:      gpu("8000"),
+			unknownCard: true,
+			allocations: []nvidia.MigAllocation{{ContainerIndex: 1, GPUUUID: "GPU-other", Profile: "7g.80gb", Placement: placement}},
+		},
+		{
+			name:   "no MIG allocation at all",
+			limits: gpu("8000"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scaling := tt.scaling
+			if scaling == 0 {
+				scaling = 1
+			}
+			plugin := cardPlugin("mig", uuid, 40960, scaling)
+			plugin.rememberMigCard(uuid, 40960, registered)
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{Name: "init"}},
+					Containers:     []corev1.Container{*gpuContainer(tt.limits)},
+				},
+			}
+			if len(tt.allocations) > 0 {
+				raw, err := json.Marshal(tt.allocations)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pod.Annotations[nvidia.MigAllocationsAnnotation] = string(raw)
+			}
+			err := plugin.validateMigAllocation(pod, &pod.Spec.Containers[0])
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("the allocation was rejected: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("the allocation was accepted")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) || !strings.Contains(err.Error(), "main") {
+				t.Errorf("error %q lacks %q or the container name", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestContainerIndex(t *testing.T) {
+	pod := &corev1.Pod{Spec: corev1.PodSpec{
+		InitContainers: []corev1.Container{{Name: "init"}},
+		Containers:     []corev1.Container{{Name: "a"}, {Name: "b"}},
+	}}
+	for name, want := range map[string]int{"init": 0, "a": 1, "b": 2, "missing": -1} {
+		if got := containerIndex(pod, name); got != want {
+			t.Errorf("containerIndex(%q) = %d, want %d", name, got, want)
+		}
+	}
+}
+
+// A device plugin built without the nvidia backend registered has no request to
+// compare against, and must not reject the allocation on that account.
+func TestValidateContainerAllocationWithoutDevices(t *testing.T) {
+	restore := device.DevicesMap
+	defer func() { device.DevicesMap = restore }()
+	device.DevicesMap = nil
+
+	limits := corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1"), "nvidia.com/gpumem": resource.MustParse("3000")}
+	plugin := cardPlugin("hami-core", "GPU-1", 24000, 1)
+	if err := plugin.validateContainerAllocation(gpuContainer(limits), device.ContainerDevices{{UUID: "GPU-1", Usedmem: 20000}}); err != nil {
+		t.Fatalf("the allocation was rejected: %v", err)
+	}
+}
+
+// Alignment can move an annotated entry onto the card the kubelet picked, so
+// the share has to be measured against that card rather than the one the
+// annotation named. Half of an 80 GB card is 40 GB, and carrying that onto a
+// 24 GB card would hand the container a limit past the whole device.
+func TestAllocate_PercentageCheckedAgainstAlignedDevice(t *testing.T) {
+	setupInRequestDevices(t)
+	restore := device.DevicesMap
+	defer func() { device.DevicesMap = restore }()
+	if err := config.InitDevicesWithConfig(&config.Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultGPUNum:                1,
+		},
+	}); err != nil {
+		t.Fatalf("failed to initialize devices: %v", err)
+	}
+
+	annotated := &rm.Device{TotalMemory: 80000 * 1024 * 1024}
+	annotated.ID = "GPU-aaa"
+	selected := &rm.Device{TotalMemory: 24000 * 1024 * 1024}
+	selected.ID = "GPU-bbb"
+	plugin := newTestPluginWithRM(t, map[string]*rm.Device{"GPU-aaa": annotated, "GPU-bbb": selected})
+
+	previous := enableGetPreferredAllocation
+	enableGetPreferredAllocation = true
+	t.Cleanup(func() { enableGetPreferredAllocation = previous })
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "aligned-pod", Namespace: "default", UID: "aligned-uid",
+			Annotations: map[string]string{
+				"hami.io/vgpu-devices-to-allocate": "GPU-aaa,NVIDIA,40000,50:;",
+			},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "c0",
+			Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+				"nvidia.com/gpu":               resource.MustParse("1"),
+				"nvidia.com/gpumem-percentage": resource.MustParse("50"),
+			}},
+		}}},
+	}
+	setupFakeClient(t, pod)
+	mockAllocateGlobals(t, pod)
+
+	_, err := plugin.Allocate(context.Background(), &kubeletdevicepluginv1beta1.AllocateRequest{
+		ContainerRequests: []*kubeletdevicepluginv1beta1.ContainerAllocateRequest{
+			{DevicesIds: []string{"GPU-bbb"}},
+		},
+	})
+	if err == nil {
+		t.Fatal("the allocation was accepted on the smaller card")
+	}
+	if !strings.Contains(err.Error(), "GPU-bbb") {
+		t.Errorf("error %q does not name the card the container got", err)
 	}
 }

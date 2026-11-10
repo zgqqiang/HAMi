@@ -17,6 +17,7 @@ limitations under the License.
 package iluvatar
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,13 +25,74 @@ import (
 	"testing"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/util/client"
 
 	"gotest.tools/v3/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
 )
+
+func TestCheckHealth(t *testing.T) {
+	dev := &IluvatarDevices{
+		config: IluvatarConfig{
+			CommonWord:         "MR-V100",
+			ResourceMemoryName: "iluvatar.ai/MR-V100.vMem",
+			ResourceCoreName:   "iluvatar.ai/MR-V100.vCore",
+			ResourceCountName:  "iluvatar.ai/MR-V100-vgpu",
+		},
+		nodeRegisterAnno: "hami.io/node-MR-V100-register",
+	}
+	oneCard := "GPU-0,10,8192,100,MR-V100,0,true:"
+	twoCards := "GPU-0,10,8192,100,MR-V100,0,true:GPU-1,10,8192,100,MR-V100,0,true:"
+
+	node := func(name string, mem, core int64, register string) *corev1.Node {
+		n := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{}},
+			Status:     corev1.NodeStatus{Allocatable: corev1.ResourceList{}},
+		}
+		if register != "" {
+			n.Annotations[dev.nodeRegisterAnno] = register
+		}
+		if mem > 0 {
+			n.Status.Allocatable["iluvatar.ai/MR-V100.vMem"] = *resource.NewQuantity(mem, resource.DecimalSI)
+		}
+		if core > 0 {
+			n.Status.Allocatable["iluvatar.ai/MR-V100.vCore"] = *resource.NewQuantity(core, resource.DecimalSI)
+		}
+		return n
+	}
+
+	healthy, needUpdate := dev.CheckHealth("MR-V100", nil)
+	assert.Equal(t, healthy, false)
+	assert.Equal(t, needUpdate, false)
+
+	// A count resource without memory or core must not keep the node schedulable.
+	countOnly := node("iluvatar-health-count", 0, 0, oneCard)
+	countOnly.Status.Allocatable["iluvatar.ai/MR-V100-vgpu"] = *resource.NewQuantity(2, resource.DecimalSI)
+	healthy, needUpdate = dev.CheckHealth("MR-V100", countOnly)
+	assert.Equal(t, healthy, false)
+	assert.Equal(t, needUpdate, false)
+
+	present := node("iluvatar-health-mem", 8192, 0, oneCard)
+	healthy, needUpdate = dev.CheckHealth("MR-V100", present)
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+	healthy, needUpdate = dev.CheckHealth("MR-V100", present)
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, false)
+
+	present.Annotations[dev.nodeRegisterAnno] = twoCards
+	healthy, needUpdate = dev.CheckHealth("MR-V100", present)
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+
+	healthy, needUpdate = dev.CheckHealth("MR-V100", node("iluvatar-health-core", 0, 100, oneCard))
+	assert.Equal(t, healthy, true)
+	assert.Equal(t, needUpdate, true)
+}
 
 func TestGetNodeDevices(t *testing.T) {
 	dev := IluvatarDevices{
@@ -61,9 +123,9 @@ func TestGetNodeDevices(t *testing.T) {
 			want: []*device.DeviceInfo{
 				{
 					ID:           "GPU-bad51c5a-ed4c-591d-91bf-c04a12e19eae",
-					Count:        int32(10),
-					Devcore:      int32(100),
-					Devmem:       int32(8192),
+					Count:        int64(10),
+					Devcore:      int64(100),
+					Devmem:       int64(8192),
 					Type:         "MR-V100",
 					Numa:         0,
 					Health:       true,
@@ -337,12 +399,98 @@ func Test_GenerateResourceRequests(t *testing.T) {
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(1),
+				Nums:             int64(1),
 				Type:             "MR-V100",
-				Memreq:           int32(256000),
-				MemPercentagereq: int32(0),
-				Coresreq:         int32(100),
+				Memreq:           int64(256000),
+				MemPercentagereq: int64(0),
+				Coresreq:         int64(100),
 			},
+		},
+		{
+			name: "cores 50 accepted",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"iluvatar.ai/MR-V100-vgpu":  resource.MustParse("1"),
+						"iluvatar.ai/MR-V100.vMem":  resource.MustParse("1000"),
+						"iluvatar.ai/MR-V100.vCore": resource.MustParse("50"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(1),
+				Type:             "MR-V100",
+				Memreq:           int64(256000),
+				MemPercentagereq: int64(0),
+				Coresreq:         int64(50),
+			},
+		},
+		{
+			name: "cores 0 accepted",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"iluvatar.ai/MR-V100-vgpu":  resource.MustParse("1"),
+						"iluvatar.ai/MR-V100.vMem":  resource.MustParse("1000"),
+						"iluvatar.ai/MR-V100.vCore": resource.MustParse("0"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             int64(1),
+				Type:             "MR-V100",
+				Memreq:           int64(256000),
+				MemPercentagereq: int64(0),
+				Coresreq:         int64(0),
+			},
+		},
+		{
+			name: "cores 101 rejected",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"iluvatar.ai/MR-V100-vgpu":  resource.MustParse("1"),
+						"iluvatar.ai/MR-V100.vCore": resource.MustParse("101"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "cores 150 rejected",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"iluvatar.ai/MR-V100-vgpu":  resource.MustParse("1"),
+						"iluvatar.ai/MR-V100.vCore": resource.MustParse("150"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "cores 200 rejected",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"iluvatar.ai/MR-V100-vgpu":  resource.MustParse("1"),
+						"iluvatar.ai/MR-V100.vCore": resource.MustParse("200"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "negative cores -1 rejected",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"iluvatar.ai/MR-V100-vgpu":  resource.MustParse("1"),
+						"iluvatar.ai/MR-V100.vCore": resource.MustParse("-1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
 		},
 		{
 			name: "all resources don't set to limits and requests",
@@ -367,12 +515,34 @@ func Test_GenerateResourceRequests(t *testing.T) {
 				},
 			},
 			want: device.ContainerDeviceRequest{
-				Nums:             int32(1),
+				Nums:             int64(1),
 				Type:             "MR-V100",
-				Memreq:           int32(0),
-				MemPercentagereq: int32(100),
-				Coresreq:         int32(0),
+				Memreq:           int64(0),
+				MemPercentagereq: int64(100),
+				Coresreq:         int64(0),
 			},
+		},
+		{
+			name: "device count zero is rejected",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"iluvatar.ai/MR-V100-vgpu": resource.MustParse("0"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "negative device count is rejected",
+			args: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"iluvatar.ai/MR-V100-vgpu": resource.MustParse("-1"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
 		},
 	}
 	for _, test := range tests {
@@ -388,10 +558,33 @@ func Test_GenerateResourceRequests(t *testing.T) {
 			}
 			fs := flag.FlagSet{}
 			ParseConfig(&fs)
-			result := dev.GenerateResourceRequests(test.args)
+			result, _ := dev.GenerateResourceRequests(test.args)
 			assert.DeepEqual(t, result, test.want)
 		})
 	}
+}
+
+func TestFit_MutexRejectsUsedDevice(t *testing.T) {
+	dev := IluvatarDevices{
+		config: IluvatarConfig{
+			CommonWord:         "MR-V100",
+			ChipName:           "MR-V100",
+			ResourceCountName:  "iluvatar.ai/MR-V100-vgpu",
+			ResourceMemoryName: "iluvatar.ai/MR-V100.vMem",
+			ResourceCoreName:   "iluvatar.ai/MR-V100.vCore",
+		},
+	}
+	devices := []*device.DeviceUsage{
+		{ID: "dev-0", Index: 0, Used: 1, Count: 100, Totalmem: 128, Totalcore: 100, Numa: 0, Type: "MR-V100", Health: true},
+	}
+	request := device.ContainerDeviceRequest{Nums: 1, Type: "MR-V100", Memreq: 64, Coresreq: 50}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{"hami.io/gpu-scheduler-policy": "mutex"},
+	}}
+
+	ok, _, reason := dev.Fit(devices, request, pod, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, ok, false)
+	assert.Equal(t, reason, "1/1 ExclusiveDeviceAllocateConflict")
 }
 
 func Test_Fit(t *testing.T) {
@@ -413,6 +606,7 @@ func Test_Fit(t *testing.T) {
 		wantOK     bool
 		wantLen    int
 		wantDevIDs []string
+		wantReason string
 	}{
 		{
 			name: "fit success",
@@ -482,6 +676,7 @@ func Test_Fit(t *testing.T) {
 			wantOK:     false,
 			wantLen:    0,
 			wantDevIDs: []string{},
+			wantReason: "1/1 CardInsufficientMemory",
 		},
 		{
 			name: "fit fail: core not enough",
@@ -509,6 +704,7 @@ func Test_Fit(t *testing.T) {
 			wantOK:     false,
 			wantLen:    0,
 			wantDevIDs: []string{},
+			wantReason: "1/1 CardInsufficientMemory",
 		},
 		{
 			name: "fit fail: type mismatch",
@@ -536,6 +732,65 @@ func Test_Fit(t *testing.T) {
 			wantOK:     false,
 			wantLen:    0,
 			wantDevIDs: []string{},
+			wantReason: "1/1 CardTypeMismatch",
+		},
+		{
+			name: "mutex policy rejects used device",
+			devices: []*device.DeviceUsage{
+				{
+					ID:        "dev-0",
+					Index:     0,
+					Used:      1,
+					Count:     2,
+					Usedmem:   0,
+					Totalmem:  128,
+					Totalcore: 100,
+					Usedcores: 0,
+					Numa:      0,
+					Type:      "MR-V100",
+					Health:    true,
+				},
+			},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Type:             "MR-V100",
+				Memreq:           64,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+			},
+			annos:      map[string]string{"hami.io/gpu-scheduler-policy": "mutex"},
+			wantOK:     false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 ExclusiveDeviceAllocateConflict",
+		},
+		{
+			name: "fit fail: CardNotHealth",
+			devices: []*device.DeviceUsage{{
+				ID:        "dev-0",
+				Index:     0,
+				Used:      0,
+				Count:     100,
+				Usedmem:   0,
+				Totalmem:  128,
+				Totalcore: 100,
+				Usedcores: 0,
+				Numa:      0,
+				Type:      "MR-V100",
+				Health:    false,
+			}},
+			request: device.ContainerDeviceRequest{
+				Nums:             1,
+				Type:             "MR-V100",
+				Memreq:           64,
+				MemPercentagereq: 0,
+				Coresreq:         50,
+			},
+			annos:      map[string]string{},
+			wantOK:     false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardNotHealth",
 		},
 	}
 
@@ -547,7 +802,7 @@ func Test_Fit(t *testing.T) {
 					Annotations: test.annos,
 				},
 			}
-			ok, result, _ := dev.Fit(test.devices, test.request, pod, &device.NodeInfo{}, allocated)
+			ok, result, reason := dev.Fit(test.devices, test.request, pod, &device.NodeInfo{}, allocated)
 			if test.wantOK {
 				if len(result["MR-V100"]) != test.wantLen {
 					t.Errorf("expected %d, got %d", test.wantLen, len(result["MR-V100"]))
@@ -567,6 +822,9 @@ func Test_Fit(t *testing.T) {
 				if len(result["MR-V100"]) != test.wantLen {
 					t.Errorf("expected %d, got %d", test.wantLen, len(result["MR-V100"]))
 				}
+			}
+			if reason != test.wantReason {
+				t.Errorf("expected reason: %s, got reason: %s", test.wantReason, reason)
 			}
 		})
 	}
@@ -654,4 +912,280 @@ func TestDevices_ReleaseNodeLock(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDevices_AddResourceUsage(t *testing.T) {
+	tests := []struct {
+		name        string
+		deviceUsage *device.DeviceUsage
+		ctr         *device.ContainerDevice
+		wantUsage   *device.DeviceUsage
+	}{
+		{
+			name: "empty device usage",
+			deviceUsage: &device.DeviceUsage{
+				ID:        "dev-0",
+				Used:      0,
+				Usedcores: 0,
+				Usedmem:   0,
+			},
+			ctr: &device.ContainerDevice{
+				UUID:      "dev-0",
+				Usedcores: 2,
+				Usedmem:   2048,
+			},
+			wantUsage: &device.DeviceUsage{
+				ID:        "dev-0",
+				Used:      1,
+				Usedcores: 2,
+				Usedmem:   2048,
+			},
+		},
+		{
+			name: "device usage with existing usage",
+			deviceUsage: &device.DeviceUsage{
+				ID:        "dev-0",
+				Used:      1,
+				Usedcores: 2,
+				Usedmem:   2048,
+			},
+			ctr: &device.ContainerDevice{
+				UUID:      "dev-0",
+				Usedcores: 2,
+				Usedmem:   2048,
+			},
+			wantUsage: &device.DeviceUsage{
+				ID:        "dev-0",
+				Used:      2,
+				Usedcores: 4,
+				Usedmem:   4096,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dev := &IluvatarDevices{}
+			if err := dev.AddResourceUsage(&corev1.Pod{}, tt.deviceUsage, tt.ctr); err != nil {
+				t.Fatalf("AddResourceUsage() error=%v", err)
+			}
+			assert.Equal(t, tt.wantUsage.Usedcores, tt.deviceUsage.Usedcores)
+			assert.Equal(t, tt.wantUsage.Usedmem, tt.deviceUsage.Usedmem)
+			assert.Equal(t, tt.wantUsage.Used, tt.deviceUsage.Used)
+		})
+	}
+}
+
+func TestFit_CoresValidation(t *testing.T) {
+	dev := &IluvatarDevices{
+		config: IluvatarConfig{
+			CommonWord: "MR-V100",
+		},
+	}
+	devices := []*device.DeviceUsage{
+		{
+			ID:        "dev-0",
+			Index:     0,
+			Count:     10,
+			Totalmem:  8000,
+			Totalcore: 100,
+			Used:      0,
+			Usedmem:   0,
+			Usedcores: 0,
+			Health:    true,
+			Type:      "MR-V100",
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+	}
+
+	tests := []struct {
+		name     string
+		coresreq int64
+		wantOk   bool
+	}{
+		{
+			name:     "cores 0 is accepted",
+			coresreq: 0,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 50 is accepted",
+			coresreq: 50,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 100 is accepted",
+			coresreq: 100,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 101 is rejected",
+			coresreq: 101,
+			wantOk:   false,
+		},
+		{
+			name:     "cores 150 is rejected and not converted to 100",
+			coresreq: 150,
+			wantOk:   false,
+		},
+		{
+			name:     "cores 200 is rejected",
+			coresreq: 200,
+			wantOk:   false,
+		},
+		{
+			name:     "negative cores -1 is rejected",
+			coresreq: -1,
+			wantOk:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := device.ContainerDeviceRequest{
+				Nums:     1,
+				Type:     "MR-V100",
+				Memreq:   1000,
+				Coresreq: tt.coresreq,
+			}
+			ok, _, _ := dev.Fit(devices, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+			assert.Equal(t, ok, tt.wantOk)
+		})
+	}
+
+	t.Run("empty devices with invalid coresreq returns out of range", func(t *testing.T) {
+		req := device.ContainerDeviceRequest{
+			Nums:     1,
+			Type:     "MR-V100",
+			Memreq:   1000,
+			Coresreq: 150,
+		}
+		ok, _, reason := dev.Fit([]*device.DeviceUsage{}, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+		assert.Equal(t, ok, false)
+		assert.Equal(t, reason, "core limit out of range")
+	})
+
+	t.Run("mismatched device type with invalid coresreq returns out of range", func(t *testing.T) {
+		req := device.ContainerDeviceRequest{
+			Nums:     1,
+			Type:     "MR-V100",
+			Memreq:   1000,
+			Coresreq: -1,
+		}
+		mismatchDevs := []*device.DeviceUsage{
+			{ID: "other-0", Type: "OtherType", Health: true},
+		}
+		ok, _, reason := dev.Fit(mismatchDevs, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+		assert.Equal(t, ok, false)
+		assert.Equal(t, reason, "core limit out of range")
+	})
+}
+
+func iluvatarTestDevice() IluvatarDevices {
+	return IluvatarDevices{
+		config: IluvatarConfig{
+			CommonWord:         "MR-V100",
+			ChipName:           "MR-V100",
+			ResourceCountName:  "iluvatar.ai/MR-V100-vgpu",
+			ResourceMemoryName: "iluvatar.ai/MR-V100.vMem",
+			ResourceCoreName:   "iluvatar.ai/MR-V100.vCore",
+		},
+	}
+}
+
+func iluvatarContainer(count int64, cores *int64) *corev1.Container {
+	limits := corev1.ResourceList{
+		"iluvatar.ai/MR-V100-vgpu": *resource.NewQuantity(count, resource.DecimalSI),
+	}
+	if cores != nil {
+		limits["iluvatar.ai/MR-V100.vCore"] = *resource.NewQuantity(*cores, resource.DecimalSI)
+	}
+	return &corev1.Container{Name: "demo", Resources: corev1.ResourceRequirements{Limits: limits}}
+}
+
+// Test_GenerateResourceRequests_MutatedMultiCard walks the admission path.
+// MutateAdmission rewrites the core limit to count*100 for a multi card
+// request, and GenerateResourceRequests has to read that total back as a per
+// card percentage. It previously compared the total against the 0-100 range,
+// so every multi card request returned an empty request and the pod was
+// scheduled with no device.
+func Test_GenerateResourceRequests_MutatedMultiCard(t *testing.T) {
+	dev := iluvatarTestDevice()
+	for _, count := range []int64{1, 2, 4, 8} {
+		ctr := iluvatarContainer(count, nil)
+		if _, err := dev.MutateAdmission(ctr, &corev1.Pod{}); err != nil {
+			t.Fatalf("MutateAdmission(count=%d): %v", count, err)
+		}
+		got, _ := dev.GenerateResourceRequests(ctr)
+		if got.Nums != count {
+			t.Errorf("count=%d: Nums = %d, want %d", count, got.Nums, count)
+		}
+		if count > 1 && got.Coresreq != 100 {
+			t.Errorf("count=%d: Coresreq = %d, want 100 per card", count, got.Coresreq)
+		}
+	}
+}
+
+// Test_GenerateResourceRequests_CoreLimitScales pins which values are treated
+// as a total and which as a per card percentage. The admission webhook is
+// optional: it can be disabled, it defaults to failurePolicy Ignore, and a
+// namespace or pod can carry hami.io/webhook: ignore. On those paths the limit
+// was never scaled, so a per card value must reach the scheduler untouched.
+func Test_GenerateResourceRequests_CoreLimitScales(t *testing.T) {
+	dev := iluvatarTestDevice()
+	tests := []struct {
+		name     string
+		count    int64
+		cores    int64
+		wantCore int64
+		wantNums int64
+	}{
+		{name: "scaled by the webhook", count: 2, cores: 200, wantCore: 100, wantNums: 2},
+		{name: "scaled by the webhook, eight cards", count: 8, cores: 800, wantCore: 100, wantNums: 8},
+		{name: "unscaled per card value is left alone", count: 2, cores: 60, wantCore: 60, wantNums: 2},
+		{name: "unscaled small value does not truncate to zero", count: 4, cores: 3, wantCore: 3, wantNums: 4},
+		{name: "unscaled full share", count: 8, cores: 100, wantCore: 100, wantNums: 8},
+		{name: "single card is unchanged", count: 1, cores: 50, wantCore: 50, wantNums: 1},
+		{name: "a total that does not divide evenly is rejected", count: 4, cores: 150, wantCore: 0, wantNums: 0},
+		{name: "a per card value above 100 is still rejected", count: 1, cores: 200, wantCore: 0, wantNums: 0},
+		{name: "negative is rejected", count: 2, cores: -1, wantCore: 0, wantNums: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, _ := dev.GenerateResourceRequests(iluvatarContainer(test.count, &test.cores))
+			if got.Nums != test.wantNums {
+				t.Errorf("Nums = %d, want %d", got.Nums, test.wantNums)
+			}
+			if got.Coresreq != test.wantCore {
+				t.Errorf("Coresreq = %d, want %d", got.Coresreq, test.wantCore)
+			}
+		})
+	}
+}
+
+func TestNodeCleanUpRemovesHandshake(t *testing.T) {
+	dev := &IluvatarDevices{handshakeAnno: "hami.io/node-handshake-MR-V100"}
+	prevClient := client.KubeClient
+	t.Cleanup(func() { client.KubeClient = prevClient })
+	client.KubeClient = fake.NewClientset()
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "node-cleanup",
+			Annotations: map[string]string{dev.handshakeAnno: "Requesting_2024-01-02 00:00:00"},
+		},
+	}
+	_, err := client.KubeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	assert.NilError(t, err)
+
+	assert.NilError(t, dev.NodeCleanUp(node.Name))
+
+	got, err := client.KubeClient.CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{})
+	assert.NilError(t, err)
+	_, ok := got.Annotations[dev.handshakeAnno]
+	assert.Equal(t, ok, false)
 }

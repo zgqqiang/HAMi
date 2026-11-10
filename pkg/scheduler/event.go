@@ -40,6 +40,15 @@ const (
 	EventReasonBindingFailed = "BindingFailed"
 	// EventReasonBindingSucceed indicates that  binding succeed.
 	EventReasonBindingSucceed = "BindingSucceed"
+
+	// EventReasonNumaRefitFailed indicates that a NUMA refit failed.
+	EventReasonNumaRefitFailed = "NumaRefitFailed"
+	// EventReasonNumaRefitSucceed indicates that a NUMA refit succeeded.
+	EventReasonNumaRefitSucceed = "NumaRefitSucceed"
+
+	// EventReasonAllocationDecodeFailed indicates that a live Pod allocation
+	// annotation could not be decoded during scheduler accounting.
+	EventReasonAllocationDecodeFailed = "AllocationDecodeFailed"
 )
 
 func (s *Scheduler) addAllEventHandlers() {
@@ -63,6 +72,29 @@ func (s *Scheduler) recordScheduleBindingResultEvent(pod *corev1.Pod, eventReaso
 	} else {
 		s.eventRecorder.Event(pod, corev1.EventTypeWarning, eventReason, schedulerErr.Error())
 	}
+}
+
+// recordNumaRefitResultEvent emits the outcome of a NUMA refit on the pod.
+func (s *Scheduler) recordNumaRefitResultEvent(pod *corev1.Pod, successMsg string, refitErr error) {
+	// eventRecorder maybe  nil
+	if pod == nil || s.eventRecorder == nil {
+		return
+	}
+	if refitErr == nil {
+		s.eventRecorder.Event(pod, corev1.EventTypeNormal, EventReasonNumaRefitSucceed, successMsg)
+	} else {
+		s.eventRecorder.Event(pod, corev1.EventTypeWarning, EventReasonNumaRefitFailed, refitErr.Error())
+	}
+}
+
+// recordAllocationDecodeFailureEvent reports an allocation that could not be
+// reconstructed without changing candidate-node selection.
+func (s *Scheduler) recordAllocationDecodeFailureEvent(pod *corev1.Pod, nodeName string, decodeErr error) {
+	if pod == nil || s.eventRecorder == nil || decodeErr == nil {
+		return
+	}
+	s.eventRecorder.Eventf(pod, corev1.EventTypeWarning, EventReasonAllocationDecodeFailed,
+		"Failed to decode HAMi allocated-device annotations for node %q: %v", nodeName, decodeErr)
 }
 
 func (s *Scheduler) recordScheduleFilterResultEvent(pod *corev1.Pod, eventReason string, successMsg string, schedulerErr error) {

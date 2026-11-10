@@ -16,7 +16,7 @@ set -o errexit  # Exit immediately if a command exits with a non-zero status
 set -o nounset  # Exit if an unset variable is referenced
 set -o pipefail # Exit if any command in a pipeline fails
 
-MIN_Go_VERSION=1.21.0
+MIN_Go_VERSION=1.27.0
 
 # Check if a command exists.
 function util::cmd_exist {
@@ -70,7 +70,15 @@ function util::install_helm {
     return 0
   fi
   echo "Installing Helm..."
-  curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  local get_helm_ref="8eb65528be9bcf8c40096d386c6eef901537f56f"
+  local get_helm_sha256="38b65f882d9cae3891755bdb03becc6a01ae6f9cb24826c191f219ddfee70a5d"
+  local helm_version="v3.22.1"
+  local get_helm_script
+  get_helm_script=$(mktemp)
+  trap 'rm -f "${get_helm_script}"' EXIT
+  curl -sSfL "https://raw.githubusercontent.com/helm/helm/${get_helm_ref}/scripts/get-helm-3" -o "${get_helm_script}"
+  echo "${get_helm_sha256}  ${get_helm_script}" | sha256sum -c -
+  bash "${get_helm_script}" --version "${helm_version}"
 }
 
 # Execute a command and capture output.
@@ -128,9 +136,9 @@ function util::check_pods_status {
 
     # Checking unhealthy pods in namespaces，ignore the  Running & Succeeded status
     if [[ -z "$namespace" ]]; then
-      unhealthy_pods=$(kubectl get po -A --kubeconfig "$kubeconfig" --no-headers --ignore-not-found | awk '!/Running|Succeeded|Completed/ {print $2}')
+      unhealthy_pods=$(kubectl get po -A --kubeconfig "$kubeconfig" --no-headers --ignore-not-found | awk '!/Running|Succeeded|Completed/ {print $1"/"$2}')
     else
-      unhealthy_pods=$(kubectl get po -n "$namespace" --kubeconfig "$kubeconfig" --no-headers --ignore-not-found | awk '!/Running|Succeeded|Completed/ {print $1}')
+      unhealthy_pods=$(kubectl get po -n "$namespace" --kubeconfig "$kubeconfig" --no-headers --ignore-not-found | awk -v ns="$namespace" '!/Running|Succeeded|Completed/ {print ns"/"$1}')
     fi
 
     if [[ -z "$unhealthy_pods" ]]; then
@@ -150,15 +158,20 @@ function util::check_pods_status {
   done
 
   if [[ -n "$unhealthy_pods" ]]; then
-    echo "Found unhealthy pods in namespace $namespace:"
+    echo "Found unhealthy pods:"
     echo "$unhealthy_pods"
 
+    local pod_namespace pod_name
     for pod in $unhealthy_pods; do
+      pod_namespace=${pod%%/*}
+      pod_name=${pod#*/}
       echo "Describing pod: $pod"
-      kubectl describe po "$pod" -n "$namespace" --kubeconfig "$kubeconfig"
+      kubectl describe po "$pod_name" -n "$pod_namespace" --kubeconfig "$kubeconfig"
 
       echo "Fetching logs for pod: $pod"
-      kubectl logs "$pod" -n "$namespace" --kubeconfig "$kubeconfig"
+      kubectl logs "$pod_name" -n "$pod_namespace" --kubeconfig "$kubeconfig" --all-containers --prefix
+      echo "Fetching previous logs for pod: $pod"
+      kubectl logs "$pod_name" -n "$pod_namespace" --kubeconfig "$kubeconfig" --all-containers --prefix --previous || true
       echo "---------------------------------------------------"
     done
 

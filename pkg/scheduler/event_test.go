@@ -31,6 +31,23 @@ import (
 	"k8s.io/client-go/tools/record"
 )
 
+func TestRecordAllocationDecodeFailureEvent(t *testing.T) {
+	recorder := record.NewFakeRecorder(1)
+	s := &Scheduler{eventRecorder: recorder}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "test-pod", Namespace: "default"}}
+
+	s.recordAllocationDecodeFailureEvent(pod, "node-a", fmt.Errorf("invalid allocation annotation"))
+
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, corev1.EventTypeWarning)
+		assert.Contains(t, event, EventReasonAllocationDecodeFailed)
+		assert.Contains(t, event, "node-a")
+	case <-time.After(time.Second):
+		t.Fatal("expected allocation decode failure event")
+	}
+}
+
 func TestRecordScheduleBindingResultEvent(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -106,13 +123,13 @@ func TestRecordScheduleBindingResultEvent(t *testing.T) {
 				}
 				event := events.Items[0]
 				if test.schedulerErr != nil {
-					assert.Equal(t, event.Type, corev1.EventTypeWarning)
+					assert.Equal(t, corev1.EventTypeWarning, event.Type)
 				} else {
-					assert.Equal(t, event.Type, corev1.EventTypeNormal)
+					assert.Equal(t, corev1.EventTypeNormal, event.Type)
 				}
 			} else {
 				events, _ = fakeClient.CoreV1().Events(metav1.NamespaceAll).List(context.Background(), metav1.ListOptions{})
-				assert.Equal(t, len(events.Items), 0)
+				assert.Empty(t, events.Items)
 			}
 		})
 	}
@@ -193,13 +210,13 @@ func TestRecordScheduleFilterResultEvent(t *testing.T) {
 				}
 				event := events.Items[0]
 				if test.schedulerErr != nil {
-					assert.Equal(t, event.Type, corev1.EventTypeWarning)
+					assert.Equal(t, corev1.EventTypeWarning, event.Type)
 				} else {
-					assert.Equal(t, event.Type, corev1.EventTypeNormal)
+					assert.Equal(t, corev1.EventTypeNormal, event.Type)
 				}
 			} else {
 				events, _ = fakeClient.CoreV1().Events(metav1.NamespaceAll).List(context.Background(), metav1.ListOptions{})
-				assert.Equal(t, len(events.Items), 0)
+				assert.Empty(t, events.Items)
 			}
 		})
 	}

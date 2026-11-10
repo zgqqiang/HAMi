@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -41,6 +42,10 @@ const (
 	MetaxSGPUDevice     = "Metax-SGPU"
 
 	MetaxNodeLock = "hami.io/mutex.lock"
+
+	// MemoryFactor converts the vmemory unit used in the pod spec into the MiB
+	// HAMi accounts internally. A bare vmemory value is read as Gi.
+	MemoryFactor = 1024
 )
 
 const (
@@ -166,16 +171,7 @@ func (sdev *MetaxSDevices) PatchAnnotations(pod *corev1.Pod, annoinput *map[stri
 }
 
 func (sdev *MetaxSDevices) LockNode(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-
-	for _, val := range p.Spec.Containers {
-		if (sdev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	if !device.PodRequiresDevice(sdev, p) {
 		return nil
 	}
 
@@ -183,16 +179,7 @@ func (sdev *MetaxSDevices) LockNode(n *corev1.Node, p *corev1.Pod) error {
 }
 
 func (sdev *MetaxSDevices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-
-	for _, val := range p.Spec.Containers {
-		if (sdev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	if !device.PodRequiresDevice(sdev, p) {
 		return nil
 	}
 
@@ -213,25 +200,40 @@ func (sdev *MetaxSDevices) CheckHealth(devType string, n *corev1.Node) (bool, bo
 	return len(devices) > 0, true
 }
 
-func (sdev *MetaxSDevices) GenerateResourceRequests(ctr *corev1.Container) device.ContainerDeviceRequest {
+func (sdev *MetaxSDevices) GenerateResourceRequests(ctr *corev1.Container) (device.ContainerDeviceRequest, error) {
 	value, ok := ctr.Resources.Limits[corev1.ResourceName(MetaxResourceNameVCount)]
 	if !ok {
-		return device.ContainerDeviceRequest{}
+		return device.ContainerDeviceRequest{}, nil
 	}
 
 	count, ok := value.AsInt64()
 	if !ok {
 		klog.Errorf("container<%s> resource<%s> cannot decode to int64",
 			ctr.Name, MetaxResourceNameVCount)
-		return device.ContainerDeviceRequest{}
+		return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "metax sgpu", Reason: fmt.Sprintf("count request %s cannot decode to int64", value.String())}
+	}
+	if count == 0 {
+		// An explicit zero count means no device is requested, not an
+		// invalid request. See the nvidia backend.
+		return device.ContainerDeviceRequest{}, nil
+	}
+	if count < 0 {
+		klog.ErrorS(nil, "metax sgpu device count request is out of range", "container", ctr.Name, "request", count)
+		return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "metax sgpu", Reason: fmt.Sprintf("device count %d is out of range", count)}
 	}
 
 	core := int64(100)
 	coreQuantity, ok := ctr.Resources.Limits[corev1.ResourceName(MetaxResourceNameVCore)]
+	if !ok {
+		coreQuantity, ok = ctr.Resources.Requests[corev1.ResourceName(MetaxResourceNameVCore)]
+	}
 	if ok {
-		if v, ok := coreQuantity.AsInt64(); ok {
-			core = v
+		v, valid := coreQuantity.AsInt64()
+		if !valid || v < 0 || v > 100 {
+			klog.ErrorS(nil, "metax sgpu device core request is out of range", "container", ctr.Name, "request", coreQuantity.String())
+			return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "metax sgpu", Reason: fmt.Sprintf("core request %s is out of range (must be an integer between 0 and 100)", coreQuantity.String())}
 		}
+		core = v
 	}
 
 	mem := int64(0)
@@ -246,7 +248,15 @@ func (sdev *MetaxSDevices) GenerateResourceRequests(ctr *corev1.Container) devic
 			if hasUnit {
 				mem = v / 1024 / 1024
 			} else {
-				mem = v * 1024
+				if v < 0 || v > math.MaxInt64/int64(MemoryFactor) {
+					klog.ErrorS(nil, "metax sgpu device memory request is out of range", "container", ctr.Name, "request", memQuantity.String())
+					return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "metax sgpu", Reason: fmt.Sprintf("memory request %s is out of range", memQuantity.String())}
+				}
+				mem = v * int64(MemoryFactor)
+			}
+			if mem < 0 {
+				klog.ErrorS(nil, "metax sgpu device memory request is out of range", "container", ctr.Name, "request", memQuantity.String())
+				return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "metax sgpu", Reason: fmt.Sprintf("memory request %s is out of range", memQuantity.String())}
 			}
 		}
 	}
@@ -259,30 +269,32 @@ func (sdev *MetaxSDevices) GenerateResourceRequests(ctr *corev1.Container) devic
 	klog.Infof("container<%s> request<count:%d, mem:%d, memPercent:%d, core:%d>",
 		ctr.Name, count, mem, memPercent, core)
 	return device.ContainerDeviceRequest{
-		Nums:             int32(count),
+		Nums:             count,
 		Type:             MetaxSGPUDevice,
-		Memreq:           int32(mem),
-		MemPercentagereq: int32(memPercent),
-		Coresreq:         int32(core),
-	}
+		Memreq:           mem,
+		MemPercentagereq: int64(memPercent),
+		Coresreq:         core,
+	}, nil
 }
 
+// ScoreNode returns a policy-independent score for the node following a
+// "higher score is a better node" convention. The shared scheduler policy layer
+// is responsible for weighting this score and adapting it to the active
+// scheduling policy (for example, inverting it under the Spread policy).
 func (sdev *MetaxSDevices) ScoreNode(node *corev1.Node, podDevices device.PodSingleDevice, previous []*device.DeviceUsage, policy string) float32 {
-	// TODO: score should not depend on policy
-	// we have to give it a smaller value because of Spread policy
-	weight := 10000
-	if policy == string(util.NodeSchedulerPolicySpread) {
-		weight = -10000
-	}
-
 	if appClassOnlineEnable(podDevices) {
-		return float32(weight * scoreOnlineDevices(podDevices, previous))
+		return float32(scoreOnlineDevices(podDevices, previous))
 	} else if topologyAwareEnable(podDevices) {
-		return float32(weight * scoreExclusiveDevices(podDevices, previous))
+		return float32(scoreExclusiveDevices(podDevices, previous))
 	}
 
 	return 0
 }
+
+// PolicyNeutralScore marks MetaxSDevices as returning a policy-independent
+// score from ScoreNode, so the shared scheduler policy layer owns the weighting
+// and Spread-policy sign inversion.
+func (sdev *MetaxSDevices) PolicyNeutralScore() {}
 
 func (sdev *MetaxSDevices) AddResourceUsage(pod *corev1.Pod, n *device.DeviceUsage, ctr *device.ContainerDevice) error {
 	n.Used++
@@ -308,9 +320,14 @@ func (sdev *MetaxSDevices) AddResourceUsage(pod *corev1.Pod, n *device.DeviceUsa
 
 func (mats *MetaxSDevices) Fit(devices []*device.DeviceUsage, request device.ContainerDeviceRequest, pod *corev1.Pod, nodeInfo *device.NodeInfo, allocated *device.PodDevices) (bool, map[string]device.ContainerDevices, string) {
 	klog.Infof("pod[%v] container request[%v] devices fit", klog.KObj(pod), request)
+	if request.Coresreq > 100 || request.Coresreq < 0 {
+		klog.ErrorS(nil, "core limit out of range (must be 0-100)", "pod", klog.KObj(pod), "coresreq", request.Coresreq)
+		return false, map[string]device.ContainerDevices{}, "core limit out of range"
+	}
 
 	// filter device
 	reason := make(map[string]int)
+	isMutex := util.PolicyContains(util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod), util.GPUSchedulerPolicyMutex)
 	candidateDevices := []*device.DeviceUsage{}
 	for i, v := range slices.Backward(devices) {
 		dev := v
@@ -353,8 +370,13 @@ func (mats *MetaxSDevices) Fit(devices []*device.DeviceUsage, request device.Con
 			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used)
 			continue
 		}
+		if isMutex && dev.Used > 0 {
+			reason[common.ExclusiveDeviceAllocateConflict]++
+			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used)
+			continue
+		}
 
-		memreq := int32(0)
+		memreq := int64(0)
 		if request.Memreq > 0 {
 			memreq = request.Memreq
 		} else {
@@ -436,7 +458,7 @@ func (mats *MetaxSDevices) Fit(devices []*device.DeviceUsage, request device.Con
 	}
 
 	for _, dev := range bestDevices {
-		memreq := int32(0)
+		memreq := int64(0)
 		if request.Memreq > 0 {
 			memreq = request.Memreq
 		} else {
@@ -470,6 +492,7 @@ func (dev *MetaxSDevices) GetResourceNames() device.ResourceNames {
 		ResourceCountName:  MetaxResourceNameVCount,
 		ResourceMemoryName: MetaxResourceNameVMemory,
 		ResourceCoreName:   MetaxResourceNameVCore,
+		MemoryFactor:       MemoryFactor,
 	}
 }
 
@@ -551,11 +574,11 @@ func prioritizeExclusiveDevices(candidateDevices []*device.DeviceUsage, require 
 		return candidateDevices
 	}
 
-	linkDevicesMap := map[int32][]*device.DeviceUsage{}
+	linkDevicesMap := map[int64][]*device.DeviceUsage{}
 	for _, device := range candidateDevices {
-		linkZone := int32(0)
+		linkZone := int64(0)
 		if v, ok := device.CustomInfo["LinkZone"]; ok {
-			if v, ok := v.(int32); ok {
+			if v, ok := v.(int64); ok {
 				linkZone = v
 			}
 		}
@@ -644,9 +667,9 @@ func scoreExclusiveDevices(podDevices device.PodSingleDevice, previous []*device
 	for _, ctrDevices := range podDevices {
 		for _, device := range ctrDevices {
 			if device.Usedcores == 100 {
-				linkZone := int32(0)
+				linkZone := int64(0)
 				if v, ok := device.CustomInfo["LinkZone"]; ok {
-					if v, ok := v.(int32); ok {
+					if v, ok := v.(int64); ok {
 						linkZone = v
 					}
 				}
@@ -661,9 +684,9 @@ func scoreExclusiveDevices(podDevices device.PodSingleDevice, previous []*device
 
 	for _, dev := range previous {
 		if dev.Used == 0 {
-			linkZone := int32(0)
+			linkZone := int64(0)
 			if v, ok := dev.CustomInfo["LinkZone"]; ok {
-				if v, ok := v.(int32); ok {
+				if v, ok := v.(int64); ok {
 					linkZone = v
 				}
 			}

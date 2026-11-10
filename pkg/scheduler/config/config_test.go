@@ -18,6 +18,8 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/Project-HAMi/HAMi/pkg/device/amd"
 	"github.com/Project-HAMi/HAMi/pkg/device/ascend"
 	"github.com/Project-HAMi/HAMi/pkg/device/awsneuron"
+	"github.com/Project-HAMi/HAMi/pkg/device/biren"
 	"github.com/Project-HAMi/HAMi/pkg/device/cambricon"
 	"github.com/Project-HAMi/HAMi/pkg/device/enflame"
 	"github.com/Project-HAMi/HAMi/pkg/device/hygon"
@@ -39,6 +42,7 @@ import (
 	"github.com/Project-HAMi/HAMi/pkg/device/metax"
 	"github.com/Project-HAMi/HAMi/pkg/device/mthreads"
 	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
+	"github.com/Project-HAMi/HAMi/pkg/device/remotegpu"
 	"github.com/Project-HAMi/HAMi/pkg/device/vastai"
 )
 
@@ -59,9 +63,9 @@ cambricon:
   resourceMemoryName: cambricon.com/mlu.smlu.vmemory
   resourceCoreName: cambricon.com/mlu.smlu.vcore
 hygon:
-  resourceCountName: hygon.com/dcunum
-  resourceMemoryName: hygon.com/dcumem
-  resourceCoreName: hygon.com/dcucores
+  resourceCountName: hygon.com/hcunum
+  resourceMemoryName: hygon.com/hcumem
+  resourceCoreName: hygon.com/hcucores
 metax:
   resourceCountName: "metax-tech.com/gpu"
 enflame:
@@ -79,11 +83,21 @@ iluvatars:
   resourceCountName: iluvatar.ai/MR-V100-vgpu
   resourceMemoryName: iluvatar.ai/MR-V100.vMem
   resourceCoreName: iluvatar.ai/MR-V100.vCore
+- chipName: MR-V100A
+  commonWord: MR-V100A
+  resourceCountName: iluvatar.ai/MR-V100A-vgpu
+  resourceMemoryName: iluvatar.ai/MR-V100A.vMem
+  resourceCoreName: iluvatar.ai/MR-V100A.vCore
 - chipName: MR-V50
   commonWord: MR-V50
   resourceCountName: iluvatar.ai/MR-V50-vgpu
   resourceMemoryName: iluvatar.ai/MR-V50.vMem
   resourceCoreName: iluvatar.ai/MR-V50.vCore
+- chipName: MR-V50A
+  commonWord: MR-V50A
+  resourceCountName: iluvatar.ai/MR-V50A-vgpu
+  resourceMemoryName: iluvatar.ai/MR-V50A.vMem
+  resourceCoreName: iluvatar.ai/MR-V50A.vCore
 - chipName: BI-V150
   commonWord: BI-V150
   resourceCountName: iluvatar.ai/BI-V150-vgpu
@@ -198,8 +212,10 @@ vnpus:
 }
 
 func Test_LoadConfig(t *testing.T) {
-	var configData Config
-	err := yaml.Unmarshal([]byte(loadTestConfig()), &configData)
+	path := filepath.Join(t.TempDir(), "device-config.yaml")
+	assert.NilError(t, os.WriteFile(path, []byte(loadTestConfig()), 0o600))
+
+	configData, err := LoadConfig(path)
 	assert.NilError(t, err)
 
 	dataDrivenTests := []struct {
@@ -228,6 +244,84 @@ func Test_LoadConfig(t *testing.T) {
 	assert.DeepEqual(t, configData.IluvatarConfig, expectedIluvatars)
 }
 
+func TestLoadConfigRemoteGPUSessionImagePullSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "device-config.yaml")
+	config := "remotegpu:\n  sessionImagePullSecrets:\n    - global-registry\n    - session-registry\n"
+	assert.NilError(t, os.WriteFile(path, []byte(config), 0o600))
+
+	configData, err := LoadConfig(path)
+	assert.NilError(t, err)
+	assert.DeepEqual(t, configData.RemoteGPUConfig.SessionImagePullSecrets, []string{
+		"global-registry",
+		"session-registry",
+	})
+}
+
+func TestLoadConfigRejectsInvalidFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string
+	}{
+		{
+			name:   "valid configuration",
+			config: loadTestConfig(),
+		},
+		{
+			name:   "valid Ascend mode",
+			config: "vnpus:\n  hamiVnpuMode: enpu\n",
+		},
+		{
+			name:    "invalid Ascend mode",
+			config:  "vnpus:\n  hamiVnpuMode: enup\n",
+			wantErr: "vnpus.hamiVnpuMode",
+		},
+		{
+			name:    "removed Ascend ENPU flag",
+			config:  "vnpus:\n  enpu: true\n",
+			wantErr: "field enpu not found",
+		},
+		{
+			name:    "unknown top-level field",
+			config:  "unknown: true\n",
+			wantErr: "field unknown not found",
+		},
+		{
+			name: "unknown nested field",
+			config: "nvidia:\n" +
+				"  resourceCountNmae: nvidia.com/gpu\n",
+			wantErr: "field resourceCountNmae not found",
+		},
+		{
+			name: "duplicate field",
+			config: "nvidia:\n" +
+				"  resourceCountName: nvidia.com/gpu\n" +
+				"  resourceCountName: nvidia.com/gpu2\n",
+			wantErr: "resourceCountName already set",
+		},
+		{
+			name: "invalid value type",
+			config: "nvidia:\n" +
+				"  defaultGPUNum: not-a-number\n",
+			wantErr: "cannot unmarshal",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "device-config.yaml")
+			assert.NilError(t, os.WriteFile(path, []byte(test.config), 0o600))
+
+			_, err := LoadConfig(path)
+			if test.wantErr == "" {
+				assert.NilError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, test.wantErr)
+		})
+	}
+}
+
 func createNvidiaConfig() nvidia.NvidiaConfig {
 	return nvidia.NvidiaConfig{
 		ResourceCountName:            "nvidia.com/gpu",
@@ -252,17 +346,9 @@ func createCambriconConfig() cambricon.CambriconConfig {
 
 func createHygonConfig() hygon.HygonConfig {
 	return hygon.HygonConfig{
-		ResourceCountName:  "hygon.com/dcunum",
-		ResourceMemoryName: "hygon.com/dcumem",
-		ResourceCoreName:   "hygon.com/dcucores",
-	}
-}
-
-func createIluvatarConfig() iluvatar.IluvatarConfig {
-	return iluvatar.IluvatarConfig{
-		ResourceCountName:  "iluvatar.ai/vgpu",
-		ResourceMemoryName: "iluvatar.ai/vcuda-memory",
-		ResourceCoreName:   "iluvatar.ai/vcuda-core",
+		ResourceCountName:  "hygon.com/hcunum",
+		ResourceMemoryName: "hygon.com/hcumem",
+		ResourceCoreName:   "hygon.com/hcucores",
 	}
 }
 
@@ -297,7 +383,6 @@ func createKunlunConfig() kunlun.KunlunConfig {
 
 func createVNPUConfigs() ascend.VNPUs {
 	return ascend.VNPUs{
-		HamiVnpuCore: false,
 		Configs: []ascend.VNPUConfig{
 			{
 				ChipName:           "910A",
@@ -386,11 +471,25 @@ func createIluvatarConfigs() []iluvatar.IluvatarConfig {
 			ResourceCoreName:   "iluvatar.ai/MR-V100.vCore",
 		},
 		{
+			ChipName:           "MR-V100A",
+			CommonWord:         "MR-V100A",
+			ResourceCountName:  "iluvatar.ai/MR-V100A-vgpu",
+			ResourceMemoryName: "iluvatar.ai/MR-V100A.vMem",
+			ResourceCoreName:   "iluvatar.ai/MR-V100A.vCore",
+		},
+		{
 			ChipName:           "MR-V50",
 			CommonWord:         "MR-V50",
 			ResourceCountName:  "iluvatar.ai/MR-V50-vgpu",
 			ResourceMemoryName: "iluvatar.ai/MR-V50.vMem",
 			ResourceCoreName:   "iluvatar.ai/MR-V50.vCore",
+		},
+		{
+			ChipName:           "MR-V50A",
+			CommonWord:         "MR-V50A",
+			ResourceCountName:  "iluvatar.ai/MR-V50A-vgpu",
+			ResourceMemoryName: "iluvatar.ai/MR-V50A.vMem",
+			ResourceCoreName:   "iluvatar.ai/MR-V50A.vCore",
 		},
 		{
 			ChipName:           "BI-V150",
@@ -424,7 +523,7 @@ func setupTest(t *testing.T) (map[string]string, map[string]device.Devices) {
 	expectedDevices := map[string]string{
 		nvidia.NvidiaGPUDevice:       nvidia.NvidiaGPUDevice,
 		cambricon.CambriconMLUDevice: cambricon.CambriconMLUCommonWord,
-		hygon.HygonDCUDevice:         hygon.HygonDCUCommonWord,
+		hygon.HygonHCUDevice:         hygon.HygonHCUCommonWord,
 		mthreads.MthreadsGPUDevice:   mthreads.MthreadsGPUCommonWord,
 		metax.MetaxGPUDevice:         metax.MetaxGPUCommonWord,
 		metax.MetaxSGPUDevice:        metax.MetaxSGPUCommonWord,
@@ -435,6 +534,8 @@ func setupTest(t *testing.T) (map[string]string, map[string]device.Devices) {
 		awsneuron.AWSNeuronDevice:    awsneuron.AWSNeuronCommonWord,
 		amd.AMDDevice:                amd.AMDDevice,
 		vastai.VastaiDevice:          vastai.VastaiCommonWord,
+		biren.BirenDevice:            biren.BirenCommonWord,
+		remotegpu.RemoteGPUDevice:    remotegpu.RemoteGPUCommonWord,
 	}
 
 	return expectedDevices, device.DevicesMap
@@ -513,25 +614,216 @@ func Test_validateConfig(t *testing.T) {
 	emptyConfig := &Config{
 		IluvatarConfig: []iluvatar.IluvatarConfig{},
 	}
+	vastaiOnly := &Config{
+		VastaiConfig: vastai.VastaiConfig{ResourceCountName: "vastaitech.com/vgpu"},
+	}
+	birenOnly := &Config{
+		BirenConfig: biren.BirenConfig{ResourceCountName: "birentech.com/gpu"},
+	}
+
+	coresTooHigh := &Config{
+		NvidiaConfig: nvidia.NvidiaConfig{ResourceCountName: "nvidia.com/gpu", DefaultCores: 101},
+	}
+	coresNegative := &Config{
+		NvidiaConfig: nvidia.NvidiaConfig{ResourceCountName: "nvidia.com/gpu", DefaultCores: -1},
+	}
+	memoryNegative := &Config{
+		NvidiaConfig: nvidia.NvidiaConfig{ResourceCountName: "nvidia.com/gpu", DefaultMemory: -1},
+	}
+	// DefaultGPUNum is zero whenever the key is omitted, and nvidia reads it as
+	// "do not inject a default", so it must stay acceptable.
+	noDefaultGPUNum := &Config{
+		NvidiaConfig: nvidia.NvidiaConfig{ResourceCountName: "nvidia.com/gpu", DefaultGPUNum: 0},
+	}
 
 	tests := []struct {
-		name        string
-		config      *Config
-		expectError bool
+		name    string
+		config  *Config
+		wantErr string
 	}{
-		{"Valid config", validConfig, false},
-		{"Empty config", emptyConfig, true},
+		{"Valid config", validConfig, ""},
+		{"Empty config", emptyConfig, "all configurations are empty"},
+		{"Vastai only", vastaiOnly, ""},
+		{"Biren only", birenOnly, ""},
+		{"DefaultCores above 100", coresTooHigh, "defaultCores is a percentage"},
+		{"DefaultCores negative", coresNegative, "defaultCores is a percentage"},
+		{"DefaultMemory negative", memoryNegative, "defaultMemory must not be negative"},
+		{"DefaultGPUNum zero is accepted", noDefaultGPUNum, ""},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateConfig(test.config)
-			if test.expectError {
-				assert.ErrorContains(t, err, "all configurations are empty")
-			} else {
+			if test.wantErr == "" {
 				assert.NilError(t, err)
+				return
 			}
+			assert.ErrorContains(t, err, test.wantErr)
 		})
+	}
+}
+
+func Test_validateConfig_ReportsEveryViolation(t *testing.T) {
+	err := validateConfig(&Config{
+		NvidiaConfig: nvidia.NvidiaConfig{
+			ResourceCountName: "nvidia.com/gpu",
+			DefaultCores:      101,
+			DefaultMemory:     -1,
+		},
+	})
+	assert.ErrorContains(t, err, "defaultCores is a percentage")
+	assert.ErrorContains(t, err, "defaultMemory must not be negative")
+}
+
+// stubDevices is a device.Devices whose only meaningful behaviour is the
+// resource names it advertises, which is all validateRegisteredDevices reads.
+// Real backends set package-level globals in their constructors, which would
+// leak between tests.
+type stubDevices struct {
+	names device.ResourceNames
+}
+
+func (s stubDevices) GetResourceNames() device.ResourceNames { return s.names }
+func (s stubDevices) CommonWord() string                     { return "stub" }
+func (s stubDevices) NodeCleanUp(nn string) error            { return nil }
+
+func (s stubDevices) MutateAdmission(ctr *corev1.Container, pod *corev1.Pod) (bool, error) {
+	return false, nil
+}
+func (s stubDevices) CheckHealth(devType string, n *corev1.Node) (bool, bool) { return true, true }
+func (s stubDevices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo, error) {
+	return nil, nil
+}
+func (s stubDevices) LockNode(n *corev1.Node, p *corev1.Pod) error        { return nil }
+func (s stubDevices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error { return nil }
+func (s stubDevices) GenerateResourceRequests(ctr *corev1.Container) (device.ContainerDeviceRequest, error) {
+	return device.ContainerDeviceRequest{}, nil
+}
+
+func (s stubDevices) PatchAnnotations(pod *corev1.Pod, annoinput *map[string]string, pd device.PodDevices) map[string]string {
+	return *annoinput
+}
+
+func (s stubDevices) ScoreNode(node *corev1.Node, podDevices device.PodSingleDevice, previous []*device.DeviceUsage, policy string) float32 {
+	return 0
+}
+
+func (s stubDevices) AddResourceUsage(pod *corev1.Pod, n *device.DeviceUsage, ctr *device.ContainerDevice) error {
+	return nil
+}
+
+func (s stubDevices) Fit(devices []*device.DeviceUsage, request device.ContainerDeviceRequest, pod *corev1.Pod, nodeInfo *device.NodeInfo, allocated *device.PodDevices) (bool, map[string]device.ContainerDevices, string) {
+	return false, nil, ""
+}
+
+func Test_validateRegisteredDevices(t *testing.T) {
+	tests := []struct {
+		name    string
+		devices map[string]device.Devices
+		wantErr string
+	}{
+		{
+			name:    "no devices registered",
+			devices: map[string]device.Devices{},
+		},
+		{
+			name: "distinct resource names",
+			devices: map[string]device.Devices{
+				"A": stubDevices{names: device.ResourceNames{ResourceCountName: "a.com/gpu"}},
+				"B": stubDevices{names: device.ResourceNames{ResourceCountName: "b.com/gpu"}},
+			},
+		},
+		{
+			name: "two backends claiming one resource",
+			devices: map[string]device.Devices{
+				"A": stubDevices{names: device.ResourceNames{ResourceCountName: "shared.com/gpu"}},
+				"B": stubDevices{names: device.ResourceNames{ResourceCountName: "shared.com/gpu"}},
+			},
+			wantErr: `A and B both claim resource "shared.com/gpu"`,
+		},
+		{
+			// Unconfigured backends advertise no count name. The default
+			// configuration registers several of them, so this must not be
+			// mistaken for a collision.
+			name: "unconfigured backends are not a collision",
+			devices: map[string]device.Devices{
+				"A": stubDevices{names: device.ResourceNames{}},
+				"B": stubDevices{names: device.ResourceNames{}},
+			},
+		},
+		{
+			name: "two backends sharing a memory resource with different factors",
+			devices: map[string]device.Devices{
+				"A": stubDevices{names: device.ResourceNames{ResourceMemoryName: "shared.com/mem", MemoryFactor: 1024}},
+				"B": stubDevices{names: device.ResourceNames{ResourceMemoryName: "shared.com/mem", MemoryFactor: 2}},
+			},
+			wantErr: `A and B both claim memory resource "shared.com/mem"`,
+		},
+		{
+			// Factors of 0 and 1 both mean the request is not scaled.
+			name: "sharing a memory resource with the same factor is allowed",
+			devices: map[string]device.Devices{
+				"A": stubDevices{names: device.ResourceNames{ResourceMemoryName: "shared.com/mem"}},
+				"B": stubDevices{names: device.ResourceNames{ResourceMemoryName: "shared.com/mem", MemoryFactor: 1}},
+			},
+		},
+		{
+			name: "negative memory factor",
+			devices: map[string]device.Devices{
+				"A": stubDevices{names: device.ResourceNames{ResourceCountName: "a.com/gpu", MemoryFactor: -1}},
+			},
+			wantErr: "memoryFactor must not be negative",
+		},
+		{
+			// A malformed name cannot match a node resource, but it is the
+			// operator's to choose, so it is logged and not rejected.
+			name: "malformed resource name is reported, not rejected",
+			devices: map[string]device.Devices{
+				"A": stubDevices{names: device.ResourceNames{ResourceCountName: "not a valid name"}},
+			},
+		},
+		{
+			name: "nil backend is skipped",
+			devices: map[string]device.Devices{
+				"A": nil,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateRegisteredDevices(test.devices)
+			if test.wantErr == "" {
+				assert.NilError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, test.wantErr)
+		})
+	}
+}
+
+// Test_InitDevicesWithConfig_RejectsDuplicateResourceName covers the wiring:
+// the collision is only caught if InitDevicesWithConfig calls the check after
+// the backends have registered.
+func Test_InitDevicesWithConfig_RejectsDuplicateResourceName(t *testing.T) {
+	err := InitDevicesWithConfig(&Config{
+		AMDGPUConfig: amd.AMDConfig{ResourceCountName: "shared.com/gpu"},
+		BirenConfig:  biren.BirenConfig{ResourceCountName: "shared.com/gpu"},
+	})
+	assert.ErrorContains(t, err, "invalid device configuration")
+	assert.ErrorContains(t, err, `both claim resource "shared.com/gpu"`)
+}
+
+func Test_validateRegisteredDevices_CollisionMessageIsStable(t *testing.T) {
+	// Map iteration is random, so the pair is sorted before reporting to keep
+	// the message reproducible across runs.
+	devices := map[string]device.Devices{
+		"Zebra": stubDevices{names: device.ResourceNames{ResourceCountName: "shared.com/gpu"}},
+		"Alpha": stubDevices{names: device.ResourceNames{ResourceCountName: "shared.com/gpu"}},
+	}
+	for range 20 {
+		err := validateRegisteredDevices(devices)
+		assert.ErrorContains(t, err, `Alpha and Zebra both claim resource "shared.com/gpu"`)
 	}
 }
 
@@ -779,8 +1071,52 @@ func Test_Resourcereqs(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := device.Resourcereqs(test.args)
+			got, err := device.Resourcereqs(test.args)
+			assert.NilError(t, err)
 			assert.DeepEqual(t, test.want, got)
+		})
+	}
+}
+
+// A count the apiserver accepts as an integer can still be too large for
+// int64, which makes Quantity.AsInt64 report failure. Every backend has to
+// fail closed on that rather than report the container as device-less, and
+// every backend has to treat an explicit zero as device-less rather than
+// invalid. Both are easy to regress one backend at a time, so assert them
+// across all of them at once.
+func TestGenerateResourceRequests_CountEdgesAcrossBackends(t *testing.T) {
+	InitDefaultDevices()
+
+	for commonWord, dev := range device.DevicesMap {
+		countName := dev.GetResourceNames().ResourceCountName
+		if countName == "" {
+			continue
+		}
+
+		t.Run(commonWord+"/too large for int64 fails closed", func(t *testing.T) {
+			ctr := &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceName(countName): resource.MustParse("1Ei"),
+					},
+				},
+			}
+			got, err := dev.GenerateResourceRequests(ctr)
+			assert.Assert(t, err != nil, "%s accepted a count that does not fit in an int64", commonWord)
+			assert.DeepEqual(t, device.ContainerDeviceRequest{}, got)
+		})
+
+		t.Run(commonWord+"/zero is device-less", func(t *testing.T) {
+			ctr := &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceName(countName): resource.MustParse("0"),
+					},
+				},
+			}
+			got, err := dev.GenerateResourceRequests(ctr)
+			assert.NilError(t, err)
+			assert.Equal(t, got.Nums, int64(0), "%s reported devices for a zero count", commonWord)
 		})
 	}
 }

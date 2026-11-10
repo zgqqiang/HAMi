@@ -19,14 +19,20 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	klog "k8s.io/klog/v2"
 
+	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/device/remotegpu"
 	versionmetrics "github.com/Project-HAMi/HAMi/pkg/metrics"
+	schedulerpkg "github.com/Project-HAMi/HAMi/pkg/scheduler"
+	"github.com/Project-HAMi/HAMi/pkg/util/leaderelection"
 )
 
 type ClusterManager struct {
@@ -34,9 +40,83 @@ type ClusterManager struct {
 	LegacyMetrics bool
 }
 
+type schedulerMetricsProvider interface {
+	InspectAllNodesUsage() *map[string]*schedulerpkg.NodeUsage
+	GetQuotaManager() *device.QuotaManager
+	GetPodManager() *device.PodManager
+	// GetLeaderManager returns the leader election manager so the collector
+	// can emit hami_scheduler_is_leader without importing the scheduler package
+	// directly in metrics.go.
+	GetLeaderManager() leaderelection.LeaderManager
+	// GetAllocationMetrics returns the scheduler outcome counters.
+	GetAllocationMetrics() *versionmetrics.SchedulerOutcomeMetrics
+	// IsSynced reports whether the scheduler's internal cache has completed at
+	// least one successful sync and is ready to serve scheduling requests.
+	IsSynced() bool
+}
+
 // ClusterManagerCollector implements the Collector interface.
 type ClusterManagerCollector struct {
-	ClusterManager *ClusterManager
+	ClusterManager  *ClusterManager
+	metricsProvider schedulerMetricsProvider
+}
+
+const normalizedCoreLimit = 100
+
+// normalizeAMDCoreMetrics converts AMD physical CU counts to the percentage
+// unit used by HAMi's core ratio metrics. Other devices keep their existing
+// metric values.
+func normalizeAMDCoreMetrics(deviceType string, total, allocated int64) (float64, float64) {
+	if !strings.HasPrefix(strings.ToUpper(deviceType), "AMD") || total <= 0 {
+		return float64(total), float64(allocated)
+	}
+	return normalizedCoreLimit, math.Ceil(float64(allocated) / float64(total) * normalizedCoreLimit)
+}
+
+// deviceMeta holds the per-device fields the container-level collector needs to
+// normalize core metrics. It is deliberately a value type: the collector only
+// reads these two scalars, so the index does not retain the snapshot's devices.
+type deviceMeta struct {
+	totalcore  int64
+	deviceType string
+}
+
+// newDeviceMetaIndex indexes every device in the snapshot by UUID so the
+// container-level collector can resolve a device in constant time. Without it,
+// each allocated container device triggers a fresh scan of every node's device
+// list, making a scrape cost O(allocated devices x nodes x devices per node).
+//
+// The index is node-agnostic, matching the lookup it replaces: a UUID resolves
+// regardless of which node advertises it. A UUID advertised by more than one
+// node keeps the first entry encountered, as the scan did by returning on its
+// first match.
+func newDeviceMetaIndex(nu *map[string]*schedulerpkg.NodeUsage) map[string]deviceMeta {
+	total := 0
+	for _, ni := range *nu {
+		total += len(ni.Devices.DeviceLists)
+	}
+	index := make(map[string]deviceMeta, total)
+	for _, ni := range *nu {
+		for _, dls := range ni.Devices.DeviceLists {
+			if dls.Device == nil {
+				continue
+			}
+			if _, ok := index[dls.Device.ID]; ok {
+				continue
+			}
+			index[dls.Device.ID] = deviceMeta{
+				totalcore:  dls.Device.Totalcore,
+				deviceType: dls.Device.Type,
+			}
+		}
+	}
+	return index
+}
+
+// mibToBytes converts a memory quantity expressed in mebibytes (MiB), the unit
+// used throughout HAMi's device accounting, to bytes for byte-oriented metrics.
+func mibToBytes(mib int64) float64 {
+	return float64(mib) * 1024 * 1024
 }
 
 // Describe is implemented with DescribeByCollect. That's possible because the
@@ -49,8 +129,35 @@ func (cc ClusterManagerCollector) Describe(ch chan<- *prometheus.Desc) {
 func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
 	klog.V(3).Info("Starting to collect metrics for scheduler")
 	legacy := cc.ClusterManager.LegacyMetrics
+	// A single snapshot is shared by the node- and container-level collectors so
+	// they observe a consistent cluster state within one scrape.
+	nu := cc.metricsProvider.InspectAllNodesUsage()
+	// Index the snapshot once so the container-level collector resolves each
+	// allocated device by UUID in constant time instead of rescanning the
+	// cluster per device.
+	deviceMetaByUUID := newDeviceMetaIndex(nu)
+	cc.collectNodeMetrics(ch, nu, legacy)
+	cc.collectQuotaMetrics(ch, legacy)
+	cc.collectContainerMetrics(ch, deviceMetaByUUID, legacy)
+	cc.collectRemoteGPUMetrics(ch)
+	cc.collectSchedulerStateMetrics(ch)
+	cc.collectSchedulerOutcomeMetrics(ch)
+}
 
-	// New metric descriptors
+// remoteGPUPool reads the lupine fleet when the remote-gpu backend is
+// configured and reports nothing otherwise. Swappable for tests.
+var remoteGPUPool = func() []remotegpu.PoolDevice {
+	dev, ok := device.GetDevices()[remotegpu.RemoteGPUDevice].(*remotegpu.RemoteGPUDevices)
+	if !ok {
+		return nil
+	}
+	return dev.Inspect()
+}
+
+// collectNodeMetrics emits node-level GPU metrics (memory/core limits and
+// allocations, sharing counts, MIG instances and overview) for every device on
+// every node. AMD core values are normalized to a percentage.
+func (cc ClusterManagerCollector) collectNodeMetrics(ch chan<- prometheus.Metric, nu *map[string]*schedulerpkg.NodeUsage, legacy bool) {
 	nodevGPUMemoryLimitDesc := prometheus.NewDesc(
 		"hami_gpu_memory_limit_bytes",
 		"Device memory limit for a certain GPU",
@@ -79,17 +186,17 @@ func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
 	nodeGPUOverview := prometheus.NewDesc(
 		"hami_node_gpu_overview",
 		"GPU overview on a certain node",
-		[]string{"node", "device_uuid", "device_index", "device_cores", "shared_containers", "device_memory_limit", "device_type"}, nil,
+		[]string{"node", "device_uuid", "device_index", "device_cores", "device_memory_limit", "device_type"}, nil,
 	)
-	nodeGPUMemoryPercentage := prometheus.NewDesc(
+	nodeGPUMemoryAllocatedRatioDesc := prometheus.NewDesc(
 		"hami_node_gpu_memory_allocated_ratio",
-		"GPU Memory Allocated Percentage on a certain GPU",
-		[]string{"node", "device_uuid", "device_index"}, nil,
+		"GPU memory allocated ratio on a certain GPU (0-1)",
+		[]string{"node", "device_uuid", "device_index", "device_type"}, nil,
 	)
 	nodeGPUMigInstance := prometheus.NewDesc(
 		"hami_node_gpu_mig_instance_info",
-		"GPU Sharing mode. 0 for hami-core, 1 for mig, 2 for mps",
-		[]string{"node", "device_uuid", "device_index", "mig_name"}, nil,
+		"Realized MIG instance identity and scheduler placement",
+		[]string{"node", "device_uuid", "device_index", "mig_uuid", "profile", "gpu_instance_id", "compute_instance_id", "placement_start", "placement_size"}, nil,
 	)
 
 	// Legacy metric descriptors (only created when legacy mode is enabled)
@@ -102,9 +209,6 @@ func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
 		legacyOverview            *prometheus.Desc
 		legacyMemoryPercentage    *prometheus.Desc
 		legacyMigInstance         *prometheus.Desc
-		legacyAllocatedMemory     *prometheus.Desc
-		legacyAllocatedCore       *prometheus.Desc
-		legacyQuotaUsed           *prometheus.Desc
 	)
 	if legacy {
 		legacyMemoryLimitDesc = prometheus.NewDesc(
@@ -135,7 +239,7 @@ func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
 		legacyOverview = prometheus.NewDesc(
 			"nodeGPUOverview",
 			"GPU overview on a certain node",
-			[]string{"nodeid", "deviceuuid", "deviceidx", "devicecores", "sharedcontainers", "devicememorylimit", "devicetype"}, nil,
+			[]string{"nodeid", "deviceuuid", "deviceidx", "devicecores", "devicememorylimit", "devicetype"}, nil,
 		)
 		legacyMemoryPercentage = prometheus.NewDesc(
 			"nodeGPUMemoryPercentage",
@@ -147,174 +251,171 @@ func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
 			"GPU Sharing mode. 0 for hami-core, 1 for mig, 2 for mps",
 			[]string{"nodeid", "deviceuuid", "deviceidx", "migname"}, nil,
 		)
-		legacyAllocatedMemory = prometheus.NewDesc(
-			"vGPUMemoryAllocated",
-			"vGPU memory allocated from a container",
-			[]string{"podnamespace", "nodename", "podname", "containeridx", "deviceuuid"}, nil,
-		)
-		legacyAllocatedCore = prometheus.NewDesc(
-			"vGPUCoreAllocated",
-			"vGPU core allocated from a container",
-			[]string{"podnamespace", "nodename", "podname", "containeridx", "deviceuuid"}, nil,
-		)
-		legacyQuotaUsed = prometheus.NewDesc(
-			"QuotaUsed",
-			"resourcequota usage for a certain device",
-			[]string{"quotanamespace", "quotaName", "limit"}, nil,
-		)
 	}
 
-	nu := sher.InspectAllNodesUsage()
 	for nodeID, val := range *nu {
 		for _, devs := range val.Devices.DeviceLists {
+			if devs.Device.Type == remotegpu.RemoteGPUCommonWord {
+				// The lupine pool is handed to every client node, so reporting
+				// it here would list each card once per node, under a node
+				// that does not own it. collectRemoteGPUMetrics reports the
+				// pool once, by server.
+				continue
+			}
+			coreLimit, coreAllocated := normalizeAMDCoreMetrics(devs.Device.Type, devs.Device.Totalcore, devs.Device.Usedcores)
 			if devs.Device.Mode == "mig" {
-				for idx, migs := range devs.Device.MigUsage.UsageList {
-					klog.V(3).Infoln("mig instances=", devs.Device.MigUsage)
-					inuse := 0
-					if migs.InUse {
-						inuse = 1
+				for _, allocation := range devs.Device.MigAllocationsInUse {
+					if !allocation.RuntimeReady {
+						continue
 					}
-					ch <- prometheus.MustNewConstMetric(
+					klog.V(3).InfoS("MIG instance allocation",
+						"profile", allocation.Profile,
+						"gpuInstanceID", allocation.GPUInstanceID,
+						"computeInstanceID", allocation.ComputeInstanceID,
+						"migUUID", allocation.MigUUID)
+					if err := sendMetric(
+						ch,
 						nodeGPUMigInstance,
 						prometheus.GaugeValue,
-						float64(inuse),
-						nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), migs.Name+"-"+fmt.Sprint(idx),
-					)
+						1,
+						nodeID,
+						devs.Device.ID,
+						fmt.Sprint(devs.Device.Index),
+						allocation.MigUUID,
+						allocation.Profile,
+						fmt.Sprint(allocation.GPUInstanceID),
+						fmt.Sprint(allocation.ComputeInstanceID),
+						fmt.Sprint(allocation.Placement.Start),
+						fmt.Sprint(allocation.Placement.Size),
+					); err != nil {
+						klog.V(4).Infof("Failed to send nodeGPUMigInstance metric: %v", err)
+					}
 					if legacy {
-						ch <- prometheus.MustNewConstMetric(
+						sendLegacyMetric(
+							ch,
 							legacyMigInstance,
 							prometheus.GaugeValue,
-							float64(inuse),
-							nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), migs.Name+"-"+fmt.Sprint(idx),
+							1,
+							nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), allocation.Profile+"-"+fmt.Sprint(allocation.GPUInstanceID),
 						)
 					}
 				}
 			}
 
-			ch <- prometheus.MustNewConstMetric(
-				nodevGPUMemoryLimitDesc,
-				prometheus.GaugeValue,
-				float64(devs.Device.Totalmem)*float64(1024)*float64(1024),
-				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				nodevGPUCoreLimitDesc,
-				prometheus.GaugeValue,
-				float64(devs.Device.Totalcore),
-				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				nodevGPUMemoryAllocatedDesc,
-				prometheus.GaugeValue,
-				float64(devs.Device.Usedmem)*float64(1024)*float64(1024),
-				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Usedcores), devs.Device.Type,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				nodevGPUSharedNumDesc,
-				prometheus.GaugeValue,
-				float64(devs.Device.Used),
-				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				nodeGPUCoreAllocatedDesc,
-				prometheus.GaugeValue,
-				float64(devs.Device.Usedcores),
-				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				nodeGPUOverview,
-				prometheus.GaugeValue,
-				float64(devs.Device.Usedmem)*float64(1024)*float64(1024),
-				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Usedcores), fmt.Sprint(devs.Device.Used), fmt.Sprint(devs.Device.Totalmem), devs.Device.Type,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				nodeGPUMemoryPercentage,
-				prometheus.GaugeValue,
-				float64(devs.Device.Usedmem)/float64(devs.Device.Totalmem),
-				nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index),
-			)
+			if err := sendMetric(ch, nodevGPUMemoryLimitDesc, prometheus.GaugeValue, mibToBytes(devs.Device.Totalmem), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type); err != nil {
+				klog.V(4).Infof("Failed to send nodevGPUMemoryLimitDesc metric: %v", err)
+			}
+			if err := sendMetric(ch, nodevGPUCoreLimitDesc, prometheus.GaugeValue, coreLimit, nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type); err != nil {
+				klog.V(4).Infof("Failed to send nodevGPUCoreLimitDesc metric: %v", err)
+			}
+			if err := sendMetric(ch, nodevGPUMemoryAllocatedDesc, prometheus.GaugeValue, mibToBytes(devs.Device.Usedmem), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Totalcore), devs.Device.Type); err != nil {
+				klog.V(4).Infof("Failed to send nodevGPUMemoryAllocatedDesc metric: %v", err)
+			}
+			if err := sendMetric(ch, nodevGPUSharedNumDesc, prometheus.GaugeValue, float64(devs.Device.Used), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type); err != nil {
+				klog.V(4).Infof("Failed to send nodevGPUSharedNumDesc metric: %v", err)
+			}
+			if err := sendMetric(ch, nodeGPUCoreAllocatedDesc, prometheus.GaugeValue, coreAllocated, nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type); err != nil {
+				klog.V(4).Infof("Failed to send nodeGPUCoreAllocatedDesc metric: %v", err)
+			}
+			if err := sendMetric(ch, nodeGPUOverview, prometheus.GaugeValue, mibToBytes(devs.Device.Usedmem), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Totalcore), fmt.Sprint(devs.Device.Totalmem), devs.Device.Type); err != nil {
+				klog.V(4).Infof("Failed to send nodeGPUOverview metric: %v", err)
+			}
+
+			if devs.Device.Totalmem > 0 {
+				if err := sendMetric(ch, nodeGPUMemoryAllocatedRatioDesc, prometheus.GaugeValue, float64(devs.Device.Usedmem)/float64(devs.Device.Totalmem), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type); err != nil {
+					klog.V(4).Infof("Failed to send nodeGPUMemoryAllocatedRatioDesc metric: %v", err)
+				}
+			}
 
 			if legacy {
-				ch <- prometheus.MustNewConstMetric(
-					legacyMemoryLimitDesc,
-					prometheus.GaugeValue,
-					float64(devs.Device.Totalmem)*float64(1024)*float64(1024),
-					nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					legacyCoreLimitDesc,
-					prometheus.GaugeValue,
-					float64(devs.Device.Totalcore),
-					nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					legacyMemoryAllocatedDesc,
-					prometheus.GaugeValue,
-					float64(devs.Device.Usedmem)*float64(1024)*float64(1024),
-					nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Usedcores), devs.Device.Type,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					legacySharedNumDesc,
-					prometheus.GaugeValue,
-					float64(devs.Device.Used),
-					nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					legacyCoreAllocatedDesc,
-					prometheus.GaugeValue,
-					float64(devs.Device.Usedcores),
-					nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					legacyOverview,
-					prometheus.GaugeValue,
-					float64(devs.Device.Usedmem)*float64(1024)*float64(1024),
-					nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Usedcores), fmt.Sprint(devs.Device.Used), fmt.Sprint(devs.Device.Totalmem), devs.Device.Type,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					legacyMemoryPercentage,
-					prometheus.GaugeValue,
-					float64(devs.Device.Usedmem)/float64(devs.Device.Totalmem),
-					nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index),
-				)
+				sendLegacyMetric(ch, legacyMemoryLimitDesc, prometheus.GaugeValue, mibToBytes(devs.Device.Totalmem), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type)
+				sendLegacyMetric(ch, legacyCoreLimitDesc, prometheus.GaugeValue, float64(devs.Device.Totalcore), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type)
+				sendLegacyMetric(ch, legacyMemoryAllocatedDesc, prometheus.GaugeValue, mibToBytes(devs.Device.Usedmem), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Totalcore), devs.Device.Type)
+				sendLegacyMetric(ch, legacySharedNumDesc, prometheus.GaugeValue, float64(devs.Device.Used), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type)
+				sendLegacyMetric(ch, legacyCoreAllocatedDesc, prometheus.GaugeValue, float64(devs.Device.Usedcores), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), devs.Device.Type)
+				sendLegacyMetric(ch, legacyOverview, prometheus.GaugeValue, mibToBytes(devs.Device.Usedmem), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index), fmt.Sprint(devs.Device.Totalcore), fmt.Sprint(devs.Device.Totalmem), devs.Device.Type)
+				if devs.Device.Totalmem > 0 {
+					sendLegacyMetric(ch, legacyMemoryPercentage, prometheus.GaugeValue, float64(devs.Device.Usedmem)/float64(devs.Device.Totalmem), nodeID, devs.Device.ID, fmt.Sprint(devs.Device.Index))
+				}
 			}
 		}
 	}
+}
 
+// collectQuotaMetrics emits per-namespace resource quota usage and limits.
+func (cc ClusterManagerCollector) collectQuotaMetrics(ch chan<- prometheus.Metric, legacy bool) {
+	quotaUsedDesc := prometheus.NewDesc(
+		"hami_resource_quota_used",
+		"resourcequota usage for a certain device (DEPRECATED: the limit label is deprecated in v2.11.0, removed in v2.12.0; use hami_resource_quota_limit instead)",
+		[]string{"namespace", "quota_name", "limit"}, nil,
+	)
+	quotaLimitDesc := prometheus.NewDesc(
+		"hami_resource_quota_limit",
+		"resourcequota limit for a certain device",
+		[]string{"namespace", "quota_name"}, nil,
+	)
+	var legacyQuotaUsed *prometheus.Desc
+	if legacy {
+		legacyQuotaUsed = prometheus.NewDesc(
+			"QuotaUsed",
+			"resourcequota usage for a certain device (DEPRECATED: the limit label is deprecated in v2.11.0, removed in v2.12.0; use hami_resource_quota_limit instead)",
+			[]string{"quotanamespace", "quotaName", "limit"}, nil,
+		)
+	}
+	for ns, val := range cc.metricsProvider.GetQuotaManager().GetResourceQuota() {
+		for quotaname, q := range *val {
+			if err := sendMetric(ch, quotaUsedDesc, prometheus.GaugeValue, float64(q.Used), ns, quotaname, fmt.Sprint(q.Limit)); err != nil {
+				klog.V(4).Infof("Failed to send quotaUsedDesc metric: %v", err)
+			}
+			if q.LimitSet {
+				if err := sendMetric(ch, quotaLimitDesc, prometheus.GaugeValue, float64(q.Limit), ns, quotaname); err != nil {
+					klog.V(4).Infof("Failed to send quotaLimitDesc metric: %v", err)
+				}
+			}
+			if legacy {
+				sendLegacyMetric(ch, legacyQuotaUsed, prometheus.GaugeValue, float64(q.Used), ns, quotaname, fmt.Sprint(q.Limit))
+			}
+		}
+	}
+}
+
+// collectContainerMetrics emits per-container vGPU metrics for all scheduled
+// pods. AMD core allocations are normalized to a percentage via
+// normalizeAMDCoreMetrics (issue #2518); legacy metrics keep raw values.
+func (cc ClusterManagerCollector) collectContainerMetrics(ch chan<- prometheus.Metric, deviceMetaByUUID map[string]deviceMeta, legacy bool) {
+	// PodManager only ever stores the pod's collapsed device usage, a single
+	// entry per device type, so there is no per-container breakdown to label
+	// with. See device.CollapseInitContainerUsage and SteadyStateDeviceUsage.
 	ctrvGPUdeviceAllocatedMemoryDesc := prometheus.NewDesc(
 		"hami_vgpu_memory_allocated_bytes",
-		"vGPU memory allocated from a container",
-		[]string{"namespace", "node", "pod", "container_index", "device_uuid"}, nil,
+		"vGPU memory allocated from a pod",
+		[]string{"namespace", "node", "pod", "device_uuid"}, nil,
 	)
 	ctrvGPUdeviceAllocatedCoreDesc := prometheus.NewDesc(
 		"hami_vgpu_core_allocated_ratio",
-		"vGPU core allocated from a container",
-		[]string{"namespace", "node", "pod", "container_index", "device_uuid"}, nil,
+		"vGPU core allocated from a pod",
+		[]string{"namespace", "node", "pod", "device_uuid"}, nil,
 	)
-	quotaUsedDesc := prometheus.NewDesc(
-		"hami_resource_quota_used",
-		"resourcequota usage for a certain device",
-		[]string{"namespace", "quota_name", "limit"}, nil,
+	var (
+		legacyAllocatedMemory *prometheus.Desc
+		legacyAllocatedCore   *prometheus.Desc
 	)
-	for ns, val := range sher.GetQuotaManager().GetResourceQuota() {
-		for quotaname, q := range *val {
-			ch <- prometheus.MustNewConstMetric(
-				quotaUsedDesc,
-				prometheus.GaugeValue,
-				float64(q.Used),
-				ns, quotaname, fmt.Sprint(q.Limit),
-			)
-			if legacy {
-				ch <- prometheus.MustNewConstMetric(
-					legacyQuotaUsed,
-					prometheus.GaugeValue,
-					float64(q.Used),
-					ns, quotaname, fmt.Sprint(q.Limit),
-				)
-			}
-		}
+	if legacy {
+		// Legacy metrics exist to keep pre-existing dashboards working, so
+		// containeridx stays even though it is always "0". Only the new
+		// hami_vgpu_* pair drops it.
+		legacyAllocatedMemory = prometheus.NewDesc(
+			"vGPUMemoryAllocated",
+			"vGPU memory allocated from a pod",
+			[]string{"podnamespace", "nodename", "podname", "containeridx", "deviceuuid"}, nil,
+		)
+		legacyAllocatedCore = prometheus.NewDesc(
+			"vGPUCoreAllocated",
+			"vGPU core allocated from a pod",
+			[]string{"podnamespace", "nodename", "podname", "containeridx", "deviceuuid"}, nil,
+		)
 	}
-	schedpods, _ := sher.GetPodManager().GetScheduledPods()
+	schedpods, _ := cc.metricsProvider.GetPodManager().GetScheduledPods()
 	for _, val := range schedpods {
 		for _, podSingleDevice := range val.Devices {
 			for ctridx, ctrdevs := range podSingleDevice {
@@ -332,71 +433,163 @@ func (cc ClusterManagerCollector) Collect(ch chan<- prometheus.Metric) {
 							val.Namespace, val.Name, ctridx, val.NodeID)
 						continue
 					}
-					ch <- prometheus.MustNewConstMetric(
-						ctrvGPUdeviceAllocatedMemoryDesc,
-						prometheus.GaugeValue,
-						float64(ctrdevval.Usedmem)*float64(1024)*float64(1024),
-						val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID)
-					ch <- prometheus.MustNewConstMetric(
-						ctrvGPUdeviceAllocatedCoreDesc,
-						prometheus.GaugeValue,
-						float64(ctrdevval.Usedcores),
-						val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID)
-					if legacy {
-						ch <- prometheus.MustNewConstMetric(
-							legacyAllocatedMemory,
-							prometheus.GaugeValue,
-							float64(ctrdevval.Usedmem)*float64(1024)*float64(1024),
-							val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID)
-						ch <- prometheus.MustNewConstMetric(
-							legacyAllocatedCore,
-							prometheus.GaugeValue,
-							float64(ctrdevval.Usedcores),
-							val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID)
-					}
-					var totaldev int32
-					found := false
-					for _, ni := range *nu {
-						for _, nodedev := range ni.Devices.DeviceLists {
-							if strings.Compare(nodedev.Device.ID, ctrdevval.UUID) == 0 {
-								totaldev = nodedev.Device.Totalmem
-								found = true
-								break
-							}
-						}
-						if found {
-							break
-						}
-					}
-					klog.V(4).InfoS("Total memory for device",
+					// Resolve the matching node device's total core capacity and type so
+					// AMD physical compute-unit (CU) counts in Usedcores can be normalized
+					// to the percentage unit used by hami_vgpu_core_allocated_ratio (#2518).
+					meta, found := deviceMetaByUUID[ctrdevval.UUID]
+					klog.V(4).InfoS("Resolved device for container metric",
 						"deviceUUID", ctrdevval.UUID,
-						"totalMemory", totaldev,
+						"totalCore", meta.totalcore,
+						"deviceType", meta.deviceType,
+						"found", found,
 						"nodeID", val.NodeID,
 					)
+					containerLabels := []string{val.Namespace, val.NodeID, val.Name, ctrdevval.UUID}
+					usedMemBytes := mibToBytes(ctrdevval.Usedmem)
+					if err := sendMetric(ch, ctrvGPUdeviceAllocatedMemoryDesc, prometheus.GaugeValue, usedMemBytes, containerLabels...); err != nil {
+						klog.V(4).Infof("Failed to send ctrvGPUdeviceAllocatedMemoryDesc metric: %v", err)
+					}
+					_, ctrCoreAllocated := normalizeAMDCoreMetrics(meta.deviceType, meta.totalcore, ctrdevval.Usedcores)
+					if err := sendMetric(ch, ctrvGPUdeviceAllocatedCoreDesc, prometheus.GaugeValue, ctrCoreAllocated, containerLabels...); err != nil {
+						klog.V(4).Infof("Failed to send ctrvGPUdeviceAllocatedCoreDesc metric: %v", err)
+					}
+					if legacy {
+						legacyLabels := []string{val.Namespace, val.NodeID, val.Name, fmt.Sprint(ctridx), ctrdevval.UUID}
+						sendLegacyMetric(ch, legacyAllocatedMemory, prometheus.GaugeValue, usedMemBytes, legacyLabels...)
+						sendLegacyMetric(ch, legacyAllocatedCore, prometheus.GaugeValue, float64(ctrdevval.Usedcores), legacyLabels...)
+					}
 				}
 			}
 		}
 	}
 }
 
+// collectRemoteGPUMetrics exports the lupine fleet once, keyed by the server
+// that owns each card rather than the client nodes that can reach it. A card
+// is handed out whole, so allocation is a flag and allocated memory is either
+// the whole card or nothing.
+func (cc ClusterManagerCollector) collectRemoteGPUMetrics(ch chan<- prometheus.Metric) {
+	labels := []string{"server", "endpoint", "device_uuid", "device_index", "device_type"}
+	memoryLimitDesc := prometheus.NewDesc(
+		"hami_remote_gpu_memory_limit_bytes",
+		"Device memory limit for a lupine-served GPU",
+		labels, nil,
+	)
+	allocatedDesc := prometheus.NewDesc(
+		"hami_remote_gpu_allocated",
+		"1 if a pod holds this lupine-served GPU, 0 if it is free",
+		labels, nil,
+	)
+	overviewDesc := prometheus.NewDesc(
+		"hami_remote_gpu_overview",
+		"Memory allocated on a lupine-served GPU, with its server and capacity",
+		[]string{"server", "endpoint", "device_uuid", "device_index", "device_cores", "device_memory_limit", "device_type"}, nil,
+	)
+	for _, pd := range remoteGPUPool() {
+		d := pd.Device
+		allocated, usedmem := 0.0, int64(0)
+		if pd.Reserved {
+			allocated, usedmem = 1, d.Devmem
+		}
+		if err := sendMetric(ch, memoryLimitDesc, prometheus.GaugeValue, mibToBytes(d.Devmem), pd.Server, pd.Endpoint, d.ID, fmt.Sprint(d.Index), d.Type); err != nil {
+			klog.V(4).Infof("Failed to send hami_remote_gpu_memory_limit_bytes metric: %v", err)
+		}
+		if err := sendMetric(ch, allocatedDesc, prometheus.GaugeValue, allocated, pd.Server, pd.Endpoint, d.ID, fmt.Sprint(d.Index), d.Type); err != nil {
+			klog.V(4).Infof("Failed to send hami_remote_gpu_allocated metric: %v", err)
+		}
+		if err := sendMetric(ch, overviewDesc, prometheus.GaugeValue, mibToBytes(usedmem), pd.Server, pd.Endpoint, d.ID, fmt.Sprint(d.Index), fmt.Sprint(d.Devcore), fmt.Sprint(d.Devmem), d.Type); err != nil {
+			klog.V(4).Infof("Failed to send hami_remote_gpu_overview metric: %v", err)
+		}
+	}
+}
+
+// collectSchedulerStateMetrics emits hami_scheduler_is_leader and
+// hami_scheduler_cache_synced as gauges (0 or 1) every scrape. These allow
+// operators to alert on leader-loss or cache-desync without log-scraping.
+func (cc ClusterManagerCollector) collectSchedulerStateMetrics(ch chan<- prometheus.Metric) {
+	isLeaderDesc := prometheus.NewDesc(
+		"hami_scheduler_is_leader",
+		"1 if this scheduler instance is the current leader, 0 otherwise.",
+		nil, nil,
+	)
+	cacheSyncedDesc := prometheus.NewDesc(
+		"hami_scheduler_cache_synced",
+		"1 if the scheduler's internal node/device cache is fully synced, 0 otherwise.",
+		nil, nil,
+	)
+
+	isLeaderVal := 0.0
+	if cc.metricsProvider.GetLeaderManager().IsLeader() {
+		isLeaderVal = 1.0
+	}
+	isSyncedVal := 0.0
+	if cc.metricsProvider.IsSynced() {
+		isSyncedVal = 1.0
+	}
+
+	if err := sendMetric(ch, isLeaderDesc, prometheus.GaugeValue, isLeaderVal); err != nil {
+		klog.V(4).Infof("Failed to send hami_scheduler_is_leader metric: %v", err)
+	}
+	if err := sendMetric(ch, cacheSyncedDesc, prometheus.GaugeValue, isSyncedVal); err != nil {
+		klog.V(4).Infof("Failed to send hami_scheduler_cache_synced metric: %v", err)
+	}
+}
+
+// collectSchedulerOutcomeMetrics emits allocation and recovery counters owned
+// by the scheduler. The metrics object is optional so lightweight collector
+// tests and embedders can omit scheduler lifecycle metrics.
+func (cc ClusterManagerCollector) collectSchedulerOutcomeMetrics(ch chan<- prometheus.Metric) {
+	if outcome := cc.metricsProvider.GetAllocationMetrics(); outcome != nil {
+		outcome.Collect(ch)
+	}
+}
+
 // NewClusterManager creates a ClusterManager and registers its collector.
-func NewClusterManager(zone string, reg prometheus.Registerer, legacyMetrics bool) *ClusterManager {
+func NewClusterManager(zone string, reg prometheus.Registerer, metricsProvider schedulerMetricsProvider, legacyMetrics bool) *ClusterManager {
 	c := &ClusterManager{
 		Zone:          zone,
 		LegacyMetrics: legacyMetrics,
 	}
-	cc := ClusterManagerCollector{ClusterManager: c}
+	cc := ClusterManagerCollector{
+		ClusterManager:  c,
+		metricsProvider: metricsProvider,
+	}
 	prometheus.WrapRegistererWith(prometheus.Labels{"zone": zone}, reg).MustRegister(cc)
 	return c
 }
 
-func initMetrics(bindAddress string, legacyMetrics bool) {
+func initMetrics(bindAddress string, metricsProvider schedulerMetricsProvider, legacyMetrics bool) {
 	klog.Info("Initializing metrics for scheduler")
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(versionmetrics.NewBuildInfoCollector())
 
-	NewClusterManager("vGPU", reg, legacyMetrics)
+	NewClusterManager("vGPU", reg, metricsProvider, legacyMetrics)
 
-	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	log.Fatal(http.ListenAndServe(bindAddress, nil))
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	server := &http.Server{
+		Addr:              bindAddress,
+		Handler:           mux,
+		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       60 * time.Second,
+	}
+	log.Fatal(server.ListenAndServe())
+}
+
+func sendLegacyMetric(ch chan<- prometheus.Metric, desc *prometheus.Desc, valueType prometheus.ValueType, value float64, labels ...string) {
+	if desc == nil {
+		return
+	}
+	if err := sendMetric(ch, desc, valueType, value, labels...); err != nil {
+		klog.V(4).Infof("Failed to send legacy metric: %v", err)
+	}
+}
+
+func sendMetric(ch chan<- prometheus.Metric, desc *prometheus.Desc, valueType prometheus.ValueType, value float64, labels ...string) error {
+	metric, err := prometheus.NewConstMetric(desc, valueType, value, labels...)
+	if err != nil {
+		return fmt.Errorf("failed to create metric: %w", err)
+	}
+	ch <- metric
+	return nil
 }

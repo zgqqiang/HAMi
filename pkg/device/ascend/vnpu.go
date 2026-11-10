@@ -16,11 +16,16 @@ limitations under the License.
 
 package ascend
 
+import (
+	"fmt"
+	"strings"
+)
+
 type Template struct {
 	Name   string `yaml:"name"`
 	Memory int64  `yaml:"memory"`
-	AICore int32  `yaml:"aiCore,omitempty"`
-	AICPU  int32  `yaml:"aiCPU,omitempty"`
+	AICore int64  `yaml:"aiCore,omitempty"`
+	AICPU  int64  `yaml:"aiCPU,omitempty"`
 }
 
 type VNPUConfig struct {
@@ -31,17 +36,53 @@ type VNPUConfig struct {
 	ResourceCoreName   string     `yaml:"resourceCoreName"`
 	MemoryAllocatable  int64      `yaml:"memoryAllocatable"`
 	MemoryCapacity     int64      `yaml:"memoryCapacity"`
-	MemoryFactor       int32      `yaml:"memoryFactor"`
-	AICore             int32      `yaml:"aiCore"`
-	AICPU              int32      `yaml:"aiCPU"`
-	RuntimeClassName   string     `yaml:"runtimeClassName"`
-	OverwriteEnv       bool       `yaml:"overwriteEnv"`
+	MemoryFactor       int64      `yaml:"memoryFactor"`
+	AICore             int64      `yaml:"aiCore"`
+	AICPU              int64      `yaml:"aiCPU"`
 	Templates          []Template `yaml:"templates"`
+	SuperPod           bool       `yaml:"superPod"`
 }
 
-// VNPUs holds the global Ascend VNPU configuration, including a flag to enable
-// hami-vnpu-core soft-partitioning for all nodes and the per-chip config list.
+// VNPUs holds the default Ascend VNPU mode and the per-chip config list.
+// OverwriteEnv and RuntimeClassName apply to every chip identically, so they
+// live here rather than on each VNPUConfig.
 type VNPUs struct {
-	HamiVnpuCore bool         `yaml:"hamiVnpuCore"`
-	Configs      []VNPUConfig `yaml:"configs"`
+	HamiVnpuMode     string       `yaml:"hamiVnpuMode,omitempty"`
+	EnpuPolicy       string       `yaml:"enpuPolicy,omitempty"`
+	OverwriteEnv     bool         `yaml:"overwriteEnv"`
+	RuntimeClassName string       `yaml:"runtimeClassName"`
+	Configs          []VNPUConfig `yaml:"configs"`
+
+	// Consumed by the Ascend device plugin from the shared device ConfigMap.
+	DeviceSplitCount int `yaml:"deviceSplitCount,omitempty"`
+
+	// Deprecated: use HamiVnpuMode. Only applies when HamiVnpuMode is empty.
+	HamiVnpuCore bool `yaml:"hamiVnpuCore,omitempty"`
+}
+
+// mode resolves the global default; node capability annotations take precedence.
+func (v VNPUs) mode() (string, error) {
+	switch mode := strings.ToLower(strings.TrimSpace(v.HamiVnpuMode)); mode {
+	case "":
+		if v.HamiVnpuCore {
+			return VNPUModeHamiCore, nil
+		}
+		return VNPUModeTemplate, nil
+	case "hamicore", VNPUModeHamiCore:
+		return VNPUModeHamiCore, nil
+	case VNPUModeTemplate, VNPUModeENPU:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("vnpus.hamiVnpuMode must be template, hami-core (or hamiCore), or enpu, got %q", v.HamiVnpuMode)
+	}
+}
+
+// UnmarshalYAML rejects invalid modes before the scheduler starts.
+func (v *VNPUs) UnmarshalYAML(unmarshal func(any) error) error {
+	type plainVNPUs VNPUs
+	if err := unmarshal((*plainVNPUs)(v)); err != nil {
+		return err
+	}
+	_, err := v.mode()
+	return err
 }

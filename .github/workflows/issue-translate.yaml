@@ -5,11 +5,21 @@ on:
   issues:
     types: [opened]
 
+permissions:
+  issues: write
+
 jobs:
   translate: # make sure the action works on a clean machine without building
+    if: >-
+      github.event_name == 'issues' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.comment.user.type != 'Bot' &&
+        !startsWith(github.event.comment.body, '/')
+      )
     runs-on: ubuntu-latest
     steps:
-      - uses: tomsun28/issues-translate-action@v2.7
+      - uses: tomsun28/issues-translate-action@af53517fed9ee52907193239fb88ddf72f51a07d # v2.8
         with:
           IS_MODIFY_TITLE: true
           BOT_GITHUB_TOKEN: ${{ secrets.TRANSLATE_ROBOT_TOKEN }}

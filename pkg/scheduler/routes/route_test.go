@@ -17,9 +17,19 @@ limitations under the License.
 package routes
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
+	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 
 	"github.com/Project-HAMi/HAMi/pkg/scheduler"
 	"github.com/Project-HAMi/HAMi/pkg/scheduler/config"
@@ -42,6 +52,7 @@ func TestMaxRequestSize(t *testing.T) {
 		t.Logf("Success! Caught expected error: %s", respBody)
 	}
 }
+
 func TestHealthzRoute(t *testing.T) {
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
@@ -75,14 +86,12 @@ func TestWebHookRoute(t *testing.T) {
 		t.Fatal("WebHookRoute returned nil handler")
 	}
 
-	// Send a request to the webhook handler - even an invalid request exercises the handler path
 	req := httptest.NewRequest("POST", "/webhook", strings.NewReader("{}"))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
 	handler(w, req, nil)
 
-	// The webhook handler should respond (any status is fine - we're testing the route layer)
 	if w.Code == 0 {
 		t.Error("Expected a non-zero status code from webhook handler")
 	}
@@ -129,9 +138,208 @@ func TestCheckBodyNil(t *testing.T) {
 	req.Body = nil
 	w := httptest.NewRecorder()
 
-	checkBody(w, req)
+	if checkBody(w, req) {
+		t.Error("expected checkBody to reject a nil body")
+	}
 
 	if w.Code != 400 {
 		t.Errorf("Expected status 400 for nil body, got %d", w.Code)
+	}
+}
+
+func TestCheckBody_ValidBody(t *testing.T) {
+	req := httptest.NewRequest("POST", "/test", strings.NewReader("some-body"))
+	w := httptest.NewRecorder()
+
+	valid := checkBody(w, req)
+
+	if !valid {
+		t.Error("Expected checkBody to return true for valid body, got false")
+	}
+	if w.Code != 200 {
+		t.Errorf("Expected status 200 (default) for valid body, got %d", w.Code)
+	}
+}
+
+func TestPredicateRoute_NilBody(t *testing.T) {
+	req := httptest.NewRequest("POST", "/predicate", nil)
+	req.Body = nil
+	w := httptest.NewRecorder()
+
+	s := &scheduler.Scheduler{}
+	handler := PredicateRoute(s)
+	handler(w, req, nil)
+
+	if w.Code != 400 {
+		t.Errorf("expected 400 for nil body, got %d", w.Code)
+	}
+}
+
+func TestBind_NilBody(t *testing.T) {
+	req := httptest.NewRequest("POST", "/bind", nil)
+	req.Body = nil
+	w := httptest.NewRecorder()
+
+	s := &scheduler.Scheduler{}
+	handler := Bind(s)
+
+	// This should not panic
+	handler(w, req, nil)
+
+	if w.Code != 400 {
+		t.Errorf("Expected status 400 for nil body in Bind, got %d", w.Code)
+	}
+}
+
+func TestPredicateRoute_DecodeError(t *testing.T) {
+	req := httptest.NewRequest("POST", "/predicate", strings.NewReader("{not-json"))
+	w := httptest.NewRecorder()
+
+	s := &scheduler.Scheduler{}
+	handler := PredicateRoute(s)
+	handler(w, req, nil)
+
+	if w.Code != 200 {
+		t.Errorf("expected 200 (error reported in body, not status), got %d", w.Code)
+	}
+
+	var result extenderv1.ExtenderFilterResult
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if result.Error == "" {
+		t.Error("expected a decode error to be reported in the filter result")
+	}
+}
+
+func TestPredicateRoute_NilPod(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "pod field omitted", body: `{"NodeNames":["node1"]}`},
+		{name: "pod field explicitly null", body: `{"Pod":null,"NodeNames":["node1"]}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/predicate", strings.NewReader(tt.body))
+			w := httptest.NewRecorder()
+
+			s := &scheduler.Scheduler{}
+			handler := PredicateRoute(s)
+
+			// Must not panic when Pod is missing/null.
+			handler(w, req, nil)
+
+			if w.Code != 200 {
+				t.Errorf("expected 200 (error reported in body, not status), got %d", w.Code)
+			}
+
+			var result extenderv1.ExtenderFilterResult
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+				t.Fatalf("failed to unmarshal response: %v", err)
+			}
+			if result.Error == "" {
+				t.Error("expected a missing-pod error to be reported in the filter result")
+			}
+		})
+	}
+}
+
+func TestPredicateRoute_CacheNotSynced(t *testing.T) {
+	args := extenderv1.ExtenderArgs{Pod: &corev1.Pod{}}
+	body, err := json.Marshal(args)
+	if err != nil {
+		t.Fatalf("failed to marshal args: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately so WaitForCacheSync fails fast instead of polling forever
+
+	req := httptest.NewRequest("POST", "/predicate", bytes.NewReader(body)).WithContext(ctx)
+	w := httptest.NewRecorder()
+
+	s := &scheduler.Scheduler{} // zero value: synced defaults to false
+	handler := PredicateRoute(s)
+	handler(w, req, nil)
+
+	if w.Code != 200 {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var result extenderv1.ExtenderFilterResult
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if !strings.Contains(result.Error, "context cancelled") {
+		t.Errorf("expected 'context cancelled' error, got %q", result.Error)
+	}
+}
+
+func TestBind_DecodeError(t *testing.T) {
+	req := httptest.NewRequest("POST", "/bind", strings.NewReader("{not-json"))
+	w := httptest.NewRecorder()
+
+	s := &scheduler.Scheduler{}
+	handler := Bind(s)
+	handler(w, req, nil)
+
+	if w.Code != 200 {
+		t.Errorf("expected 200 (error reported in body, not status), got %d", w.Code)
+	}
+
+	var result extenderv1.ExtenderBindingResult
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if result.Error == "" {
+		t.Error("expected a decode error to be reported in the bind result")
+	}
+}
+
+type errorResponseWriter struct {
+	http.ResponseWriter
+}
+
+func (w *errorResponseWriter) Write(b []byte) (int, error) {
+	return 0, errors.New("mock write error")
+}
+func TestPredicateRoute_WriteError(t *testing.T) {
+	var buf bytes.Buffer
+	klog.SetOutput(&buf)
+	klog.LogToStderr(false)
+	defer func() {
+		klog.SetOutput(os.Stderr)
+		klog.LogToStderr(true)
+	}()
+	req := httptest.NewRequest("POST", "/predicate", strings.NewReader("{not-json"))
+	w := httptest.NewRecorder()
+	ew := &errorResponseWriter{ResponseWriter: w}
+	s := &scheduler.Scheduler{}
+	handler := PredicateRoute(s)
+	handler(ew, req, nil)
+	klog.Flush()
+	if !strings.Contains(buf.String(), "Failed to write response") {
+		t.Errorf("Expected 'Failed to write response' in log output, but got: %s", buf.String())
+	}
+}
+func TestBind_WriteError(t *testing.T) {
+	var buf bytes.Buffer
+	klog.SetOutput(&buf)
+	klog.LogToStderr(false)
+	defer func() {
+		klog.SetOutput(os.Stderr)
+		klog.LogToStderr(true)
+	}()
+	req := httptest.NewRequest("POST", "/bind", strings.NewReader("{not-json"))
+	w := httptest.NewRecorder()
+	ew := &errorResponseWriter{ResponseWriter: w}
+	s := &scheduler.Scheduler{}
+	handler := Bind(s)
+	handler(ew, req, nil)
+	klog.Flush()
+	if !strings.Contains(buf.String(), "Failed to write response") {
+		t.Errorf("Expected 'Failed to write response' in log output, but got: %s", buf.String())
 	}
 }

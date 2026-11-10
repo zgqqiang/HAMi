@@ -23,9 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
-
-	"github.com/ccoveille/go-safecast/v2"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -42,80 +40,165 @@ type Devices interface {
 	GetNodeDevices(n corev1.Node) ([]*DeviceInfo, error)
 	LockNode(n *corev1.Node, p *corev1.Pod) error
 	ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error
-	GenerateResourceRequests(ctr *corev1.Container) ContainerDeviceRequest
+	// GenerateResourceRequests translates a container's resource limits into a
+	// device request. A zero Nums with a nil error means the container does not
+	// request this vendor's devices. A non-nil error means it does, but the
+	// request is invalid and the caller must fail closed instead of silently
+	// treating the pod as device-less.
+	//
+	// An explicitly requested count of zero is "no device", not an invalid
+	// request, so it belongs in the first case. Admission runs this on every
+	// pod, and charts commonly render a disabled GPU count as 0, so returning
+	// an error for it would deny ordinary CPU pods. A backend for which zero
+	// really is malformed should reject it in MutateAdmission instead, which
+	// only rejects containers that actually carry its resources.
+	GenerateResourceRequests(ctr *corev1.Container) (ContainerDeviceRequest, error)
 	PatchAnnotations(pod *corev1.Pod, annoinput *map[string]string, pd PodDevices) map[string]string
 	ScoreNode(node *corev1.Node, podDevices PodSingleDevice, previous []*DeviceUsage, policy string) float32
 	AddResourceUsage(pod *corev1.Pod, n *DeviceUsage, ctr *ContainerDevice) error
 	Fit(devices []*DeviceUsage, request ContainerDeviceRequest, pod *corev1.Pod, nodeInfo *NodeInfo, allocated *PodDevices) (bool, map[string]ContainerDevices, string)
 }
 
+type MigPlacement struct {
+	Start uint32 `json:"start"`
+	Size  uint32 `json:"size"`
+}
+
+// Deprecated scheduler-template types are retained for source compatibility
+// with non-NVIDIA device implementations and tests. Dynamic NVIDIA MIG does
+// not populate or consume them.
 type MigTemplate struct {
 	Name   string `yaml:"name"`
-	Core   int32  `yaml:"core"`
-	Memory int32  `yaml:"memory"`
-	Count  int32  `yaml:"count"`
+	Core   int64  `yaml:"core"`
+	Memory int64  `yaml:"memory"`
+	Count  int64  `yaml:"count"`
 }
 
 type MigTemplateUsage struct {
-	Name   string `json:"name,omitempty"`
-	Core   int32  `json:"core,omitempty"`
-	Memory int32  `json:"memory,omitempty"`
-	InUse  bool   `json:"inuse,omitempty"`
+	Name   string
+	Core   int64
+	Memory int64
+	InUse  bool
 }
 
 type Geometry []MigTemplate
-
 type MIGS []MigTemplateUsage
-
 type MigInUse struct {
-	Index     int32
+	Index     int64
 	UsageList MIGS
 }
 
-type AllowedMigGeometries struct {
-	Models     []string   `yaml:"models"`
-	Geometries []Geometry `yaml:"allowedGeometries"`
+type MigProfile struct {
+	Name       string         `json:"name"`
+	MemoryMB   int64          `json:"memoryMB"`
+	Core       int64          `json:"core"`
+	SliceCount uint32         `json:"sliceCount"`
+	Placements []MigPlacement `json:"placements"`
+
+	// InstanceCount is only used by the device plugin to derive the physical
+	// GPU's advertised replica count. It is not part of the scheduler wire
+	// format because placements already describe schedulable MIG capacity.
+	InstanceCount uint32 `json:"-"`
+}
+
+type MigAllocation struct {
+	Profile           string
+	Placement         MigPlacement
+	MigUUID           string
+	GPUInstanceID     uint32
+	ComputeInstanceID uint32
+	RuntimeReady      bool
+}
+
+type AllowedMigProfiles struct {
+	Models   []string `yaml:"models"`
+	Profiles []string `yaml:"profiles"`
 }
 
 type DeviceUsage struct {
-	ID          string
-	Index       uint
-	Used        int32
-	Count       int32
-	Usedmem     int32
-	Totalmem    int32
-	Totalcore   int32
-	Usedcores   int32
-	Mode        string
-	MigTemplate []Geometry
-	MigUsage    MigInUse
-	Numa        int
-	Type        string
-	Health      bool
-	PodInfos    []*PodInfo
-	CustomInfo  map[string]any
+	ID                  string
+	Index               uint
+	Used                int64
+	Count               int64
+	Usedmem             int64
+	Totalmem            int64
+	Totalcore           int64
+	Usedcores           int64
+	Mode                string
+	MigProfiles         []MigProfile
+	MigAllocationsInUse []MigAllocation
+	MigTemplate         []Geometry // Deprecated: unused by dynamic NVIDIA MIG.
+	MigUsage            MigInUse   // Deprecated: unused by dynamic NVIDIA MIG.
+	Numa                int
+	Type                string
+	DeviceVendor        string
+	Health              bool
+	PodInfos            []*PodInfo
+	CustomInfo          map[string]any
 }
 
 type DeviceInfo struct {
-	ID              string          `json:"id,omitempty"`
-	Index           uint            `json:"index,omitempty"`
-	Count           int32           `json:"count,omitempty"`
-	Devmem          int32           `json:"devmem,omitempty"`
-	Devcore         int32           `json:"devcore,omitempty"`
-	Type            string          `json:"type,omitempty"`
-	Numa            int             `json:"numa,omitempty"`
-	Mode            string          `json:"mode,omitempty"`
-	MIGTemplate     []Geometry      `json:"migtemplate,omitempty"`
-	Health          bool            `json:"health,omitempty"`
-	DeviceVendor    string          `json:"devicevendor,omitempty"`
-	CustomInfo      map[string]any  `json:"custominfo,omitempty"`
-	DevicePairScore DevicePairScore `json:"devicepairscore,omitempty"`
+	ID           string         `json:"id,omitempty"`
+	Index        uint           `json:"index,omitempty"`
+	Count        int64          `json:"count,omitempty"`
+	Devmem       int64          `json:"devmem,omitempty"`
+	Devcore      int64          `json:"devcore,omitempty"`
+	Type         string         `json:"type,omitempty"`
+	Numa         int            `json:"numa,omitempty"`
+	Mode         string         `json:"mode,omitempty"`
+	MIGProfiles  []MigProfile   `json:"migProfiles,omitempty"`
+	MIGTemplate  []Geometry     `json:"migtemplate,omitempty"` // Deprecated.
+	Health       bool           `json:"health,omitempty"`
+	DeviceVendor string         `json:"devicevendor,omitempty"`
+	CustomInfo   map[string]any `json:"custominfo,omitempty"`
+	// Device pair scores use a dedicated node annotation and must not inflate
+	// the per-device registration payload.
+	DevicePairScore DevicePairScore `json:"-"`
 }
 
 type DevicePairScores []DevicePairScore
 type DevicePairScore struct {
 	ID     string         `json:"uuid,omitempty"`
 	Scores map[string]int `json:"score,omitempty"`
+}
+
+func (d DeviceInfo) DeepCopy() DeviceInfo {
+	dup := d
+
+	if d.MIGProfiles != nil {
+		dup.MIGProfiles = make([]MigProfile, len(d.MIGProfiles))
+		copy(dup.MIGProfiles, d.MIGProfiles)
+		for i := range dup.MIGProfiles {
+			dup.MIGProfiles[i].Placements = slices.Clone(d.MIGProfiles[i].Placements)
+		}
+	}
+	if d.MIGTemplate != nil {
+		dup.MIGTemplate = make([]Geometry, len(d.MIGTemplate))
+		for i, geometry := range d.MIGTemplate {
+			dup.MIGTemplate[i] = slices.Clone(geometry)
+		}
+	}
+
+	if d.CustomInfo != nil {
+		dup.CustomInfo = maps.Clone(d.CustomInfo)
+	}
+
+	if d.DevicePairScore.Scores != nil {
+		dup.DevicePairScore.Scores = maps.Clone(d.DevicePairScore.Scores)
+	}
+
+	return dup
+}
+
+func DeepCopyDeviceInfos(devices []DeviceInfo) []DeviceInfo {
+	if devices == nil {
+		return nil
+	}
+	dup := make([]DeviceInfo, len(devices))
+	for i, dev := range devices {
+		dup[i] = dev.DeepCopy()
+	}
+	return dup
 }
 
 type NodeInfo struct {
@@ -128,24 +211,42 @@ type ResourceNames struct {
 	ResourceCountName  string
 	ResourceMemoryName string
 	ResourceCoreName   string
+	// MemoryFactor is the scale GenerateResourceRequests applies to the memory
+	// value read off the container spec. Recorded usage is in scaled units, so
+	// the quota manager scales a ResourceQuota memory limit by the same factor
+	// when it loads the quota. Backends that do not scale leave this zero.
+	MemoryFactor int64
 }
 
 type ContainerDevice struct {
 	// TODO current Idx cannot use, because EncodeContainerDevices method not encode this filed.
-	Idx        int
-	UUID       string
-	Type       string
-	Usedmem    int32
-	Usedcores  int32
+	Idx       int
+	UUID      string
+	Type      string
+	Usedmem   int64
+	Usedcores int64
+	// Slots is the number of concurrent tasks this collapsed entry represents on the device.
+	// Usage reconstruction adds it to DeviceUsage.Used; 0 (raw, uncollapsed entries) counts as 1.
+	Slots      int64
 	CustomInfo map[string]any
 }
 
 type ContainerDeviceRequest struct {
-	Nums             int32
+	Nums             int64
 	Type             string
-	Memreq           int32
-	MemPercentagereq int32
-	Coresreq         int32
+	Memreq           int64
+	MemPercentagereq int64
+	Coresreq         int64
+	// TotalCoresreq preserves a NeuronCore request until the candidate node's
+	// cores-per-device geometry is known. Other backends leave it zero.
+	TotalCoresreq int64
+}
+
+// CoreMaskAccounting is implemented by backends whose Usedcores values are
+// bit masks rather than additive core counts.
+type CoreMaskAccounting interface {
+	AccumulateCores(used, allocated int64) int64
+	CountAllocatedCores(allocated int64) int64
 }
 
 type ContainerDevices []ContainerDevice
@@ -177,41 +278,46 @@ func init() {
 	SupportDevices = make(map[string]string)
 }
 
+// DeepCopy returns a copy of DeviceUsage. It clones the PodInfos slice but
+// shares its read-only PodInfo entries, which callers must not mutate.
 func (d *DeviceUsage) DeepCopy() *DeviceUsage {
 	if d == nil {
 		return nil
 	}
 	dup := &DeviceUsage{
-		ID:        d.ID,
-		Index:     d.Index,
-		Used:      d.Used,
-		Count:     d.Count,
-		Usedmem:   d.Usedmem,
-		Totalmem:  d.Totalmem,
-		Totalcore: d.Totalcore,
-		Usedcores: d.Usedcores,
-		Mode:      d.Mode,
-		Numa:      d.Numa,
-		Type:      d.Type,
-		Health:    d.Health,
+		ID:           d.ID,
+		Index:        d.Index,
+		Used:         d.Used,
+		Count:        d.Count,
+		Usedmem:      d.Usedmem,
+		Totalmem:     d.Totalmem,
+		Totalcore:    d.Totalcore,
+		Usedcores:    d.Usedcores,
+		Mode:         d.Mode,
+		Numa:         d.Numa,
+		Type:         d.Type,
+		DeviceVendor: d.DeviceVendor,
+		Health:       d.Health,
 	}
 
+	if d.MigProfiles != nil {
+		dup.MigProfiles = make([]MigProfile, len(d.MigProfiles))
+		copy(dup.MigProfiles, d.MigProfiles)
+		for i := range dup.MigProfiles {
+			dup.MigProfiles[i].Placements = slices.Clone(d.MigProfiles[i].Placements)
+		}
+	}
+	dup.MigAllocationsInUse = slices.Clone(d.MigAllocationsInUse)
 	if d.MigTemplate != nil {
 		dup.MigTemplate = make([]Geometry, len(d.MigTemplate))
-		for i, g := range d.MigTemplate {
-			dup.MigTemplate[i] = make(Geometry, len(g))
-			copy(dup.MigTemplate[i], g)
+		for i, geometry := range d.MigTemplate {
+			dup.MigTemplate[i] = slices.Clone(geometry)
 		}
 	}
-
 	dup.MigUsage = d.MigUsage.DeepCopy()
 
-	if d.PodInfos != nil {
-		dup.PodInfos = make([]*PodInfo, len(d.PodInfos))
-		for i, pi := range d.PodInfos {
-			dup.PodInfos[i] = pi.DeepCopy()
-		}
-	}
+	// Copy the slice while sharing its read-only PodInfo snapshots.
+	dup.PodInfos = slices.Clone(d.PodInfos)
 
 	if d.CustomInfo != nil {
 		dup.CustomInfo = make(map[string]any, len(d.CustomInfo))
@@ -222,15 +328,7 @@ func (d *DeviceUsage) DeepCopy() *DeviceUsage {
 }
 
 func (m MigInUse) DeepCopy() MigInUse {
-	var usageList MIGS
-	if m.UsageList != nil {
-		usageList = make(MIGS, len(m.UsageList))
-		copy(usageList, m.UsageList)
-	}
-	return MigInUse{
-		Index:     m.Index,
-		UsageList: usageList,
-	}
+	return MigInUse{Index: m.Index, UsageList: slices.Clone(m.UsageList)}
 }
 
 func GetDevices() map[string]Devices {
@@ -252,15 +350,15 @@ func DecodeNodeDevices(str string) ([]*DeviceInfo, error) {
 		}
 		items := strings.Split(val, ",")
 		if len(items) == 7 || len(items) == 9 {
-			count, err := strconv.ParseInt(items[1], 10, 32)
+			count, err := strconv.ParseInt(items[1], 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("invalid count field: %w", err)
 			}
-			devmem, err := strconv.ParseInt(items[2], 10, 32)
+			devmem, err := strconv.ParseInt(items[2], 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("invalid memory field: %w", err)
 			}
-			devcore, err := strconv.ParseInt(items[3], 10, 32)
+			devcore, err := strconv.ParseInt(items[3], 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("invalid core field: %w", err)
 			}
@@ -286,9 +384,9 @@ func DecodeNodeDevices(str string) ([]*DeviceInfo, error) {
 			}
 			i := DeviceInfo{
 				ID:      items[0],
-				Count:   int32(count),
-				Devmem:  int32(devmem),
-				Devcore: int32(devcore),
+				Count:   count,
+				Devmem:  devmem,
+				Devcore: devcore,
 				Type:    items[4],
 				Numa:    numa,
 				Health:  health,
@@ -316,11 +414,11 @@ func EncodeNodeDevices(dlist []*DeviceInfo) string {
 	for _, val := range dlist {
 		builder.WriteString(val.ID)
 		builder.WriteString(",")
-		builder.WriteString(strconv.FormatInt(int64(val.Count), 10))
+		builder.WriteString(strconv.FormatInt(val.Count, 10))
 		builder.WriteString(",")
-		builder.WriteString(strconv.Itoa(int(val.Devmem)))
+		builder.WriteString(strconv.FormatInt(val.Devmem, 10))
 		builder.WriteString(",")
-		builder.WriteString(strconv.Itoa(int(val.Devcore)))
+		builder.WriteString(strconv.FormatInt(val.Devcore, 10))
 		builder.WriteString(",")
 		builder.WriteString(val.Type)
 		builder.WriteString(",")
@@ -339,20 +437,23 @@ func EncodeNodeDevices(dlist []*DeviceInfo) string {
 	return tmp
 }
 
-// MarshalNodeDevices will only marshal general information, customInfo is neglected.
+// MarshalNodeDevices marshals scheduler-visible device information. Arbitrary
+// customInfo is deliberately excluded; MIG placement capabilities are part of
+// the scheduling contract and must be preserved.
 func MarshalNodeDevices(dlist []*DeviceInfo) string {
 	devAnnos := []*DeviceInfo{}
 	for _, val := range dlist {
 		devAnnos = append(devAnnos, &DeviceInfo{
-			ID:      val.ID,
-			Count:   val.Count,
-			Devmem:  val.Devmem,
-			Devcore: val.Devcore,
-			Type:    val.Type,
-			Numa:    val.Numa,
-			Health:  val.Health,
-			Index:   val.Index,
-			Mode:    val.Mode,
+			ID:          val.ID,
+			Count:       val.Count,
+			Devmem:      val.Devmem,
+			Devcore:     val.Devcore,
+			Type:        val.Type,
+			Numa:        val.Numa,
+			Health:      val.Health,
+			Index:       val.Index,
+			Mode:        val.Mode,
+			MIGProfiles: val.MIGProfiles,
 		})
 	}
 	data, err := json.Marshal(devAnnos)
@@ -371,6 +472,12 @@ func UnMarshalNodeDevices(str string) ([]*DeviceInfo, error) {
 func EncodeContainerDevices(cd ContainerDevices) string {
 	var builder strings.Builder
 	for _, val := range cd {
+		// Slots is appended as an optional 5th field only when it exceeds 1, so
+		// single-slot allocations keep the historical 4-field encoding.
+		if val.Slots > 1 {
+			fmt.Fprintf(&builder, "%s,%s,%d,%d,%d%s", val.UUID, val.Type, val.Usedmem, val.Usedcores, val.Slots, OneContainerMultiDeviceSplitSymbol)
+			continue
+		}
 		fmt.Fprintf(&builder, "%s,%s,%d,%d%s", val.UUID, val.Type, val.Usedmem, val.Usedcores, OneContainerMultiDeviceSplitSymbol)
 	}
 	tmp := builder.String()
@@ -419,28 +526,54 @@ func DecodeContainerDevices(str string) (ContainerDevices, error) {
 	}
 	cd := strings.Split(str, OneContainerMultiDeviceSplitSymbol)
 	contdev := ContainerDevices{}
-	tmpdev := ContainerDevice{}
 	klog.V(5).Infof("Start to decode container device %s", str)
 	for _, val := range cd {
-		if strings.Contains(val, ",") {
-			tmpstr := strings.Split(val, ",")
-			if len(tmpstr) < 4 {
-				return nil, fmt.Errorf("pod annotation format error, missing fields, do not use nodeName in task spec")
-			}
-			tmpdev.UUID = tmpstr[0]
-			tmpdev.Type = tmpstr[1]
-			devmem, err := strconv.ParseInt(tmpstr[2], 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("invalid memory field: %w", err)
-			}
-			tmpdev.Usedmem = int32(devmem)
-			devcores, err := strconv.ParseInt(tmpstr[3], 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("invalid core field: %w", err)
-			}
-			tmpdev.Usedcores = int32(devcores)
-			contdev = append(contdev, tmpdev)
+		if val == "" {
+			continue
 		}
+		if !strings.Contains(val, ",") {
+			return nil, fmt.Errorf("malformed container device annotation segment: %q", val)
+		}
+		tmpstr := strings.Split(val, ",")
+		if len(tmpstr) < 4 {
+			return nil, fmt.Errorf("pod annotation format error, missing fields, do not use nodeName in task spec")
+		}
+		if tmpstr[0] == "" {
+			return nil, fmt.Errorf("pod annotation format error, missing device UUID")
+		}
+		if tmpstr[1] == "" {
+			return nil, fmt.Errorf("pod annotation format error, missing device type")
+		}
+		devmem, err := strconv.ParseInt(tmpstr[2], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid memory field: %w", err)
+		}
+		if devmem < 0 {
+			return nil, fmt.Errorf("memory field must not be negative: %d", devmem)
+		}
+		devcores, err := strconv.ParseInt(tmpstr[3], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid core field: %w", err)
+		}
+		if devcores < 0 {
+			return nil, fmt.Errorf("core field must not be negative: %d", devcores)
+		}
+		tmpdev := ContainerDevice{
+			UUID:      tmpstr[0],
+			Type:      tmpstr[1],
+			Usedmem:   devmem,
+			Usedcores: devcores,
+		}
+		// The 5th field is optional. An unusable value is ignored rather than
+		// rejected: dropping the whole annotation undercounts far more than one slot.
+		if len(tmpstr) >= 5 {
+			if devslots, err := strconv.ParseInt(tmpstr[4], 10, 64); err == nil && devslots >= 0 {
+				tmpdev.Slots = devslots
+			} else {
+				klog.V(5).Infof("ignoring unusable slots field %q in segment %q", tmpstr[4], val)
+			}
+		}
+		contdev = append(contdev, tmpdev)
 	}
 	klog.V(5).Infof("Finished decoding container devices. Total devices: %d", len(contdev))
 	return contdev, nil
@@ -475,26 +608,6 @@ func DecodePodDevices(checklist map[string]string, annos map[string]string) (Pod
 	return pd, nil
 }
 
-func PlatternMIG(n *MigInUse, templates []Geometry, templateIdx int) {
-	var err error
-	for _, val := range templates[templateIdx] {
-		count := 0
-		for count < int(val.Count) {
-			n.Index, err = safecast.Convert[int32](templateIdx)
-			if err != nil {
-				continue
-			}
-			n.UsageList = append(n.UsageList, MigTemplateUsage{
-				Name:   val.Name,
-				Memory: val.Memory,
-				Core:   val.Core,
-				InUse:  false,
-			})
-			count++
-		}
-	}
-}
-
 func GetDevicesUUIDList(infos []*DeviceInfo) []string {
 	uuids := make([]string, 0)
 	for _, info := range infos {
@@ -503,116 +616,122 @@ func GetDevicesUUIDList(infos []*DeviceInfo) []string {
 	return uuids
 }
 
-func CheckHealth(devType string, resourceCountName string, node *corev1.Node) (bool, bool) {
-	handshake := node.Annotations[util.HandshakeAnnos[devType]]
-	if strings.Contains(handshake, "Requesting") {
-		formertime, _ := time.ParseInLocation(time.DateTime, strings.Split(handshake, "_")[1], time.Local)
-		if time.Now().Before(formertime.Add(time.Second * 60)) {
-			return true, false
+// Deprecated: dynamic NVIDIA MIG constructs candidates from MigProfiles.
+func PlatternMIG(n *MigInUse, templates []Geometry, templateIdx int) {
+	for _, value := range templates[templateIdx] {
+		for range value.Count {
+			n.Index = int64(templateIdx)
+			n.UsageList = append(n.UsageList, MigTemplateUsage{Name: value.Name, Memory: value.Memory, Core: value.Core})
 		}
-
-		qty := node.Status.Allocatable[corev1.ResourceName(resourceCountName)]
-		if qty.Value() > 0 {
-			klog.V(5).InfoS("Handshake expired but Allocatable still present, skipping NodeCleanUp", "nodeName", node.Name, "resource", resourceCountName)
-			return true, false
-		}
-		return false, false
-	} else if strings.Contains(handshake, "Deleted") {
-		// Mirror the timestamp logic used by the Requesting branch: a
-		// Deleted_<ts> older than 60s on a node whose devices are otherwise
-		// reporting healthy means the previous cleanup is stale and the
-		// scheduler should bring the node back into its cache. Stamp
-		// Requesting_<now> and return (true, true) so the caller re-adds
-		// node devices on the next reconcile.
-		//
-		// Bare "Deleted" without a timestamp (used in some unit tests) and
-		// any unparsable timestamp must keep the conservative (true, false)
-		// path so we never recover from a malformed value.
-		annoKey, ok := util.HandshakeAnnos[devType]
-		if !ok {
-			return true, false
-		}
-		parts := strings.SplitN(handshake, "_", 2)
-		if len(parts) < 2 {
-			return true, false
-		}
-		formerTime, err := time.ParseInLocation(time.DateTime, parts[1], time.Local)
-		if err != nil {
-			return true, false
-		}
-		now := time.Now()
-		if now.Before(formerTime.Add(time.Second * 60)) {
-			return true, false
-		}
-		newHandshake := "Requesting_" + now.Format(time.DateTime)
-		tmppat := map[string]string{annoKey: newHandshake}
-		klog.V(5).InfoS("Recovering stale Deleted_ handshake", "nodeName", node.Name, "annotationKey", annoKey, "annotationValue", newHandshake)
-		// Mirror the empty-annotation branch: GetNode also acts as a guard
-		// for an empty node.Name and an uninitialised client (PatchNodeAnnotations
-		// panics in unit tests without it). Worth a follow-up to dedupe with
-		// the else branch into a helper.
-		n, err := util.GetNode(node.Name)
-		if err != nil {
-			klog.ErrorS(err, "Failed to get node", "nodeName", node.Name)
-			return true, false
-		}
-		if err := util.PatchNodeAnnotations(n, tmppat); err != nil {
-			klog.ErrorS(err, "Failed to patch node annotations", "nodeName", node.Name)
-		}
-		return true, true
-	} else {
-		_, ok := util.HandshakeAnnos[devType]
-		if ok {
-			tmppat := make(map[string]string)
-			tmppat[util.HandshakeAnnos[devType]] = "Requesting_" + time.Now().Format(time.DateTime)
-			klog.V(5).InfoS("New timestamp for annotation", "nodeName", node.Name, "annotationKey", util.HandshakeAnnos[devType], "annotationValue", tmppat[util.HandshakeAnnos[devType]])
-			n, err := util.GetNode(node.Name)
-			if err != nil {
-				klog.ErrorS(err, "Failed to get node", "nodeName", node.Name)
-				return true, false
-			}
-			klog.V(5).InfoS("Patching node annotations", "nodeName", node.Name, "annotations", tmppat)
-			if err := util.PatchNodeAnnotations(n, tmppat); err != nil {
-				klog.ErrorS(err, "Failed to patch node annotations", "nodeName", node.Name)
-			}
-		}
-		return true, true
 	}
 }
 
-// Enhanced ExtractMigTemplatesFromUUID with error handling.
+var registeredDevices = struct {
+	sync.Mutex
+	seen map[string]string
+}{seen: map[string]string{}}
+
+func registeredDevicesKey(devType, nodeName string) string {
+	return devType + "/" + nodeName
+}
+
+func registerAnnoChanged(devType, nodeName, registerAnno string) bool {
+	key := registeredDevicesKey(devType, nodeName)
+	registeredDevices.Lock()
+	defer registeredDevices.Unlock()
+	if previous, ok := registeredDevices.seen[key]; ok && previous == registerAnno {
+		return false
+	}
+	registeredDevices.seen[key] = registerAnno
+	return true
+}
+
+func ForgetRegisteredDevices(devType, nodeName string) {
+	key := registeredDevicesKey(devType, nodeName)
+	registeredDevices.Lock()
+	defer registeredDevices.Unlock()
+	delete(registeredDevices.seen, key)
+}
+
+func RemoveObsoleteHandshake(devType string, node *corev1.Node) {
+	annoKey, ok := util.HandshakeAnnos[devType]
+	if !ok {
+		return
+	}
+	if _, present := node.Annotations[annoKey]; !present {
+		return
+	}
+	klog.V(5).InfoS("Removing obsolete handshake annotation", "nodeName", node.Name, "annotationKey", annoKey)
+	if err := util.RemoveNodeAnnotation(node, annoKey); err != nil {
+		klog.ErrorS(err, "Failed to remove obsolete handshake annotation", "nodeName", node.Name, "annotationKey", annoKey)
+	}
+}
+
+func CheckHealth(devType string, resourceCountName string, node *corev1.Node, registerAnno string) (bool, bool) {
+	RemoveObsoleteHandshake(devType, node)
+	if resourceCountName == "" {
+		return true, true
+	}
+	qty := node.Status.Allocatable[corev1.ResourceName(resourceCountName)]
+	if qty.Value() <= 0 {
+		klog.V(5).InfoS("Device absent from node Allocatable", "nodeName", node.Name, "resource", resourceCountName)
+		ForgetRegisteredDevices(devType, node.Name)
+		return false, false
+	}
+	return true, registerAnnoChanged(devType, node.Name, registerAnno)
+}
+
+// AllocatableHealth reports whether a node should stay in the scheduler cache,
+// and whether its device list should be read again.
+func AllocatableHealth(devType, nodeName string, allocatable, cardCount int64, anno string) (bool, bool) {
+	if allocatable <= 0 {
+		ForgetRegisteredDevices(devType, nodeName)
+		return false, false
+	}
+	observed := strconv.FormatInt(cardCount, 10) + "\n" + anno
+	return true, registerAnnoChanged(devType, nodeName, observed)
+}
+
+// Deprecated: new MIG allocations never encode template/slot indexes in UUIDs.
 func ExtractMigTemplatesFromUUID(uuid string) (int, int, error) {
-	parts := strings.Split(uuid, "[")
-	if len(parts) < 2 {
-		return -1, -1, fmt.Errorf("invalid UUID format: missing '[' delimiter")
+	left := strings.Index(uuid, "[")
+	right := strings.Index(uuid, "]")
+	if left < 0 || right <= left {
+		return -1, -1, fmt.Errorf("invalid legacy MIG UUID %q", uuid)
 	}
-
-	tmp := parts[1]
-	parts = strings.Split(tmp, "]")
-	if len(parts) < 2 {
-		return -1, -1, fmt.Errorf("invalid UUID format: missing ']' delimiter")
+	parts := strings.Split(uuid[left+1:right], "-")
+	if len(parts) != 2 {
+		return -1, -1, fmt.Errorf("invalid legacy MIG UUID %q", uuid)
 	}
-
-	tmp = parts[0]
-	parts = strings.Split(tmp, "-")
-	if len(parts) < 2 {
-		return -1, -1, fmt.Errorf("invalid UUID format: missing '-' delimiter")
-	}
-
 	templateIdx, err := strconv.Atoi(parts[0])
 	if err != nil {
-		return -1, -1, fmt.Errorf("invalid template index: %v", err)
+		return -1, -1, err
 	}
-
-	pos, err := strconv.Atoi(parts[1])
+	slotIdx, err := strconv.Atoi(parts[1])
 	if err != nil {
-		return -1, -1, fmt.Errorf("invalid position: %v", err)
+		return -1, -1, err
 	}
-
-	return templateIdx, pos, nil
+	return templateIdx, slotIdx, nil
 }
 
-func Resourcereqs(pod *corev1.Pod) (counts PodDeviceRequests) {
+// ErrInvalidDeviceRequest is returned by GenerateResourceRequests when a
+// container declares this vendor's resources but the values cannot form a
+// valid request. Callers must treat it as a hard failure: dropping the entry
+// would make the pod look device-less and let it schedule with no device.
+type ErrInvalidDeviceRequest struct {
+	Container string
+	Device    string
+	Reason    string
+}
+
+func (e *ErrInvalidDeviceRequest) Error() string {
+	return fmt.Sprintf("invalid %s request for container %q: %s", e.Device, e.Container, e.Reason)
+}
+
+// Resourcereqs collects the device requests of every container. A container
+// whose request is invalid aborts the collection with the backend's error, so
+// the scheduler rejects the pod instead of scheduling it with no device.
+func Resourcereqs(pod *corev1.Pod) (counts PodDeviceRequests, err error) {
 	// Total containers = init containers + regular containers
 	totalContainers := len(pod.Spec.InitContainers) + len(pod.Spec.Containers)
 	counts = make(PodDeviceRequests, totalContainers)
@@ -622,7 +741,7 @@ func Resourcereqs(pod *corev1.Pod) (counts PodDeviceRequests) {
 		"containerCount", len(pod.Spec.Containers),
 		"totalContainers", totalContainers)
 	//Count Nvidia GPU
-	cnt := int32(0)
+	cnt := int64(0)
 
 	// Process init containers first (indices 0 to len(InitContainers)-1)
 	for i := range pod.Spec.InitContainers {
@@ -633,7 +752,10 @@ func Resourcereqs(pod *corev1.Pod) (counts PodDeviceRequests) {
 			"containerIndex", i,
 			"containerName", pod.Spec.InitContainers[i].Name)
 		for idx, val := range devices {
-			request := val.GenerateResourceRequests(&pod.Spec.InitContainers[i])
+			request, reqErr := val.GenerateResourceRequests(&pod.Spec.InitContainers[i])
+			if reqErr != nil {
+				return nil, reqErr
+			}
 			if request.Nums > 0 {
 				cnt += request.Nums
 				counts[i][idx] = request
@@ -651,7 +773,10 @@ func Resourcereqs(pod *corev1.Pod) (counts PodDeviceRequests) {
 			"containerIndex", initContainerOffset+i,
 			"containerName", pod.Spec.Containers[i].Name)
 		for idx, val := range devices {
-			request := val.GenerateResourceRequests(&pod.Spec.Containers[i])
+			request, reqErr := val.GenerateResourceRequests(&pod.Spec.Containers[i])
+			if reqErr != nil {
+				return nil, reqErr
+			}
 			if request.Nums > 0 {
 				cnt += request.Nums
 				counts[initContainerOffset+i][idx] = request
@@ -663,24 +788,75 @@ func Resourcereqs(pod *corev1.Pod) (counts PodDeviceRequests) {
 	} else {
 		klog.V(4).InfoS("Resource requirements collected", "pod", klog.KObj(pod), "requests", counts)
 	}
-	return counts
+	return counts, nil
 }
 
 func CheckUUID(annos map[string]string, id, useKey, noUseKey, deviceType string) bool {
-	userUUID, ok := annos[useKey]
-	if ok {
-		klog.V(5).Infof("check uuid for %s user uuid [%s], device id is %s", deviceType, userUUID, id)
-		// use , symbol to connect multiple uuid
-		userUUIDs := strings.Split(userUUID, ",")
-		return slices.Contains(userUUIDs, id)
+	match := func(list string) bool {
+		return slices.ContainsFunc(strings.Split(list, ","), func(u string) bool {
+			return strings.TrimSpace(u) == id
+		})
 	}
-
-	noUserUUID, ok := annos[noUseKey]
-	if ok {
+	// An empty value means "no constraint" rather than "match nothing".
+	if userUUID, ok := annos[useKey]; ok && strings.TrimSpace(userUUID) != "" {
+		klog.V(5).Infof("check uuid for %s user uuid [%s], device id is %s", deviceType, userUUID, id)
+		if !match(userUUID) {
+			return false
+		}
+	}
+	if noUserUUID, ok := annos[noUseKey]; ok && strings.TrimSpace(noUserUUID) != "" {
 		klog.V(5).Infof("check uuid for %s not user uuid [%s], device id is %s", deviceType, noUserUUID, id)
-		// use , symbol to connect multiple uuid
-		noUserUUIDs := strings.Split(noUserUUID, ",")
-		return !slices.Contains(noUserUUIDs, id)
+		if match(noUserUUID) {
+			return false
+		}
 	}
 	return true
+}
+
+// CheckType reports whether a device model is allowed by the use/noUse type
+// constraints in annos. It mirrors CheckUUID but matches the card model as a
+// case-insensitive substring instead of an exact device id. An empty value
+// means "no constraint" rather than "match nothing".
+func CheckType(annos map[string]string, cardType, useKey, noUseKey string) bool {
+	cardType = strings.ToUpper(cardType)
+	match := func(list string) bool {
+		return slices.ContainsFunc(strings.Split(list, ","), func(t string) bool {
+			t = strings.TrimSpace(t)
+			return t != "" && strings.Contains(cardType, strings.ToUpper(t))
+		})
+	}
+	if inuse, ok := annos[useKey]; ok && strings.TrimSpace(inuse) != "" {
+		if !match(inuse) {
+			return false
+		}
+	}
+	if noUse, ok := annos[noUseKey]; ok && strings.TrimSpace(noUse) != "" {
+		if match(noUse) {
+			return false
+		}
+	}
+	return true
+}
+
+// PodRequiresDevice returns true if any container (init container or regular container)
+// in the pod requests resources from the specified device generator. An invalid
+// request still counts as requiring the device: the pod is not device-less and
+// must be rejected rather than silently passed through.
+func PodRequiresDevice(dev Devices, p *corev1.Pod) bool {
+	if p == nil || dev == nil {
+		return false
+	}
+	for i := range p.Spec.InitContainers {
+		req, err := dev.GenerateResourceRequests(&p.Spec.InitContainers[i])
+		if err != nil || req.Nums > 0 {
+			return true
+		}
+	}
+	for i := range p.Spec.Containers {
+		req, err := dev.GenerateResourceRequests(&p.Spec.Containers[i])
+		if err != nil || req.Nums > 0 {
+			return true
+		}
+	}
+	return false
 }

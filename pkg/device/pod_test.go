@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -58,7 +59,6 @@ func TestPodInfo(t *testing.T) {
 						},
 					},
 				},
-				CtrIDs: []string{"ctr1", "ctr2"},
 			},
 			expected: PodInfo{
 				Pod: &corev1.Pod{
@@ -78,7 +78,6 @@ func TestPodInfo(t *testing.T) {
 						},
 					},
 				},
-				CtrIDs: []string{"ctr1", "ctr2"},
 			},
 		},
 	}
@@ -140,7 +139,6 @@ func TestGetScheduledPods(t *testing.T) {
 		},
 		NodeID:  "node1",
 		Devices: PodDevices{"device1": {{}}},
-		CtrIDs:  []string{"ctr1"},
 	}
 	pod2 := &PodInfo{
 		Pod: &corev1.Pod{
@@ -153,16 +151,15 @@ func TestGetScheduledPods(t *testing.T) {
 
 		NodeID:  "node2",
 		Devices: PodDevices{"device2": {{}}},
-		CtrIDs:  []string{"ctr2"},
 	}
 	podManager.pods[pod1.UID] = pod1
 	podManager.pods[pod2.UID] = pod2
 
 	scheduledPods, err := podManager.GetScheduledPods()
 
-	assert.NoError(t, err, "GetScheduledPods should not return an error")
+	require.NoError(t, err, "GetScheduledPods should not return an error")
 	assert.NotNil(t, scheduledPods, "The result should not be nil")
-	assert.Equal(t, 2, len(scheduledPods), "The number of scheduled pods should be 2")
+	assert.Len(t, scheduledPods, 2, "The number of scheduled pods should be 2")
 
 	expectedPods := map[k8stypes.UID]*PodInfo{
 		pod1.UID: pod1,
@@ -176,7 +173,6 @@ func TestGetScheduledPods(t *testing.T) {
 		assert.Equal(t, expectedPod.UID, pod.UID, "UID should match")
 		assert.Equal(t, expectedPod.NodeID, pod.NodeID, "NodeID should match")
 		assert.Equal(t, expectedPod.Devices, pod.Devices, "Devices should match")
-		assert.Equal(t, expectedPod.CtrIDs, pod.CtrIDs, "CtrIDs should match")
 	}
 }
 
@@ -193,7 +189,6 @@ func TestGetPod(t *testing.T) {
 		},
 		NodeID:  "node1",
 		Devices: PodDevices{"device1": {{}}},
-		CtrIDs:  []string{"ctr1"},
 	}
 
 	podManager.pods["uid2"] = &PodInfo{
@@ -206,7 +201,6 @@ func TestGetPod(t *testing.T) {
 		},
 		NodeID:  "node2",
 		Devices: PodDevices{"device2": {{}}},
-		CtrIDs:  []string{"ctr2"},
 	}
 
 	for _, ts := range []struct {
@@ -248,7 +242,6 @@ func TestAddPod(t *testing.T) {
 		},
 		NodeID:  "node1",
 		Devices: PodDevices{"device1": {{}}},
-		CtrIDs:  []string{"ctr1"},
 	}
 
 	for _, ts := range []struct {
@@ -282,7 +275,6 @@ func TestAddPod(t *testing.T) {
 					},
 					NodeID:  "node1",
 					Devices: PodDevices{"device1": {{}}},
-					CtrIDs:  []string{"ctr1"},
 				},
 				"uid2": {
 					Pod: &corev1.Pod{
@@ -294,7 +286,6 @@ func TestAddPod(t *testing.T) {
 					},
 					NodeID:  "node2",
 					Devices: PodDevices{"device2": {{}}},
-					CtrIDs:  nil,
 				},
 			},
 		},
@@ -307,6 +298,124 @@ func TestAddPod(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAddPod_UpdateExistingDevices(t *testing.T) {
+	podManager := NewPodManager()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod1",
+			UID:       k8stypes.UID("uid1"),
+		},
+	}
+
+	added := podManager.AddPod(pod, "node1", PodDevices{"device1": {{}}})
+	assert.True(t, added, "AddPod should report true for a new pod")
+
+	updatedAgain := podManager.AddPod(pod, "node2", PodDevices{"device1": {{{UUID: "GPU-1"}}}})
+	assert.False(t, updatedAgain, "AddPod should report false when the pod already exists")
+
+	pi, ok := podManager.GetPod(pod)
+	assert.True(t, ok)
+	assert.Equal(t, "node2", pi.NodeID, "NodeID should be refreshed with the latest pod state")
+	assert.Equal(t, PodDevices{"device1": {{{UUID: "GPU-1"}}}}, pi.Devices, "Devices should be replaced with the new value")
+}
+
+func TestDelPod(t *testing.T) {
+	podManager := NewPodManager()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod1",
+			UID:       k8stypes.UID("uid1"),
+		},
+	}
+	podManager.AddPod(pod, "node1", PodDevices{"device1": {{}}})
+
+	_, ok := podManager.GetPod(pod)
+	assert.True(t, ok, "pod should be present before deletion")
+
+	podManager.DelPod(pod)
+	_, ok = podManager.GetPod(pod)
+	assert.False(t, ok, "pod should be absent after deletion")
+
+	assert.NotPanics(t, func() {
+		podManager.DelPod(pod)
+	})
+
+	unknownPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "ghost-pod",
+			UID:       k8stypes.UID("uid-ghost"),
+		},
+	}
+	assert.NotPanics(t, func() {
+		podManager.DelPod(unknownPod)
+	})
+}
+
+func TestListPodsUID(t *testing.T) {
+	podManager := NewPodManager()
+
+	uids, err := podManager.ListPodsUID()
+	require.NoError(t, err)
+	assert.Empty(t, uids, "expected no pods when the manager is empty")
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod1",
+			UID:       k8stypes.UID("uid1"),
+		},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "pod2",
+			UID:       k8stypes.UID("uid2"),
+		},
+	}
+	podManager.AddPod(pod1, "node1", PodDevices{"device1": {{}}})
+	podManager.AddPod(pod2, "node2", PodDevices{"device2": {{}}})
+
+	uids, err = podManager.ListPodsUID()
+	require.NoError(t, err)
+	assert.Len(t, uids, 2, "expected one entry per tracked pod")
+
+	gotUIDs := make(map[k8stypes.UID]bool, len(uids))
+	for _, p := range uids {
+		gotUIDs[p.UID] = true
+	}
+	assert.True(t, gotUIDs[pod1.UID], "expected pod1's UID to be present")
+	assert.True(t, gotUIDs[pod2.UID], "expected pod2's UID to be present")
+}
+
+func TestAddPodRefreshesExistingPodObject(t *testing.T) {
+	podManager := NewPodManager()
+	uid := k8stypes.UID("uid1")
+	original := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "default",
+		Name:      "pod1",
+		UID:       uid,
+		Annotations: map[string]string{
+			"hami.io/vgpu-mig-allocations": `[{"profile":"1g.5gb"}]`,
+		},
+	}}
+	assert.True(t, podManager.AddPod(original, "node1", PodDevices{"device1": {{}}}))
+
+	updated := original.DeepCopy()
+	updated.Annotations["hami.io/vgpu-mig-allocations"] = `[{"profile":"1g.5gb","placement":{"start":6,"size":1}}]`
+	devices := PodDevices{"device1": {{{UUID: "GPU-1"}}}}
+	assert.False(t, podManager.AddPod(updated, "node1", devices), "refreshing an existing pod must not add quota usage again")
+
+	cached, ok := podManager.GetPod(updated)
+	assert.True(t, ok)
+	assert.Equal(t, updated.Annotations, cached.Annotations)
+	assert.Equal(t, devices, cached.Devices)
 }
 
 func TestUpdatePod(t *testing.T) {
@@ -377,7 +486,7 @@ func TestUpdatePod(t *testing.T) {
 	}
 }
 
-func TestPodInfoDeepCopy(t *testing.T) {
+func TestPodInfoSnapshot(t *testing.T) {
 	tests := []struct {
 		name     string
 		original *PodInfo
@@ -404,18 +513,17 @@ func TestPodInfoDeepCopy(t *testing.T) {
 				Devices: PodDevices{
 					"NVIDIA": {
 						{
-							ContainerDevice{UUID: "GPU-0", Type: "NVIDIA", Usedmem: 100, Usedcores: 10},
+							ContainerDevice{UUID: "GPU-0", Type: "NVIDIA", Usedmem: 100, Usedcores: 10, Slots: 3},
 						},
 					},
 				},
-				CtrIDs: []string{"ctr1", "ctr2"},
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			copy := tt.original.DeepCopy()
+			copy := tt.original.Snapshot()
 
 			if tt.original == nil {
 				if copy != nil {
@@ -424,26 +532,20 @@ func TestPodInfoDeepCopy(t *testing.T) {
 				return
 			}
 
-			// 1. Copy must be deeply equal to original.
 			assert.Equal(t, tt.original.NodeID, copy.NodeID)
-			assert.Equal(t, tt.original.CtrIDs, copy.CtrIDs)
 			assert.Equal(t, tt.original.Devices, copy.Devices)
 			if tt.original.Pod != nil {
 				assert.Equal(t, tt.original.Name, copy.Name)
 			}
 
-			// 2. Mutating the copy must not affect the original.
-			if copy.Pod != nil {
-				originalPodName := tt.original.Name
-				copy.Name = "mutated-pod"
-				assert.Equal(t, tt.original.Name, originalPodName)
+			if tt.original.Pod != nil {
+				assert.Same(t, tt.original.Pod, copy.Pod, "Pod pointer should be shared with the snapshot")
 			}
+
+			// Manager-owned fields remain independent of the snapshot.
 			originalNodeID := tt.original.NodeID
 			copy.NodeID = "mutated-node"
 			assert.Equal(t, tt.original.NodeID, originalNodeID)
-			originalCtrIDsLen := len(tt.original.CtrIDs)
-			copy.CtrIDs = append(copy.CtrIDs, "ctr3")
-			assert.Equal(t, len(tt.original.CtrIDs), originalCtrIDsLen)
 			if copy.Devices == nil {
 				copy.Devices = make(PodDevices)
 			}
@@ -460,7 +562,7 @@ func TestPodDevicesDeepCopy(t *testing.T) {
 	original := PodDevices{
 		"NVIDIA": {
 			{
-				ContainerDevice{UUID: "GPU-0", Type: "NVIDIA", Usedmem: 100, Usedcores: 10},
+				ContainerDevice{UUID: "GPU-0", Type: "NVIDIA", Usedmem: 100, Usedcores: 10, Slots: 3},
 			},
 		},
 	}
@@ -478,7 +580,7 @@ func TestPodDevicesDeepCopy(t *testing.T) {
 
 	_, exists := original["AMD"]
 	assert.False(t, exists, "original should not have AMD key")
-	assert.Equal(t, original["NVIDIA"][0][0].UUID, "GPU-0")
+	assert.Equal(t, "GPU-0", original["NVIDIA"][0][0].UUID)
 }
 
 func TestPodSingleDeviceDeepCopy(t *testing.T) {
@@ -499,7 +601,7 @@ func TestPodSingleDeviceDeepCopy(t *testing.T) {
 	// 2. Mutating the copy must not affect the original.
 	copy[0][0].UUID = "mutated-gpu"
 
-	assert.Equal(t, original[0][0].UUID, "GPU-0")
+	assert.Equal(t, "GPU-0", original[0][0].UUID)
 }
 
 func TestContainerDevicesDeepCopy(t *testing.T) {
@@ -516,7 +618,7 @@ func TestContainerDevicesDeepCopy(t *testing.T) {
 	// 2. Mutating the copy must not affect the original.
 	copy[0].UUID = "mutated-gpu"
 
-	assert.Equal(t, original[0].UUID, "GPU-0")
+	assert.Equal(t, "GPU-0", original[0].UUID)
 }
 
 func TestContainerDeviceDeepCopy(t *testing.T) {
@@ -538,9 +640,25 @@ func TestContainerDeviceDeepCopy(t *testing.T) {
 	copy.UUID = "mutated-gpu"
 	copy.CustomInfo["key2"] = "value2"
 
-	assert.Equal(t, original.UUID, "GPU-0")
+	assert.Equal(t, "GPU-0", original.UUID)
 	_, exists := original.CustomInfo["key2"]
 	assert.False(t, exists, "original CustomInfo should not have key2")
+}
+
+func TestListPodsInfoReturnsSnapshot(t *testing.T) {
+	pm := NewPodManager()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "uid-1", Name: "p", Namespace: "ns"}}
+	pm.AddPod(pod, "node-1", PodDevices{"dev": {{{UUID: "GPU-0"}}}})
+
+	listed := pm.ListPodsInfo()
+	assert.Len(t, listed, 1)
+
+	listed[0].NodeID = "mutated"
+	listed[0].Devices["dev"][0][0].UUID = "mutated"
+
+	inner := pm.pods[k8stypes.UID("uid-1")]
+	assert.Equal(t, "node-1", inner.NodeID)
+	assert.Equal(t, "GPU-0", inner.Devices["dev"][0][0].UUID)
 }
 
 func TestTakeAndDeletePodIsAtomic(t *testing.T) {
@@ -553,4 +671,119 @@ func TestTakeAndDeletePodIsAtomic(t *testing.T) {
 	assert.NotNil(t, pi1)
 	assert.False(t, ok2)
 	assert.Nil(t, pi2)
+}
+
+// The metrics collector scrapes on its own goroutine while the pod informer
+// keeps calling AddPod. Copying only the map would leave the collector holding
+// the stored *PodInfo, whose Devices field AddPod rewrites in place.
+func TestGetScheduledPodsCopiesEntries(t *testing.T) {
+	pm := NewPodManager()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "copy-uid",
+			Name:      "copy-pod",
+			Namespace: "default",
+		},
+	}
+	devices := func(mem int64) PodDevices {
+		return PodDevices{
+			"NVIDIA": PodSingleDevice{{{UUID: "dev-0", Usedmem: mem, Usedcores: 10}}},
+		}
+	}
+	pm.AddPod(pod, "node1", devices(1))
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Go(func() {
+		for i := int64(0); ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				pm.AddPod(pod, "node1", devices(i))
+			}
+		}
+	})
+
+	wg.Go(func() {
+		for range 20000 {
+			scheduled, _ := pm.GetScheduledPods()
+			for _, pi := range scheduled {
+				for _, single := range pi.Devices {
+					for _, ctr := range single {
+						for _, d := range ctr {
+							_ = d.Usedmem
+							_ = pi.Namespace
+						}
+					}
+				}
+			}
+		}
+		close(stop)
+	})
+
+	wg.Wait()
+}
+
+// Mutating snapshot accounting fields must not affect the manager.
+func TestGetScheduledPodsReturnsDetachedEntries(t *testing.T) {
+	pm := NewPodManager()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "detach-uid", Name: "detach-pod", Namespace: "default"},
+	}
+	pm.AddPod(pod, "node1", PodDevices{
+		"NVIDIA": PodSingleDevice{{{UUID: "dev-0", Usedmem: 100, Usedcores: 10}}},
+	})
+
+	scheduled, err := pm.GetScheduledPods()
+	require.NoError(t, err)
+	scheduled["detach-uid"].Devices["NVIDIA"][0][0].Usedmem = 999
+	scheduled["detach-uid"].NodeID = "tampered"
+
+	again, _ := pm.GetScheduledPods()
+	assert.Equal(t, int64(100), again["detach-uid"].Devices["NVIDIA"][0][0].Usedmem)
+	assert.Equal(t, "node1", again["detach-uid"].NodeID)
+}
+
+func TestGetPodReturnsDetachedCopy(t *testing.T) {
+	pm := NewPodManager()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "getpod-uid", Name: "getpod", Namespace: "default"},
+	}
+	pm.AddPod(pod, "node1", PodDevices{
+		"NVIDIA": PodSingleDevice{{{UUID: "dev-0", Usedmem: 100, Usedcores: 10}}},
+	})
+
+	pi, ok := pm.GetPod(pod)
+	assert.True(t, ok)
+	pi.Devices["NVIDIA"][0][0].Usedmem = 999
+	pi.NodeID = "tampered"
+
+	again, ok := pm.GetPod(pod)
+	assert.True(t, ok)
+	assert.Equal(t, int64(100), again.Devices["NVIDIA"][0][0].Usedmem)
+	assert.Equal(t, "node1", again.NodeID)
+
+	missing, ok := pm.GetPod(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "nope"}})
+	assert.False(t, ok)
+	assert.Nil(t, missing)
+}
+
+// The UID keys the cache, but /filter and /bind take the UID, name and
+// namespace from the request body as three independent fields. Pairing a live
+// pod's UID with some other name must not free that pod's devices.
+func TestTakeAndDeletePodRejectsMismatchedIdentity(t *testing.T) {
+	pm := NewPodManager()
+	victim := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "victim-uid", Name: "victim", Namespace: "team-a"}}
+	pm.AddPod(victim, "gpu-node-1", PodDevices{})
+
+	forged := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "victim-uid", Name: "does-not-exist", Namespace: "team-b"}}
+	pi, ok := pm.TakeAndDeletePod(forged)
+	assert.False(t, ok)
+	assert.Nil(t, pi)
+
+	_, stillCached := pm.GetPod(victim)
+	assert.True(t, stillCached, "the victim's reservation was dropped by a request naming another pod")
 }

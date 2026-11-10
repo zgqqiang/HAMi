@@ -1,5 +1,9 @@
 name: Chart Lint
 
+env:
+  HELM_VERSION: v3.22.1
+  HELM_DOCS_VERSION: v1.14.2
+
 on:
   push:
     # Exclude branches created by Dependabot to avoid triggering current workflow
@@ -9,29 +13,48 @@ on:
   pull_request:
     paths:
       - "charts/**"
+      - ".github/workflows/lint-chart.yaml"
+      - "Makefile"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   chart-lint-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
-          version: v3.7.1
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install helm-unittest
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest.git --version v1.2.1
+
+      - name: Install helm-docs
+        run: |
+          GOBIN="$RUNNER_TEMP/helm-docs" go install -ldflags "-X main.version=${HELM_DOCS_VERSION#v}" github.com/norwoodj/helm-docs/cmd/helm-docs@${{ env.HELM_DOCS_VERSION }}
+          echo "$RUNNER_TEMP/helm-docs" >> "$GITHUB_PATH"
 
       - name: Add HAMi DRA Helm repository
         run: |
           helm repo add hami-dra https://project-hami.github.io/HAMi-DRA/
           helm repo update hami-dra
 
-      - name: Lint Chart
-        run: |
-          make lint_chart
-      - name: Check chart version
-        run: bash ./hack/verify-chart-version.sh
-
+      - name: Validate chart
+        run: make verify_chart

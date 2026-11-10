@@ -8,30 +8,35 @@ on:
         required: true
         type: string
 
-permissions: write-all
+permissions:
+  contents: read
 
 jobs:
   generate-release-notes:
     runs-on: ubuntu-latest
+    # updates the github release page
+    permissions:
+      contents: write
     steps:
     - name: Download Artifact
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         name: chart_package_artifact
         path: charts/
     # generate release notes for the new release branch
     - name: upload chart tgz to release
       if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v3
+      uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         files: "charts/*.tgz"
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         fetch-depth: 0
         ref: master
+        persist-credentials: false
 
     - name: Create release notes markdown
       run: |
@@ -57,14 +62,12 @@ jobs:
         #   -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
         #   https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${latest_tag}
         
-        # cat result.json | yq '.body' > docs/CHANGELOG/${latest_tag}.md
-
         # rm -rf result.json
 
 
     # - name: Push release notes
     #   id: push_directory
-    #   uses: cpina/github-action-push-to-another-repository@v1.7.2
+    #   uses: cpina/github-action-push-to-another-repository@07c4d7b3def0a8ebe788a8f2c843a4e1de4f6900 # v1.7.2
     #   env:
     #     API_TOKEN_GITHUB: ${{ secrets.API_TOKEN_GITHUB }}
     #   with:

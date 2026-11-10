@@ -1,4 +1,4 @@
-ARG GOLANG_IMAGE
+ARG GOLANG_IMAGE=golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5
 ARG HAMICORE_IMAGE
 FROM $GOLANG_IMAGE AS build
 FROM $HAMICORE_IMAGE AS corebuild
@@ -8,15 +8,14 @@ ADD . /k8s-vgpu
 ARG VERSION
 RUN go env -w GO111MODULE=on
 RUN cd /k8s-vgpu && make all VERSION=$VERSION
-RUN go install github.com/NVIDIA/mig-parted/cmd/nvidia-mig-parted@v0.12.2
 
-FROM nvidia/cuda:13.3.0-base-ubuntu22.04
+FROM nvidia/cuda:13.5.0-base-ubuntu22.04@sha256:4df174aaa911425cc8ab5beb6f897dfeafa92f03884c25176db134743f6e3736
 RUN apt-get update && \
-    apt-mark hold cuda-toolkit-config-common cuda-toolkit-12-config-common && \
+    apt-mark hold cuda-toolkit-config-common cuda-toolkit-13-config-common && \
     DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
-RUN rm -rf /usr/local/cuda-12.6/compat/libcuda.so*
+RUN rm -rf /usr/local/cuda-*/compat/libcuda.so*
 ENV NVIDIA_DISABLE_REQUIRE="true"
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
@@ -26,7 +25,6 @@ LABEL version="$VERSION"
 LABEL maintainer="opensource@4paradigm.com"
 COPY ./LICENSE /k8s-vgpu/LICENSE
 COPY --from=GOBUILD /k8s-vgpu/bin /k8s-vgpu/bin
-COPY --from=GOBUILD /go/bin/nvidia-mig-parted /k8s-vgpu/bin/
 COPY ./docker/entrypoint.sh /k8s-vgpu/bin/entrypoint.sh
 COPY ./docker/vgpu-init.sh /k8s-vgpu/bin/vgpu-init.sh
 COPY ./lib /k8s-vgpu/lib

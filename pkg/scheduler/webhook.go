@@ -19,9 +19,14 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
+	admissionv1 "k8s.io/api/admission/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
@@ -29,8 +34,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
-	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
+	"github.com/Project-HAMi/HAMi/pkg/device/remotegpu"
 	"github.com/Project-HAMi/HAMi/pkg/scheduler/config"
+	"github.com/Project-HAMi/HAMi/pkg/util"
+	"github.com/Project-HAMi/HAMi/pkg/util/client"
 )
 
 const template = "Processing admission hook for pod %v/%v, UID: %v"
@@ -50,16 +57,28 @@ func NewWebHook() (*admission.Webhook, error) {
 	return wh, nil
 }
 
-func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Response {
+func (h *webhook) Handle(ctx context.Context, req admission.Request) admission.Response {
 	pod := &corev1.Pod{}
 	err := h.decoder.Decode(req, pod)
 	if err != nil {
 		klog.Errorf("Failed to decode request: %v", err)
 		return admission.Errored(http.StatusBadRequest, err)
 	}
+	if req.Operation == admissionv1.Update {
+		return h.handleUpdate(ctx, req, pod)
+	}
 	if len(pod.Spec.Containers) == 0 {
 		klog.Warningf(template+" - Denying admission as pod has no containers", pod.Namespace, pod.Name, pod.UID)
 		return admission.Denied("pod has no containers")
+	}
+	// This must come before the different-scheduler case below: that path
+	// returns without validating anything, and a pod taking it keeps whatever
+	// allocation annotations it was created with. The device plugin hands out
+	// devices from exactly those annotations, so a pod naming its own GPU and
+	// memory would be served them, outside the scheduler's accounting.
+	if annotation, found := schedulerOwnedAnnotation(pod); found {
+		klog.Warningf(template+" - Denying admission as pod presets %s", pod.Namespace, pod.Name, pod.UID, annotation)
+		return admission.Denied(fmt.Sprintf("annotation %s is written by the scheduler and cannot be set when creating a pod", annotation))
 	}
 	if pod.Spec.SchedulerName != "" &&
 		(pod.Spec.SchedulerName != corev1.DefaultSchedulerName || !config.ForceOverwriteDefaultScheduler) &&
@@ -67,16 +86,25 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 		klog.V(3).Infof(template+" - Pod already has different scheduler assigned", req.Namespace, req.Name, req.UID)
 		return admission.Allowed("pod already has different scheduler assigned")
 	}
-	klog.V(5).Infof(template, pod.Namespace, pod.Name, pod.UID)
-	hasResource := false
-	for idx, ctr := range pod.Spec.Containers {
-		c := &pod.Spec.Containers[idx]
-		if ctr.SecurityContext != nil {
-			if ctr.SecurityContext.Privileged != nil && *ctr.SecurityContext.Privileged {
-				klog.Warningf(template+" - Denying admission as container %s is privileged", pod.Namespace, pod.Name, pod.UID, c.Name)
-				continue
-			}
+	// Reject invalid numa-alignment values at admission, so a typo surfaces
+	// to the user instead of only appearing in a device-plugin log later.
+	if _, err := util.GetNumaAlignmentModeByPod(pod); err != nil {
+		klog.Warningf(template+" - Denying admission: %v", pod.Namespace, pod.Name, pod.UID, err)
+		return admission.Denied(err.Error())
+	}
+	if remotegpu.PodRequestsRemoteGPU(pod) {
+		if err := remotegpu.ValidateLupineServerSelector(pod); err != nil {
+			klog.Warningf(template+" - Denying admission: %v", pod.Namespace, pod.Name, pod.UID, err)
+			return admission.Denied(err.Error())
 		}
+	}
+	klog.V(5).Infof(template, pod.Namespace, pod.Name, pod.UID)
+	privilegedName, hasPrivileged := privilegedContainerName(pod)
+	hasResource := false
+
+	// 1. Process InitContainers
+	for idx := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[idx]
 		for _, val := range device.GetDevices() {
 			found, err := val.MutateAdmission(c, pod)
 			if err != nil {
@@ -85,6 +113,42 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 			}
 			hasResource = hasResource || found
 		}
+	}
+
+	// 2. Process Regular Containers (Keep your existing loop here)
+	for idx := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[idx]
+		for _, val := range device.GetDevices() {
+			found, err := val.MutateAdmission(c, pod)
+			if err != nil {
+				klog.Errorf("validating pod failed:%s", err.Error())
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			hasResource = hasResource || found
+		}
+	}
+	// Delivery must precede GPU-using init containers. Reorder only after all
+	// mutations, when no pointers into the init-container slice remain live.
+	remotegpu.FinalizeAdmission(pod)
+	// Validate device-scoring weights for HAMi workloads so malformed input is
+	// reported before scheduling. The scheduler retains the same validation as
+	// a defense-in-depth check.
+	if hasResource {
+		if _, err := util.GetDeviceScoringWeightsByPod(pod); err != nil {
+			klog.Warningf(template+" - Denying admission: %v", pod.Namespace, pod.Name, pod.UID, err)
+			return admission.Denied(err.Error())
+		}
+		// The scheduler ignores an unrecognized scheduler-policy value and
+		// keeps the configured default, so a typo only shows up as
+		// unexpected packing (#2767). Deny it here instead.
+		if err := util.SchedulerPolicyAnnotationError(pod); err != nil {
+			klog.Warningf(template+" - Denying admission: %v", pod.Namespace, pod.Name, pod.UID, err)
+			return admission.Denied(err.Error())
+		}
+	}
+	if hasPrivileged && hasResource {
+		klog.Warningf(template+" - Denying admission as container %s is privileged", pod.Namespace, pod.Name, pod.UID, privilegedName)
+		return admission.Denied(fmt.Sprintf("container %s is privileged", privilegedName))
 	}
 
 	if !hasResource {
@@ -97,8 +161,8 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 			return admission.Denied("pod has node assigned")
 		}
 	}
-	if !fitResourceQuota(pod) {
-		return admission.Denied("exceeding resource quota")
+	if err := fitResourceQuota(pod); err != nil {
+		return admission.Denied(err.Error())
 	}
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
@@ -108,51 +172,213 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 }
 
-func fitResourceQuota(pod *corev1.Pod) bool {
-	for deviceName, dev := range device.GetDevices() {
-		// Only supports NVIDIA
-		if deviceName != nvidia.NvidiaGPUDevice {
-			continue
-		}
-		memoryFactor := nvidia.MemoryFactor
-		resourceNames := dev.GetResourceNames()
-		resourceName := corev1.ResourceName(resourceNames.ResourceCountName)
-		memResourceName := corev1.ResourceName(resourceNames.ResourceMemoryName)
-		coreResourceName := corev1.ResourceName(resourceNames.ResourceCoreName)
-		var memoryReq int64 = 0
-		var coresReq int64 = 0
-		getRequest := func(ctr *corev1.Container, resName corev1.ResourceName) (int64, bool) {
-			v, ok := ctr.Resources.Limits[resName]
-			if !ok {
-				v, ok = ctr.Resources.Requests[resName]
-			}
-			if ok {
-				if n, ok := v.AsInt64(); ok {
-					return n, true
-				}
-			}
-			return 0, false
-		}
-		for _, ctr := range pod.Spec.Containers {
-			req, ok := getRequest(&ctr, resourceName)
-			if ok && req == 1 {
-				if memReq, ok := getRequest(&ctr, memResourceName); ok {
-					memoryReq += memReq
-				}
-				if coreReq, ok := getRequest(&ctr, coreResourceName); ok {
-					coresReq += coreReq
-				}
-			}
-		}
-		if memoryFactor > 1 {
-			oriMemReq := memoryReq
-			memoryReq = memoryReq * int64(memoryFactor)
-			klog.V(5).Infof("Adjusting memory request for quota check: oriMemReq %d, memoryReq %d, factor %d", oriMemReq, memoryReq, memoryFactor)
-		}
-		if !device.GetLocalCache().FitQuota(pod.Namespace, memoryReq, memoryFactor, coresReq, deviceName) {
-			klog.Infof(template+" - Denying admission", pod.Namespace, pod.Name, pod.UID)
-			return false
+// handleUpdate guards the same annotations on an existing pod. Denying them at
+// create closes only half the door: the keys can be patched in afterward by
+// anyone holding update on pods, and the device plugin hands out devices from
+// whatever they name, so the pod is served memory and cores the scheduler never
+// accounted for. An update that leaves those keys alone is not ours to judge
+// and passes through as-is, which also keeps the create path's mutation off an
+// existing pod, whose schedulerName the API server will not let us change.
+func (h *webhook) handleUpdate(ctx context.Context, req admission.Request, pod *corev1.Pod) admission.Response {
+	oldPod := &corev1.Pod{}
+	if err := h.decoder.DecodeRaw(req.OldObject, oldPod); err != nil {
+		klog.Errorf("Failed to decode old object: %v", err)
+		return admission.Errored(http.StatusBadRequest, err)
+	}
+	if (remotegpu.PodRequestsRemoteGPU(oldPod) || remotegpu.PodRequestsRemoteGPU(pod)) && remoteGPUSelectorChanged(oldPod, pod) {
+		return admission.Denied(fmt.Sprintf("annotation %s cannot be changed after a pod is created", remotegpu.LupineServerSelectorAnno))
+	}
+	if remotegpu.PodRequestsRemoteGPU(pod) {
+		if err := remotegpu.ValidateLupineServerSelector(pod); err != nil {
+			return admission.Denied(err.Error())
 		}
 	}
-	return true
+	annotation, changed := changedSchedulerOwnedAnnotation(oldPod, pod)
+	if !changed {
+		return admission.Allowed("no scheduler-owned annotation changed")
+	}
+	// HAMi rewrites these itself once a pod is admitted: the scheduler patches
+	// them as it filters and binds, and a device plugin rewrites them as each
+	// container gets its devices. Both hold node write access for the locks they
+	// take around that work, and both only ever touch a pod this scheduler was
+	// asked to place, so a request failing either test is neither of them.
+	if !canWriteNodes(ctx, req.UserInfo) {
+		return denySchedulerOwnedAnnotation(pod, req.UserInfo.Username, annotation)
+	}
+	if len(config.SchedulerName) > 0 && pod.Spec.SchedulerName != config.SchedulerName {
+		return denySchedulerOwnedAnnotation(pod, req.UserInfo.Username, annotation)
+	}
+	return admission.Allowed("scheduler-owned annotation changed by a HAMi component")
+}
+
+func remoteGPUSelectorChanged(oldPod, pod *corev1.Pod) bool {
+	oldValue, oldFound := oldPod.Annotations[remotegpu.LupineServerSelectorAnno]
+	value, found := pod.Annotations[remotegpu.LupineServerSelectorAnno]
+	return oldFound != found || oldValue != value
+}
+
+// canWriteNodes asks the API server whether the caller may patch nodes.
+func canWriteNodes(ctx context.Context, user authenticationv1.UserInfo) bool {
+	kubeClient := client.GetClient()
+	if kubeClient == nil {
+		klog.Error("No client to review node write access with, refusing the annotation change")
+		return false
+	}
+	extra := make(map[string]authorizationv1.ExtraValue, len(user.Extra))
+	for key, value := range user.Extra {
+		extra[key] = authorizationv1.ExtraValue(value)
+	}
+	review, err := kubeClient.AuthorizationV1().SubjectAccessReviews().Create(ctx, &authorizationv1.SubjectAccessReview{
+		Spec: authorizationv1.SubjectAccessReviewSpec{
+			User:   user.Username,
+			UID:    user.UID,
+			Groups: user.Groups,
+			Extra:  extra,
+			ResourceAttributes: &authorizationv1.ResourceAttributes{
+				Verb:     "patch",
+				Resource: "nodes",
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		klog.Errorf("Failed to review node write access for %s, refusing the annotation change: %v", user.Username, err)
+		return false
+	}
+	return review.Status.Allowed
+}
+
+func denySchedulerOwnedAnnotation(pod *corev1.Pod, username, annotation string) admission.Response {
+	klog.Warningf(template+" - Denying update as %s writes %s", pod.Namespace, pod.Name, pod.UID, username, annotation)
+	return admission.Denied(fmt.Sprintf("annotation %s is written by the scheduler and cannot be set by %s", annotation, username))
+}
+
+// schedulerOwnedAnnotationKeys lists the annotations the scheduler writes after
+// a pod is admitted, together with the per-device keys each backend fills in.
+func schedulerOwnedAnnotationKeys() []string {
+	keys := []string{
+		util.AssignedNodeAnnotations,
+		util.BindTimeAnnotations,
+		util.DeviceBindPhase,
+	}
+	for _, perDevice := range []map[string]string{device.InRequestDevices, device.SupportDevices} {
+		for _, key := range perDevice {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// schedulerOwnedAnnotation reports an annotation the scheduler writes after a
+// pod is admitted. A pod that already carries one at create did not get it from
+// the scheduler: it was either written by hand or copied from a scheduled pod's
+// manifest, and in both cases the device plugin would act on it as though the
+// scheduler had decided it.
+func schedulerOwnedAnnotation(pod *corev1.Pod) (string, bool) {
+	for _, key := range schedulerOwnedAnnotationKeys() {
+		if _, ok := pod.Annotations[key]; ok {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+// changedSchedulerOwnedAnnotation reports a scheduler-owned annotation the
+// update adds, rewrites or drops.
+func changedSchedulerOwnedAnnotation(oldPod, newPod *corev1.Pod) (string, bool) {
+	for _, key := range schedulerOwnedAnnotationKeys() {
+		if oldPod.Annotations[key] != newPod.Annotations[key] {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+func privilegedContainerName(pod *corev1.Pod) (string, bool) {
+	for _, ctr := range pod.Spec.InitContainers {
+		if isPrivilegedContainer(&ctr) {
+			return ctr.Name, true
+		}
+	}
+	for _, ctr := range pod.Spec.Containers {
+		if isPrivilegedContainer(&ctr) {
+			return ctr.Name, true
+		}
+	}
+	return "", false
+}
+
+func isPrivilegedContainer(ctr *corev1.Container) bool {
+	return ctr.SecurityContext != nil &&
+		ctr.SecurityContext.Privileged != nil &&
+		*ctr.SecurityContext.Privileged
+}
+
+func fitResourceQuota(pod *corev1.Pod) error {
+	for deviceName, dev := range device.GetDevices() {
+		resourceNames := dev.GetResourceNames()
+		if len(resourceNames.ResourceMemoryName) == 0 && len(resourceNames.ResourceCoreName) == 0 {
+			continue
+		}
+
+		// Ask the backend what the pod is requesting rather than reading the
+		// container spec here. It applies its own memory factor, defaults and
+		// template rounding, which is what the scheduler later records as used,
+		// so this keeps admission and the scheduler on the same numbers.
+		var appMemoryReq, appCoresReq int64
+		for i := range pod.Spec.Containers {
+			req, reqErr := dev.GenerateResourceRequests(&pod.Spec.Containers[i])
+			if reqErr != nil {
+				return reqErr
+			}
+			if req.Nums == 0 {
+				continue
+			}
+			appMemoryReq += req.Memreq * req.Nums
+			if req.TotalCoresreq > 0 {
+				appCoresReq += req.TotalCoresreq
+			} else {
+				appCoresReq += req.Coresreq * req.Nums
+			}
+		}
+
+		var initPeakMemoryReq, initPeakCoresReq int64
+		var sidecarMemoryReq, sidecarCoresReq int64
+		for i := range pod.Spec.InitContainers {
+			c := &pod.Spec.InitContainers[i]
+			req, reqErr := dev.GenerateResourceRequests(c)
+			if reqErr != nil {
+				return reqErr
+			}
+			if req.Nums == 0 {
+				continue
+			}
+			mem := req.Memreq * req.Nums
+			cores := req.Coresreq * req.Nums
+			if req.TotalCoresreq > 0 {
+				cores = req.TotalCoresreq
+			}
+			if util.IsSidecarContainer(c) {
+				sidecarMemoryReq += mem
+				sidecarCoresReq += cores
+				initPeakMemoryReq = max(initPeakMemoryReq, sidecarMemoryReq)
+				initPeakCoresReq = max(initPeakCoresReq, sidecarCoresReq)
+				continue
+			}
+			initPeakMemoryReq = max(initPeakMemoryReq, sidecarMemoryReq+mem)
+			initPeakCoresReq = max(initPeakCoresReq, sidecarCoresReq+cores)
+		}
+
+		memoryReq := max(initPeakMemoryReq, sidecarMemoryReq+appMemoryReq)
+		coresReq := max(initPeakCoresReq, sidecarCoresReq+appCoresReq)
+		if memoryReq == 0 && coresReq == 0 {
+			continue
+		}
+
+		klog.V(5).Infof("Checking quota for device %s: memory %d, cores %d", deviceName, memoryReq, coresReq)
+		if !device.GetLocalCache().FitQuota(pod.Namespace, memoryReq, coresReq, deviceName) {
+			klog.Infof(template+" - Denying admission", pod.Namespace, pod.Name, pod.UID)
+			return fmt.Errorf("exceeding resource quota for device %s", deviceName)
+		}
+	}
+	return nil
 }

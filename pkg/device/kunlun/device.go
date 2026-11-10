@@ -125,10 +125,17 @@ func (dev *KunlunDevices) CheckType(annos map[string]string, d device.DeviceUsag
 }
 
 func (dev *KunlunDevices) CheckHealth(devType string, n *corev1.Node) (bool, bool) {
-	return true, true
+	if n == nil {
+		return false, false
+	}
+	countQty := n.Status.Allocatable[corev1.ResourceName(KunlunResourceCount)]
+	capacityQty := n.Status.Capacity[corev1.ResourceName(KunlunResourceCount)]
+	count := countQty.Value()
+	capacity := capacityQty.Value()
+	return device.AllocatableHealth(devType, n.Name, count, count, fmt.Sprintf("%d", capacity))
 }
 
-func (dev *KunlunDevices) GenerateResourceRequests(ctr *corev1.Container) device.ContainerDeviceRequest {
+func (dev *KunlunDevices) GenerateResourceRequests(ctr *corev1.Container) (device.ContainerDeviceRequest, error) {
 	klog.Info("Start to count kunlun devices for container ", ctr.Name)
 	kunlunResourceCount := corev1.ResourceName(KunlunResourceCount)
 	v, ok := ctr.Resources.Limits[kunlunResourceCount]
@@ -137,18 +144,33 @@ func (dev *KunlunDevices) GenerateResourceRequests(ctr *corev1.Container) device
 	}
 	if ok {
 		if n, ok := v.AsInt64(); ok {
+			if n == 0 {
+				// An explicit zero count means no device is requested,
+				// not an invalid request. See the nvidia backend.
+				return device.ContainerDeviceRequest{}, nil
+			}
+			if n < 0 {
+				klog.ErrorS(nil, "kunlun device count request is out of range", "container", ctr.Name, "request", n)
+				return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "kunlun", Reason: fmt.Sprintf("device count %d is out of range", n)}
+			}
 			klog.Info("Found kunlunxin devices")
 
 			return device.ContainerDeviceRequest{
-				Nums:             int32(n),
+				Nums:             n,
 				Type:             KunlunGPUDevice,
 				Memreq:           0,
 				MemPercentagereq: 100,
 				Coresreq:         0,
-			}
+			}, nil
 		}
+		// A quantity the apiserver accepts as an integer can still be too
+		// large for int64 (1Ei, 1e19). Falling through would report the
+		// container as device-less, which is the fail-open this change
+		// exists to remove.
+		klog.ErrorS(nil, "kunlun device count request is not a plain integer", "container", ctr.Name, "request", v.String())
+		return device.ContainerDeviceRequest{}, &device.ErrInvalidDeviceRequest{Container: ctr.Name, Device: "kunlun", Reason: fmt.Sprintf("device count %s is not a plain integer", v.String())}
 	}
-	return device.ContainerDeviceRequest{}
+	return device.ContainerDeviceRequest{}, nil
 }
 
 func (dev *KunlunDevices) ScoreNode(node *corev1.Node, podDevices device.PodSingleDevice, previous []*device.DeviceUsage, policy string) float32 {
@@ -184,11 +206,30 @@ func (kl *KunlunDevices) Fit(devices []*device.DeviceUsage, request device.Conta
 	tmpDevs := make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
 
-	alloc := graghSelect(devices, request, FitXPU)
+	// graghSelect decides topology from the position of a device in the slice,
+	// so the uuid constraint has to be applied through fitFn rather than by
+	// filtering the slice first.
+	uuidMismatches := make(map[string]bool)
+	fitFn := func(d *device.DeviceUsage, r device.ContainerDeviceRequest) bool {
+		if !device.CheckUUID(pod.GetAnnotations(), d.ID, UseUUIDAnno, NoUseUUIDAnno, kl.CommonWord()) ||
+			!device.CheckUUID(pod.GetAnnotations(), d.ID, KunlunUseUUID, KunlunNoUseUUID, kl.CommonWord()) {
+			uuidMismatches[d.ID] = true
+			klog.V(5).InfoS(common.CardUUIDMismatch, "pod", klog.KObj(pod), "device", d.ID)
+			return false
+		}
+		return FitXPU(d, r)
+	}
+
+	alloc := graghSelect(devices, request, fitFn)
 	if len(alloc) == 0 {
-		reason[common.NumaNotFit]++
-		klog.V(5).InfoS(common.NumaNotFit, "pod", klog.KObj(pod), "device", devices, "request nums", request.Nums, "numa")
-		return false, tmpDevs, common.GenReason(reason, len(reason))
+		uuidMismatch := len(uuidMismatches)
+		if uuidMismatch > 0 {
+			reason[common.CardUUIDMismatch] += uuidMismatch
+		} else {
+			reason[common.NumaNotFit]++
+			klog.V(5).InfoS(common.NumaNotFit, "pod", klog.KObj(pod), "device", devices, "request nums", request.Nums, "numa")
+		}
+		return false, tmpDevs, common.GenReason(reason, len(devices))
 	}
 
 	for _, dev := range alloc {
@@ -217,5 +258,5 @@ func (dev *KunlunDevices) GetResourceNames() device.ResourceNames {
 }
 
 func FitXPU(device *device.DeviceUsage, request device.ContainerDeviceRequest) bool {
-	return device.Used == 0
+	return device.Used == 0 && device.Health
 }

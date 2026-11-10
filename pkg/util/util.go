@@ -43,6 +43,11 @@ func init() {
 }
 
 func GetNode(nodename string) (*corev1.Node, error) {
+	return GetNodeWithContext(context.Background(), nodename)
+}
+
+// GetNodeWithContext allows callers to cancel a node lookup during shutdown.
+func GetNodeWithContext(ctx context.Context, nodename string) (*corev1.Node, error) {
 	if nodename == "" {
 		klog.ErrorS(nil, "Node name is empty")
 		return nil, fmt.Errorf("nodename is empty")
@@ -54,18 +59,18 @@ func GetNode(nodename string) (*corev1.Node, error) {
 	}
 
 	klog.V(5).InfoS("Fetching node", "nodeName", nodename)
-	n, err := c.CoreV1().Nodes().Get(context.Background(), nodename, metav1.GetOptions{})
+	n, err := c.CoreV1().Nodes().Get(ctx, nodename, metav1.GetOptions{})
 	if err != nil {
 		switch {
 		case apierrors.IsNotFound(err):
 			klog.ErrorS(err, "Node not found", "nodeName", nodename)
-			return nil, fmt.Errorf("node %s not found", nodename)
+			return nil, fmt.Errorf("node %s not found: %w", nodename, err)
 		case apierrors.IsUnauthorized(err):
 			klog.ErrorS(err, "Unauthorized to access node", "nodeName", nodename)
-			return nil, fmt.Errorf("unauthorized to access node %s", nodename)
+			return nil, fmt.Errorf("unauthorized to access node %s: %w", nodename, err)
 		default:
 			klog.ErrorS(err, "Failed to get node", "nodeName", nodename)
-			return nil, fmt.Errorf("failed to get node %s: %v", nodename, err)
+			return nil, fmt.Errorf("failed to get node %s: %w", nodename, err)
 		}
 	}
 
@@ -73,48 +78,22 @@ func GetNode(nodename string) (*corev1.Node, error) {
 	return n, nil
 }
 
+// GetPendingPod returns the pod the node lock names. The kubelet never tells a
+// device plugin which pod an Allocate is for, so the lock is the only record of
+// it the scheduler leaves behind. There is deliberately no fallback to matching
+// pending pods by their own hami.io/ annotations: writing those needs no rbac
+// beyond creating the pod, and when the lock is missing the nearest annotated
+// pod is not the pod being allocated, so that path served one pod's devices to
+// another (issue #3076).
 func GetPendingPod(ctx context.Context, node string) (*corev1.Pod, error) {
 	pod, err := GetAllocatePodByNode(ctx, node)
 	if err != nil {
 		return nil, err
 	}
-	if pod != nil {
-		return pod, nil
+	if pod == nil {
+		return nil, fmt.Errorf("no node lock naming a pending pod on node %s", node)
 	}
-	// filter pods for this node.
-	selector := fmt.Sprintf("spec.nodeName=%s", node)
-	podListOptions := metav1.ListOptions{
-		FieldSelector: selector,
-	}
-	podlist, err := client.GetClient().CoreV1().Pods("").List(ctx, podListOptions)
-	if err != nil {
-		return nil, err
-	}
-	for _, p := range podlist.Items {
-		if p.Status.Phase != corev1.PodPending {
-			continue
-		}
-		if _, ok := p.Annotations[BindTimeAnnotations]; !ok {
-			continue
-		}
-		if phase, ok := p.Annotations[DeviceBindPhase]; !ok {
-			continue
-		} else {
-			// Allow both "allocating" and "success" phases for multi-container pods
-			// where some containers have already been allocated but others are still pending
-			if phase != DeviceBindAllocating && phase != DeviceBindSuccess {
-				continue
-			}
-		}
-		if n, ok := p.Annotations[AssignedNodeAnnotations]; !ok {
-			continue
-		} else {
-			if strings.Compare(n, node) == 0 {
-				return &p, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("no binding pod found on node %s", node)
+	return pod, nil
 }
 
 func GetAllocatePodByNode(ctx context.Context, nodeName string) (*corev1.Pod, error) {
@@ -137,6 +116,18 @@ func GetAllocatePodByNode(ctx context.Context, nodeName string) (*corev1.Pod, er
 }
 
 func PatchNodeAnnotations(node *corev1.Node, annotations map[string]string) error {
+	return PatchNodeAnnotationsWithContext(context.Background(), node, annotations)
+}
+
+// PatchNodeAnnotationsWithContext allows callers to cancel registration on shutdown.
+func PatchNodeAnnotationsWithContext(ctx context.Context, node *corev1.Node, annotations map[string]string) error {
+	if node == nil {
+		return fmt.Errorf("node is nil")
+	}
+	c := client.GetClient()
+	if c == nil {
+		return fmt.Errorf("kubernetes client is not initialized")
+	}
 	type patchMetadata struct {
 		Annotations map[string]string `json:"annotations,omitempty"`
 	}
@@ -151,8 +142,8 @@ func PatchNodeAnnotations(node *corev1.Node, annotations map[string]string) erro
 	if err != nil {
 		return err
 	}
-	_, err = client.GetClient().CoreV1().Nodes().
-		Patch(context.Background(), node.Name, k8stypes.MergePatchType, bytes, metav1.PatchOptions{})
+	_, err = c.CoreV1().Nodes().
+		Patch(ctx, node.Name, k8stypes.MergePatchType, bytes, metav1.PatchOptions{})
 	if err != nil {
 		klog.Infoln("annotations=", annotations)
 		klog.Infof("patch node %v failed, %v", node.Name, err)
@@ -160,8 +151,75 @@ func PatchNodeAnnotations(node *corev1.Node, annotations map[string]string) erro
 	return err
 }
 
+func PatchNodeStatusCapacity(node *corev1.Node, resources corev1.ResourceList) error {
+	if len(resources) == 0 {
+		return nil
+	}
+	c := client.GetClient()
+	if c == nil {
+		return fmt.Errorf("kubernetes client is not initialized")
+	}
+
+	type patchStatusDetails struct {
+		Capacity    corev1.ResourceList `json:"capacity,omitempty"`
+		Allocatable corev1.ResourceList `json:"allocatable,omitempty"`
+	}
+	type patchStatusNode struct {
+		Status patchStatusDetails `json:"status"`
+	}
+
+	p := patchStatusNode{
+		Status: patchStatusDetails{
+			Capacity:    resources,
+			Allocatable: resources,
+		},
+	}
+
+	bytes, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	_, err = c.CoreV1().Nodes().
+		Patch(context.Background(), node.Name, k8stypes.MergePatchType, bytes, metav1.PatchOptions{}, "status")
+	if err != nil {
+		klog.Infoln("resources=", resources)
+		klog.Infof("patch node status capacity %v failed, %v", node.Name, err)
+	}
+	return err
+}
+
+func AllNonSidecarInitContainersSucceeded(pod *corev1.Pod) bool {
+	if len(pod.Spec.InitContainers) == 0 {
+		return false
+	}
+	statusByName := make(map[string]corev1.ContainerStatus, len(pod.Status.InitContainerStatuses))
+	for _, s := range pod.Status.InitContainerStatuses {
+		statusByName[s.Name] = s
+	}
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		if IsSidecarContainer(c) {
+			continue
+		}
+		s, ok := statusByName[c.Name]
+		if !ok || s.State.Terminated == nil || s.State.Terminated.ExitCode != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func PatchPodAnnotations(pod *corev1.Pod, annotations map[string]string) error {
+	if pod == nil {
+		return fmt.Errorf("pod is nil")
+	}
 	type patchMetadata struct {
+		// UID makes the patch conditional on the object's identity. A merge
+		// patch is addressed by name, so without it a patch computed for one
+		// pod can land on a different pod that later took the same name.
+		// Kubernetes rejects an update that changes the UID, so a mismatch
+		// fails the request instead of writing to the wrong object.
+		UID         k8stypes.UID      `json:"uid,omitempty"`
 		Annotations map[string]string `json:"annotations,omitempty"`
 		Labels      map[string]string `json:"labels,omitempty"`
 	}
@@ -170,6 +228,7 @@ func PatchPodAnnotations(pod *corev1.Pod, annotations map[string]string) error {
 	}
 
 	p := patchPod{}
+	p.Metadata.UID = pod.UID
 	p.Metadata.Annotations = annotations
 	label := make(map[string]string)
 	if v, ok := annotations[AssignedNodeAnnotations]; ok && v != "" {
@@ -217,6 +276,71 @@ func PatchPodLabels(namespace, name string, labels map[string]string) error {
 	return err
 }
 
+// PatchNodeLabels merges the given labels onto the node. An empty string value
+// is a deliberate label (for example hami.io/lupine-server with the chart
+// default port), not an omit.
+func PatchNodeLabels(node *corev1.Node, labels map[string]string) error {
+	return PatchNodeLabelsWithContext(context.Background(), node, labels)
+}
+
+// PatchNodeLabelsWithContext allows callers to cancel a label patch on shutdown.
+func PatchNodeLabelsWithContext(ctx context.Context, node *corev1.Node, labels map[string]string) error {
+	if node == nil {
+		return fmt.Errorf("node is nil")
+	}
+	c := client.GetClient()
+	if c == nil {
+		return fmt.Errorf("kubernetes client is not initialized")
+	}
+	type patchMetadata struct {
+		Labels map[string]string `json:"labels,omitempty"`
+	}
+	type patchNode struct {
+		Metadata patchMetadata `json:"metadata"`
+	}
+
+	bytes, err := json.Marshal(patchNode{Metadata: patchMetadata{Labels: labels}})
+	if err != nil {
+		return err
+	}
+	_, err = c.CoreV1().Nodes().
+		Patch(ctx, node.Name, k8stypes.MergePatchType, bytes, metav1.PatchOptions{})
+	if err != nil {
+		klog.InfoS("patch node labels failed", "node", node.Name, "labels", labels, "err", err)
+	}
+	return err
+}
+
+// RemoveNodeLabels deletes the named labels from the node via a merge patch.
+func RemoveNodeLabels(node *corev1.Node, labelKeys ...string) error {
+	if node == nil {
+		return fmt.Errorf("node is nil")
+	}
+	labels := make(map[string]any, len(labelKeys))
+	for _, key := range labelKeys {
+		labels[key] = nil
+	}
+	patch := map[string]any{
+		"metadata": map[string]any{
+			"labels": labels,
+		},
+	}
+	bytes, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	c := client.GetClient()
+	if c == nil {
+		return fmt.Errorf("kubernetes client is not initialized")
+	}
+	_, err = c.CoreV1().Nodes().
+		Patch(context.Background(), node.Name, k8stypes.MergePatchType, bytes, metav1.PatchOptions{})
+	if err != nil {
+		klog.InfoS("remove node labels failed", "node", node.Name, "labelKeys", labelKeys, "err", err)
+	}
+	return err
+}
+
 func InitKlogFlags() *flag.FlagSet {
 	// Init log flags
 	flagset := flag.NewFlagSet("klog", flag.ExitOnError)
@@ -226,34 +350,252 @@ func InitKlogFlags() *flag.FlagSet {
 }
 
 func MarkAnnotationsToDelete(devType string, nn string) error {
-	tmppat := make(map[string]string)
-	tmppat[devType] = "Deleted_" + time.Now().Format(time.DateTime)
 	n, err := GetNode(nn)
 	if err != nil {
 		klog.Errorln("get node failed", err.Error())
 		return err
 	}
-	return PatchNodeAnnotations(n, tmppat)
+	return RemoveNodeAnnotation(n, devType)
 }
 
+func RemoveNodeAnnotation(node *corev1.Node, annotationKeys ...string) error {
+	if node == nil {
+		return fmt.Errorf("node is nil")
+	}
+	annos := make(map[string]any, len(annotationKeys))
+	for _, key := range annotationKeys {
+		annos[key] = nil
+	}
+	patch := map[string]any{
+		"metadata": map[string]any{
+			"annotations": annos,
+		},
+	}
+	bytes, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	c := client.GetClient()
+	if c == nil {
+		return fmt.Errorf("kubernetes client is not initialized")
+	}
+	_, err = c.CoreV1().Nodes().
+		Patch(context.Background(), node.Name, k8stypes.MergePatchType, bytes, metav1.PatchOptions{})
+	if err != nil {
+		klog.Infoln("remove annotation failed for node", node.Name, "annotationKeys", annotationKeys)
+	}
+	return err
+}
+
+// IsValidGPUSchedulerPolicy reports whether policy names GPU scheduling
+// policies HAMi recognizes. The value is read as a comma-separated ordered
+// list, the same way PolicyContains and the sort-key chain read it, so
+// "binpack,numa" and "mutex,topology-aware" are both accepted. An empty or
+// blank value is not.
+func IsValidGPUSchedulerPolicy(policy string) bool {
+	if strings.TrimSpace(policy) == "" {
+		return false
+	}
+	for p := range strings.SplitSeq(policy, ",") {
+		switch SchedulerPolicyName(strings.TrimSpace(p)) {
+		case GPUSchedulerPolicyBinpack, GPUSchedulerPolicySpread, GPUSchedulerPolicyNuma,
+			GPUSchedulerPolicyMutex, GPUSchedulerPolicyTopology:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeSchedulerPolicy trims every comma-separated token so consumers
+// that compare whole strings or split without trimming see canonical values.
+func normalizeSchedulerPolicy(policy string) string {
+	parts := strings.Split(policy, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return strings.Join(parts, ",")
+}
+
+// IsValidNodeSchedulerPolicy reports whether policy names a node scheduling
+// policy HAMi recognizes. NodeScoreList.Less has no chain form, so only a
+// single name is meaningful here. The value is trimmed before it is compared,
+// so surrounding whitespace is read the same way IsValidGPUSchedulerPolicy
+// reads it.
+func IsValidNodeSchedulerPolicy(policy string) bool {
+	switch SchedulerPolicyName(strings.TrimSpace(policy)) {
+	case NodeSchedulerPolicyBinpack, NodeSchedulerPolicySpread:
+		return true
+	default:
+		return false
+	}
+}
+
+// SchedulerPolicyAnnotationError reports a scheduler-policy annotation HAMi
+// does not recognize. A missing annotation is not an error: the configured
+// default applies. GetGPUSchedulerPolicyByPod and resolveNodeSchedulerPolicy
+// already ignore a bad value at schedule time, so this is the admission-time
+// signal that turns the same typo into a kubectl apply failure.
+func SchedulerPolicyAnnotationError(pod *corev1.Pod) error {
+	if pod == nil || pod.Annotations == nil {
+		return nil
+	}
+	if value, ok := pod.Annotations[GPUSchedulerPolicyAnnotationKey]; ok && !IsValidGPUSchedulerPolicy(value) {
+		return fmt.Errorf("invalid %s annotation %q: expected binpack, spread, numa, mutex, topology-aware, or a comma-separated chain of them",
+			GPUSchedulerPolicyAnnotationKey, value)
+	}
+	if value, ok := pod.Annotations[NodeSchedulerPolicyAnnotationKey]; ok && !IsValidNodeSchedulerPolicy(value) {
+		return fmt.Errorf("invalid %s annotation %q: expected binpack or spread",
+			NodeSchedulerPolicyAnnotationKey, value)
+	}
+	return nil
+}
+
+// GetGPUSchedulerPolicyByPod returns the GPU scheduling policy to apply to
+// task, preferring its GPUSchedulerPolicyAnnotationKey annotation over
+// defaultPolicy. An annotation that does not name a known policy is ignored
+// with a warning, so defaultPolicy stands.
 func GetGPUSchedulerPolicyByPod(defaultPolicy string, task *corev1.Pod) string {
-	userGPUPolicy := defaultPolicy
+	// --gpu-scheduler-policy is a free-form string that nothing validates, so
+	// a padded cluster default reaches DeviceUsageList.Less the same way a
+	// padded annotation would.
+	userGPUPolicy := normalizeSchedulerPolicy(defaultPolicy)
 	if task != nil && task.Annotations != nil {
 		if value, ok := task.Annotations[GPUSchedulerPolicyAnnotationKey]; ok {
-			userGPUPolicy = value
+			if IsValidGPUSchedulerPolicy(value) {
+				// The validator trims each token, but DeviceUsageList.Less
+				// compares the whole string and its chain dispatch splits on
+				// commas, so store the canonical form. An accepted padded
+				// value would otherwise silently sort as the spread default.
+				userGPUPolicy = normalizeSchedulerPolicy(value)
+			} else {
+				klog.Warningf("ignoring unrecognized %s=%q on pod %s/%s, using configured policy %q",
+					GPUSchedulerPolicyAnnotationKey, value, task.Namespace, task.Name, userGPUPolicy)
+			}
 		}
 	}
 	return userGPUPolicy
 }
 
+// PolicyContains reports whether policy names name, treating policy as a
+// comma-separated ordered list (e.g. "binpack,numa"). A single value with no
+// comma is compared directly, so existing single-policy callers are unaffected.
+func PolicyContains(policy string, name SchedulerPolicyName) bool {
+	target := name.String()
+	for p := range strings.SplitSeq(policy, ",") {
+		if strings.TrimSpace(p) == target {
+			return true
+		}
+	}
+	return false
+}
+
 func IsPodInTerminatedState(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
 	return pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
 }
 
 func IsPodTerminating(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
 	return pod.DeletionTimestamp != nil
 }
 
 func AllContainersCreated(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
 	return len(pod.Status.ContainerStatuses) >= len(pod.Spec.Containers)
+}
+
+func IsSidecarContainer(c *corev1.Container) bool {
+	return c != nil && c.RestartPolicy != nil &&
+		*c.RestartPolicy == corev1.ContainerRestartPolicyAlways
+}
+
+// EmitNodeWarningEvent emits a Warning event on the given Node with deduplication.
+func EmitNodeWarningEvent(node *corev1.Node, reason, message string, dedupWindow time.Duration) {
+	c := client.GetClient()
+	if c == nil {
+		klog.Warningf("cannot emit node event for %s: Kubernetes client not initialized", node.Name)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fieldSel := fmt.Sprintf(
+		"involvedObject.kind=Node,involvedObject.name=%s,involvedObject.uid=%s,reason=%s",
+		node.Name, string(node.UID), reason,
+	)
+	existing, err := c.CoreV1().Events(corev1.NamespaceDefault).List(ctx, metav1.ListOptions{
+		FieldSelector: fieldSel,
+	})
+	if err != nil {
+		klog.Warningf("failed to list events for node %s: %v; will attempt create", node.Name, err)
+	}
+
+	now := metav1.Now()
+
+	if err == nil && len(existing.Items) > 0 {
+		// Client-side filter: the field selector is a server-side optimization; re-check
+		// here so the function is correct even against fake clients or non-compliant servers.
+		var latest *corev1.Event
+		for i := range existing.Items {
+			ev := &existing.Items[i]
+			if ev.InvolvedObject.UID != node.UID || ev.Reason != reason {
+				continue
+			}
+			if latest == nil || ev.LastTimestamp.After(latest.LastTimestamp.Time) {
+				latest = ev
+			}
+		}
+		if latest != nil && now.Sub(latest.LastTimestamp.Time) <= dedupWindow {
+			latest.Count++
+			latest.LastTimestamp = now
+			latest.Message = message
+			if _, err := c.CoreV1().Events(corev1.NamespaceDefault).Update(ctx, latest, metav1.UpdateOptions{}); err != nil {
+				klog.Warningf("failed to update node event for %s: %v", node.Name, err)
+			}
+			return
+		}
+	}
+
+	event := &corev1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: node.Name + "-",
+			Namespace:    corev1.NamespaceDefault,
+		},
+		InvolvedObject: corev1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       "Node",
+			Name:       node.Name,
+			UID:        node.UID,
+		},
+		Reason:         reason,
+		Message:        message,
+		Type:           corev1.EventTypeWarning,
+		Count:          1,
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+		Source:         corev1.EventSource{Component: "hami-device-plugin"},
+	}
+	if _, err := c.CoreV1().Events(corev1.NamespaceDefault).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+		klog.Warningf("failed to create node event for %s: %v", node.Name, err)
+	}
+}
+
+func IsPodGroupMember(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	if pod.Labels[PodGroupLabel] != "" {
+		return true
+	}
+	if sg := pod.Spec.SchedulingGroup; sg != nil && sg.PodGroupName != nil && *sg.PodGroupName != "" {
+		return true
+	}
+	return false
 }

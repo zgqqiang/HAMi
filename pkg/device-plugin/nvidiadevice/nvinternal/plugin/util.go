@@ -17,7 +17,6 @@
 package plugin
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,19 +24,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
-	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
-	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
-	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"tags.cncf.io/container-device-interface/specs-go"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/cdi"
 	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/info"
 	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
 	"github.com/Project-HAMi/HAMi/pkg/util"
@@ -92,125 +89,194 @@ func GetNextDeviceRequest(dtype string, p corev1.Pod) (corev1.Container, device.
 	return corev1.Container{}, res, errors.New("device request not found")
 }
 
-var eraseNextDeviceTypeFromAnnotation = func(dtype string, p corev1.Pod) error {
+// decodePodSingleDevice decodes the pod's device allocation annotation for the
+// given device type into a PodSingleDevice slice. Each element corresponds to
+// one container (init containers first, then regular containers).
+func decodePodSingleDevice(dtype string, p *corev1.Pod) (device.PodSingleDevice, error) {
 	pdevices, err := device.DecodePodDevices(device.InRequestDevices, p.Annotations)
+	if err != nil {
+		return nil, err
+	}
+	pd, ok := pdevices[dtype]
+	if !ok {
+		return nil, errors.New("device request not found")
+	}
+	return pd, nil
+}
+
+// popNextContainerDevices finds and erases the first non-empty ContainerDevices
+// from podSingleDev in place, returning the corresponding pod container and the
+// popped devices. The container resolution uses the same init-then-regular
+// ordering convention as the annotation encoder. It does NOT touch the API
+// server, the caller is responsible for patching the annotation once after the
+// loop completes.
+func popNextContainerDevices(pod *corev1.Pod, podSingleDev device.PodSingleDevice) (corev1.Container, device.ContainerDevices, error) {
+	initContainerCount := len(pod.Spec.InitContainers)
+	for i, ctrDevs := range podSingleDev {
+		if len(ctrDevs) > 0 {
+			podSingleDev[i] = device.ContainerDevices{}
+			if i < initContainerCount {
+				return pod.Spec.InitContainers[i], ctrDevs, nil
+			}
+			regularIdx := i - initContainerCount
+			if regularIdx >= len(pod.Spec.Containers) {
+				return corev1.Container{}, nil, fmt.Errorf("container index %d out of range (init=%d, regular=%d)", i, initContainerCount, len(pod.Spec.Containers))
+			}
+			return pod.Spec.Containers[regularIdx], ctrDevs, nil
+		}
+	}
+	return corev1.Container{}, nil, errors.New("no pending device allocation found")
+}
+
+// validateContainerAllocation rejects an allocation handing the container more
+// than its own resource limits ask for (issue #3041). A MIG slice is charged
+// its profile's capacity rather than the raw request, so it is checked by
+// validateMigAllocation instead.
+func (plugin *NvidiaDevicePlugin) validateContainerAllocation(ctr *corev1.Container, allocated device.ContainerDevices) error {
+	if plugin.operatingMode == "mig" {
+		return nil
+	}
+	dev, ok := device.GetDevices()[nvidia.NvidiaGPUDevice]
+	if !ok {
+		return nil
+	}
+	req, err := dev.GenerateResourceRequests(ctr)
 	if err != nil {
 		return err
 	}
-	res := device.PodSingleDevice{}
-	pd, ok := pdevices[dtype]
-	if !ok {
-		return errors.New("erase device annotation not found")
-	}
-	found := false
-	for _, val := range pd {
-		if found {
-			res = append(res, val)
-		} else {
-			if len(val) > 0 {
-				found = true
-				res = append(res, device.ContainerDevices{})
-			} else {
-				res = append(res, val)
-			}
-		}
-	}
-	klog.Infoln("After erase res=", res)
-	newannos := make(map[string]string)
-	newannos[device.InRequestDevices[dtype]] = device.EncodePodSingleDevice(res)
-	return util.PatchPodAnnotations(&p, newannos)
+	return device.ValidateContainerAllocation(ctr.Name, req, allocated, plugin.registeredMemoryMB, device.CoresInRequestUnits)
 }
 
-func GetIndexAndTypeFromUUID(uuid string) (string, int) {
-	defer nvml.Shutdown()
-	if nvret := nvml.Init(); nvret != nvml.SUCCESS {
-		klog.Errorln("nvml Init err: ", nvret)
-		panic(0)
-	}
-	originuuid := strings.Split(uuid, "[")[0]
-	ndev, ret := nvml.DeviceGetHandleByUUID(originuuid)
-	if ret != nvml.SUCCESS {
-		klog.Error("nvml get handlebyuuid error ret=", ret)
-		panic(0)
-	}
-	Model, ret := ndev.GetName()
-	if ret != nvml.SUCCESS {
-		klog.Error("nvml get name error ret=", ret)
-		panic(0)
-	}
-	index, ret := ndev.GetIndex()
-	if ret != nvml.SUCCESS {
-		klog.Error("nvml get index error ret=", ret)
-		panic(0)
-	}
-	return Model, index
+// registeredMigCard is a MIG card as registered: the memory the scheduler sized
+// percentage requests against, and the profiles it can offer.
+type registeredMigCard struct {
+	memoryMB int64
+	profiles []device.MigProfile
 }
 
-func GetMigUUIDFromSmiOutput(output string, uuid string, idx int) string {
-	migmode := false
-	for val := range strings.SplitSeq(output, "\n") {
-		if !strings.Contains(val, "MIG") && strings.Contains(val, uuid) {
-			migmode = true
-			continue
-		}
-		if !strings.Contains(val, "MIG") && !strings.Contains(val, uuid) {
-			migmode = false
-			continue
-		}
-		if !migmode {
-			continue
-		}
-		klog.Infoln("inspecting", val)
-		num := strings.Split(val, "Device")[1]
-		num = strings.Split(num, ":")[0]
-		num = strings.TrimSpace(num)
-		index, err := strconv.Atoi(num)
-		if err != nil {
-			klog.Fatal("atoi failed num=", num)
-		}
-		if index == idx {
-			outputStr := strings.Split(val, ":")[2]
-			outputStr = strings.TrimSpace(outputStr)
-			outputStr = strings.TrimRight(outputStr, ")")
-			return outputStr
-		}
+// rememberMigCard records what was registered for a MIG card.
+func (plugin *NvidiaDevicePlugin) rememberMigCard(uuid string, memoryMB int64, profiles []device.MigProfile) {
+	plugin.registeredMigMu.Lock()
+	defer plugin.registeredMigMu.Unlock()
+	if plugin.registeredMig == nil {
+		plugin.registeredMig = map[string]registeredMigCard{}
 	}
-	return ""
+	plugin.registeredMig[uuid] = registeredMigCard{memoryMB: memoryMB, profiles: append([]device.MigProfile(nil), profiles...)}
 }
 
-func GetMigUUIDFromIndex(uuid string, idx int) string {
-	defer nvml.Shutdown()
-	if nvret := nvml.Init(); nvret != nvml.SUCCESS {
-		klog.Errorln("nvml Init err: ", nvret)
-		panic(0)
-	}
-	originuuid := strings.Split(uuid, "[")[0]
-	ndev, ret := nvml.DeviceGetHandleByUUID(originuuid)
-	if ret != nvml.SUCCESS {
-		klog.Error(`nvml get device uuid error ret=`, ret)
-		panic(0)
-	}
-	migdev, ret := nvml.DeviceGetMigDeviceHandleByIndex(ndev, idx)
-	if ret != nvml.SUCCESS {
-		klog.Error("nvml get mig dev error ret=", ret, ",idx=", idx, "using nvidia-smi -L for query")
-		cmd := exec.Command("nvidia-smi", "-L")
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		err := cmd.Run()
-		if err != nil {
-			klog.Fatalf("nvidia-smi -L failed with %s\n", err)
+// registeredMigProfile looks up a profile among those registered for a card.
+// known is false when nothing was registered for the card yet.
+func (plugin *NvidiaDevicePlugin) registeredMigProfile(uuid, name string) (profile device.MigProfile, found, known bool) {
+	plugin.registeredMigMu.RLock()
+	defer plugin.registeredMigMu.RUnlock()
+	card, known := plugin.registeredMig[uuid]
+	for _, p := range card.profiles {
+		if p.Name == name {
+			return p, true, true
 		}
-		outStr := stdout.String()
-		uuid := GetMigUUIDFromSmiOutput(outStr, originuuid, idx)
-		return uuid
 	}
-	res, ret := migdev.GetUUID()
-	if ret != nvml.SUCCESS {
-		klog.Error(`nvml get mig uuid error ret=`, ret)
-		panic(0)
+	return device.MigProfile{}, false, known
+}
+
+// registeredMigMemoryMB returns the memory registered for a MIG card. Memory
+// scaling does not apply in MIG mode, so this is not registeredMemoryMB.
+func (plugin *NvidiaDevicePlugin) registeredMigMemoryMB(uuid string) (int64, bool) {
+	plugin.registeredMigMu.RLock()
+	defer plugin.registeredMigMu.RUnlock()
+	card, ok := plugin.registeredMig[uuid]
+	return card.memoryMB, ok
+}
+
+// validateMigAllocation rejects a MIG slice the node would not have offered
+// (issue #3077). The slice is charged its profile's capacity, so it cannot be
+// compared with the request directly. Two inputs a pod cannot change stand in
+// for that: the profiles this plugin registered, which come from the node's
+// allowlist, and the container's own memory request. The profile must be
+// registered and large enough for the request. A card with no registered
+// profiles yet, as right after a restart, is left to the scheduler's choice.
+func (plugin *NvidiaDevicePlugin) validateMigAllocation(pod *corev1.Pod, ctr *corev1.Container) error {
+	allocations, err := nvidia.DecodeMigAllocations(pod.Annotations[nvidia.MigAllocationsAnnotation])
+	if err != nil {
+		return err
 	}
-	return res
+	index := containerIndex(pod, ctr.Name)
+	var req device.ContainerDeviceRequest
+	if dev, ok := device.GetDevices()[nvidia.NvidiaGPUDevice]; ok {
+		if req, err = dev.GenerateResourceRequests(ctr); err != nil {
+			return err
+		}
+	}
+	for _, allocation := range allocations {
+		if allocation.ContainerIndex != index {
+			continue
+		}
+		profile, found, known := plugin.registeredMigProfile(allocation.GPUUUID, allocation.Profile)
+		if !known {
+			klog.InfoS("No MIG profiles registered for card yet, skipping the profile check",
+				"container", ctr.Name, "gpu", allocation.GPUUUID, "profile", allocation.Profile)
+			continue
+		}
+		if !found {
+			return fmt.Errorf("container %s is allocated MIG profile %s on device %s, which this node does not offer",
+				ctr.Name, allocation.Profile, allocation.GPUUUID)
+		}
+		if limit, bounded := device.RequestedMemoryMB(req, allocation.GPUUUID, plugin.registeredMigMemoryMB); bounded && profile.MemoryMB < limit {
+			return fmt.Errorf("container %s is allocated MIG profile %s with %d MB on device %s but requests %d MB",
+				ctr.Name, allocation.Profile, profile.MemoryMB, allocation.GPUUUID, limit)
+		}
+	}
+	return nil
+}
+
+// containerIndex numbers a container the way the allocation annotations do:
+// init containers first, then the regular ones. It returns -1 for a name the
+// pod does not have.
+func containerIndex(pod *corev1.Pod, name string) int {
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == name {
+			return i
+		}
+	}
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == name {
+			return len(pod.Spec.InitContainers) + i
+		}
+	}
+	return -1
+}
+
+// registeredMemoryMB returns the memory this plugin published for a card, which
+// is what the scheduler sized a percentage request against, oversubscription
+// included.
+func (plugin *NvidiaDevicePlugin) registeredMemoryMB(uuid string) (int64, bool) {
+	if plugin.rm == nil {
+		return 0, false
+	}
+	card, ok := plugin.rm.Devices()[uuid]
+	if !ok || card == nil {
+		return 0, false
+	}
+	total := int64(card.TotalMemory / 1024 / 1024)
+	if plugin.schedulerConfig.DeviceMemoryScaling != nil && *plugin.schedulerConfig.DeviceMemoryScaling != 1 {
+		total = int64(float64(total) * *plugin.schedulerConfig.DeviceMemoryScaling)
+	}
+	return total, true
+}
+
+// patchErasedAnnotation patches the pod's device annotation with the given
+// podSingleDev (which has had some containers popped). It also updates
+// pod.Annotations in place so that subsequent Allocate calls within the same
+// kubelet invocation see the erased state.
+func patchErasedAnnotation(pod *corev1.Pod, dtype string, podSingleDev device.PodSingleDevice) error {
+	klog.V(5).Infof("After erase annotation, remaining devices: %v", podSingleDev)
+	encoded := device.EncodePodSingleDevice(podSingleDev)
+	annoKey := device.InRequestDevices[dtype]
+	newAnnos := map[string]string{annoKey: encoded}
+	if err := util.PatchPodAnnotations(pod, newAnnos); err != nil {
+		return err
+	}
+	pod.Annotations[annoKey] = encoded
+	return nil
 }
 
 func GetMigGpuInstanceIdFromIndex(uuid string, idx int) (int, error) {
@@ -218,6 +284,7 @@ func GetMigGpuInstanceIdFromIndex(uuid string, idx int) (int, error) {
 		klog.Errorln("nvml Init err: ", nvret)
 		return 0, fmt.Errorf("nvml Init err: %s", nvml.ErrorString(nvret))
 	}
+	defer nvml.Shutdown()
 	originuuid := strings.Split(uuid, "[")[0]
 	ndev, ret := nvml.DeviceGetHandleByUUID(originuuid)
 	if ret != nvml.SUCCESS {
@@ -238,11 +305,11 @@ func GetMigGpuInstanceIdFromIndex(uuid string, idx int) (int, error) {
 }
 
 func GetDeviceNums() (int, error) {
-	defer nvml.Shutdown()
 	if nvret := nvml.Init(); nvret != nvml.SUCCESS {
 		klog.Errorln("nvml Init err: ", nvret)
 		return 0, fmt.Errorf("nvml Init err: %s", nvml.ErrorString(nvret))
 	}
+	defer nvml.Shutdown()
 	count, ret := nvml.DeviceGetCount()
 	if ret != nvml.SUCCESS {
 		klog.Error(`nvml get count error ret=`, ret)
@@ -253,11 +320,11 @@ func GetDeviceNums() (int, error) {
 
 func GetDeviceNames() ([]string, error) {
 	names := []string{}
-	defer nvml.Shutdown()
 	if nvret := nvml.Init(); nvret != nvml.SUCCESS {
 		klog.Errorln("nvml Init err: ", nvret)
 		return names, fmt.Errorf("nvml Init err: %s", nvml.ErrorString(nvret))
 	}
+	defer nvml.Shutdown()
 	count, ret := nvml.DeviceGetCount()
 	if ret != nvml.SUCCESS {
 		klog.Error(`nvml get count error ret=`, ret)
@@ -323,87 +390,6 @@ func (nv *NvidiaDevicePlugin) EnableOtherNVMLOperation() {
 	nv.disableWatchAndRegister <- false
 }
 
-func (nv *NvidiaDevicePlugin) ApplyMigTemplate() {
-	nv.applyMutex.Lock()
-	nv.DisableOtherNVMLOperation()
-	defer func() {
-		nv.EnableOtherNVMLOperation()
-		nv.applyMutex.Unlock()
-	}()
-	data, err := yaml.Marshal(nv.migCurrent)
-	if err != nil {
-		klog.Error("marshal failed", err.Error())
-	}
-	klog.Infoln("Applying data=", string(data))
-	os.WriteFile("/tmp/migconfig.yaml", data, os.ModePerm)
-	cmd := exec.Command("nvidia-mig-parted", "apply", "-f", "/tmp/migconfig.yaml")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err = cmd.Run()
-	if err != nil {
-		klog.Fatalf("nvidia-mig-parted failed with %s,reason:%s\n", err, stderr.String())
-	}
-	outStr := stdout.String()
-	klog.Infoln("Mig apply", outStr)
-}
-
-func (nv *NvidiaDevicePlugin) GenerateMigTemplate(devtype string, devindex int, val device.ContainerDevice) (int, bool) {
-	needsreset := false
-	position := -1 // Initialize to an invalid position
-
-	for _, migTemplate := range nv.schedulerConfig.MigGeometriesList {
-		if containsModel(devtype, migTemplate.Models) {
-			klog.InfoS("type found", "Type", devtype, "Models", strings.Join(migTemplate.Models, ", "))
-
-			templateIdx, pos, err := device.ExtractMigTemplatesFromUUID(val.UUID)
-			if err != nil {
-				klog.ErrorS(err, "failed to extract template index from UUID", "UUID", val.UUID)
-				return -1, false
-			}
-			position = pos
-
-			if templateIdx < 0 || templateIdx >= len(migTemplate.Geometries) {
-				klog.ErrorS(nil, "invalid template index extracted from UUID", "UUID", val.UUID, "Index", templateIdx)
-				return -1, false
-			}
-
-			v := migTemplate.Geometries[templateIdx]
-
-			for migidx, migpartedDev := range nv.migCurrent.MigConfigs["current"] {
-				if containsDevice(devindex, migpartedDev.Devices) {
-					for _, migTemplateEntry := range v {
-						currentCount, ok := migpartedDev.MigDevices[migTemplateEntry.Name]
-						expectedCount := migTemplateEntry.Count
-
-						if !ok || currentCount != expectedCount {
-							needsreset = true
-							klog.InfoS("updated mig device count", "Template", v)
-						} else {
-							klog.InfoS("incremented mig device count", "TemplateName", migTemplateEntry.Name, "Count", currentCount+1)
-						}
-					}
-
-					if needsreset {
-						for k := range nv.migCurrent.MigConfigs["current"][migidx].MigDevices {
-							delete(nv.migCurrent.MigConfigs["current"][migidx].MigDevices, k)
-						}
-
-						for _, migTemplateEntry := range v {
-							nv.migCurrent.MigConfigs["current"][migidx].MigDevices[migTemplateEntry.Name] = migTemplateEntry.Count
-							nv.migCurrent.MigConfigs["current"][migidx].MigEnabled = true
-						}
-					}
-					break
-				}
-			}
-			break
-		}
-	}
-
-	return position, needsreset
-}
-
 // Helper function to check if a model is in the list of models.
 func containsModel(target string, models []string) bool {
 	for _, model := range models {
@@ -414,80 +400,158 @@ func containsModel(target string, models []string) bool {
 	return false
 }
 
-// Helper function to check if a device index is in the list of devices.
-func containsDevice(target int, devices []int32) bool {
-	for _, device := range devices {
-		if int(device) == target {
-			return true
+// GetContainerDeviceStrArray resolves container devices. In MIG mode the caller
+// must hold applyMutex across this call and the runtime annotation update.
+func (nv *NvidiaDevicePlugin) GetContainerDeviceStrArray(c device.ContainerDevices, pod *corev1.Pod, containerName string) ([]string, error) {
+	if nv.operatingMode != "mig" {
+		out := make([]string, 0, len(c))
+		for _, value := range c {
+			out = append(out, value.UUID)
+		}
+		return out, nil
+	}
+	if nv.migMgr == nil || pod == nil {
+		return nil, fmt.Errorf("MIG allocation requires an initialized manager and Pod")
+	}
+	containerIndex := -1
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == containerName {
+			containerIndex = i
+			break
 		}
 	}
-	return false
-}
-
-// Helper function to deepcopy new mig spec
-func deepCopyMigConfig(src nvidia.MigConfigSpec) nvidia.MigConfigSpec {
-	dst := src
-	if src.Devices != nil {
-		dst.Devices = make([]int32, len(src.Devices))
-		copy(dst.Devices, src.Devices)
-	}
-	if src.MigDevices != nil {
-		dst.MigDevices = make(map[string]int32)
-		for k, v := range src.MigDevices {
-			dst.MigDevices[k] = v
-		}
-	}
-	return dst
-}
-
-func (nv *NvidiaDevicePlugin) GetContainerDeviceStrArray(c device.ContainerDevices) []string {
-	tmp := []string{}
-	needsreset := false
-	position := 0
-	for _, val := range c {
-		if !strings.Contains(val.UUID, "[") {
-			tmp = append(tmp, val.UUID)
-		} else {
-			devtype, devindex := GetIndexAndTypeFromUUID(val.UUID)
-			position, needsreset = nv.GenerateMigTemplate(devtype, devindex, val)
-			if needsreset {
-				nv.ApplyMigTemplate()
-				if nv.deviceListStrategies.Includes(spec.DeviceListStrategyVolumeMounts) ||
-					nv.deviceListStrategies.Includes(spec.DeviceListStrategyCDIAnnotations) ||
-					nv.deviceListStrategies.Includes(spec.DeviceListStrategyCDICRI) {
-					klog.V(3).Infoln("generate CDI spec file")
-					const (
-						maxTryTimes      = 5
-						waitTimeInterval = 5 * time.Second
-						specFilePath     = "/var/run/cdi/k8s.device-plugin.nvidia.com-gpu.json"
-						kind             = "k8s.device-plugin.nvidia.com/gpu"
-					)
-					for i := 0; i < maxTryTimes; i++ {
-						if err := createSpecFile(specFilePath); err != nil {
-							klog.Warningf("failed to create CDI spec file: %v", err)
-						} else {
-							klog.Infof("createSpecFile ok. file path %s", specFilePath)
-						}
-						if err := checkCDISpecFile(specFilePath, kind); err != nil {
-							klog.Warningf("check CDI spec file failed. %v", err)
-							if i == maxTryTimes-1 {
-								klog.Fatalf("exceed the max trytime %d", maxTryTimes)
-							} else {
-								time.Sleep(waitTimeInterval)
-								klog.Warningf("try to create CDI spec file again. try times: %d", i)
-								continue
-							}
-						}
-						klog.Infof("check CDI spec file ok")
-						break
-					}
-				}
+	if containerIndex < 0 {
+		for i := range pod.Spec.Containers {
+			if pod.Spec.Containers[i].Name == containerName {
+				containerIndex = len(pod.Spec.InitContainers) + i
+				break
 			}
-			tmp = append(tmp, GetMigUUIDFromIndex(val.UUID, position))
 		}
 	}
-	klog.V(3).Infoln("mig current=", nv.migCurrent, ":", needsreset, "position=", position, "uuid lists", tmp)
-	return tmp
+	if containerIndex < 0 {
+		return nil, fmt.Errorf("container %q not found in Pod", containerName)
+	}
+	allocations, err := nvidia.DecodeMigAllocations(pod.Annotations[nvidia.MigAllocationsAnnotation])
+	if err != nil {
+		return nil, fmt.Errorf("decode scheduler MIG allocations: %w", err)
+	}
+	containerAllocations := make([]nvidia.MigAllocation, 0, len(c))
+	for _, allocation := range allocations {
+		if allocation.ContainerIndex == containerIndex {
+			containerAllocations = append(containerAllocations, allocation)
+		}
+	}
+	sort.Slice(containerAllocations, func(i, j int) bool { return containerAllocations[i].DeviceIndex < containerAllocations[j].DeviceIndex })
+	if len(containerAllocations) != len(c) {
+		return nil, fmt.Errorf("container %s has %d MIG reservations, requested %d devices", containerName, len(containerAllocations), len(c))
+	}
+	createdMigUUIDs := make([]string, 0, len(c))
+	reusedMigUUIDs := make([]string, 0, len(c))
+	allocationCompleted := false
+	defer func() {
+		if allocationCompleted {
+			return
+		}
+		for i := len(createdMigUUIDs) - 1; i >= 0; i-- {
+			if err := nv.migMgr.Release(createdMigUUIDs[i]); err != nil {
+				klog.ErrorS(err, "failed to roll back partial MIG allocation", "uuid", createdMigUUIDs[i])
+			} else {
+				nv.removeReclaimedMIGArtifacts([]string{createdMigUUIDs[i]})
+			}
+		}
+		for _, uuid := range reusedMigUUIDs {
+			nv.migMgr.MarkIdle(uuid)
+		}
+	}()
+	out := make([]string, 0, len(c))
+	for i, reservation := range containerAllocations {
+		if reservation.GPUUUID != c[i].UUID {
+			return nil, fmt.Errorf("MIG reservation GPU %s does not match allocated GPU %s", reservation.GPUUUID, c[i].UUID)
+		}
+		gpuIndex, ok := nv.migMgr.gpuUUIDToIndex(reservation.GPUUUID)
+		if !ok {
+			return nil, fmt.Errorf("resolve parent GPU %s", reservation.GPUUUID)
+		}
+		placement := nvml.GpuInstancePlacement{Start: reservation.Placement.Start, Size: reservation.Placement.Size}
+		result, err := nv.migMgr.EnsureAllocation(gpuIndex, reservation.Profile, placement)
+		nv.removeReclaimedMIGArtifacts(result.Reclaimed)
+		if err != nil {
+			return nil, err
+		}
+		migUUID := result.MigUUID
+		if result.Created {
+			createdMigUUIDs = append(createdMigUUIDs, migUUID)
+		} else if result.Reused {
+			reusedMigUUIDs = append(reusedMigUUIDs, migUUID)
+		}
+		if err := nv.persistMIGOwnership(allocationKey(gpuIndex, reservation.Profile, placement)); err != nil {
+			return nil, err
+		}
+		if nv.deviceListStrategies.AnyCDIEnabled() {
+			handler, ok := nv.cdiHandler.(cdi.DynamicMIGInterface)
+			if !ok {
+				return nil, fmt.Errorf("dynamic MIG CDI handler is unavailable")
+			}
+			record, err := nv.dynamicMIGRecord(gpuIndex, reservation.GPUUUID, reservation.Profile, placement)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := handler.EnsureDynamicMIGDevice(record); err != nil {
+				return nil, fmt.Errorf("publish CDI entry for MIG device %s: %w", migUUID, err)
+			}
+		}
+		out = append(out, migUUID)
+	}
+	allocationCompleted = true
+	return out, nil
+}
+
+func (nv *NvidiaDevicePlugin) removeReclaimedMIGArtifacts(uuids []string) {
+	if len(uuids) == 0 {
+		return
+	}
+	nv.removeMIGOwnership(uuids)
+	if !nv.deviceListStrategies.AnyCDIEnabled() {
+		return
+	}
+	if nv.pendingCDIRemovals == nil {
+		nv.pendingCDIRemovals = make(map[string]struct{})
+	}
+	for _, uuid := range uuids {
+		nv.pendingCDIRemovals[uuid] = struct{}{}
+	}
+	handler, ok := nv.cdiHandler.(cdi.DynamicMIGInterface)
+	if !ok {
+		klog.ErrorS(nil, "dynamic MIG CDI handler is unavailable during reclamation")
+		return
+	}
+	for _, uuid := range uuids {
+		if err := handler.RemoveDynamicMIGDevice(uuid); err != nil {
+			klog.ErrorS(err, "failed to remove reclaimed MIG CDI entry", "uuid", uuid)
+			nv.pendingCDIRemovals[uuid] = struct{}{}
+			continue
+		}
+		delete(nv.pendingCDIRemovals, uuid)
+	}
+}
+
+func (nv *NvidiaDevicePlugin) dynamicMIGRecord(gpuIndex int, parentUUID, profile string, placement nvml.GpuInstancePlacement) (cdi.DynamicMIGDevice, error) {
+	info, ok := nv.migMgr.AllocationRuntimeInfo(gpuIndex, profile, placement)
+	if !ok {
+		return cdi.DynamicMIGDevice{}, fmt.Errorf("MIG runtime information is missing for GPU %s", parentUUID)
+	}
+	gpu, ret := nv.migMgr.nvmllib.DeviceGetHandleByIndex(gpuIndex)
+	if ret != nvml.SUCCESS {
+		return cdi.DynamicMIGDevice{}, fmt.Errorf("get parent GPU %d: %s", gpuIndex, nvml.ErrorString(ret))
+	}
+	minor, ret := gpu.GetMinorNumber()
+	if ret != nvml.SUCCESS {
+		return cdi.DynamicMIGDevice{}, fmt.Errorf("get parent GPU minor: %s", nvml.ErrorString(ret))
+	}
+	return cdi.DynamicMIGDevice{
+		MIGUUID: info.MigUUID, ParentGPUUUID: parentUUID, ParentMinor: minor,
+		GPUInstanceID: info.GIID, ComputeInstanceID: info.CIID,
+	}, nil
 }
 
 var podAllocationTrySuccess = func(nodeName string, devName string, lockName string, pod *corev1.Pod) {
@@ -507,6 +571,10 @@ var podAllocationTrySuccess = func(nodeName string, devName string, lockName str
 	PodAllocationSuccess(nodeName, pod, lockName)
 }
 
+func PodAllocationTrySuccess(nodeName string, devName string, lockName string, pod *corev1.Pod) {
+	podAllocationTrySuccess(nodeName, devName, lockName, pod)
+}
+
 func PodAllocationSuccess(nodeName string, pod *corev1.Pod, lockName string) {
 	klog.Infof("Pod allocation successful for pod %s/%s on node %s", pod.Namespace, pod.Name, nodeName)
 	updatePodAnnotationsAndReleaseLock(nodeName, pod, lockName, util.DeviceBindSuccess)
@@ -516,7 +584,6 @@ func updatePodAnnotationsAndReleaseLock(nodeName string, pod *corev1.Pod, lockNa
 	newAnnos := map[string]string{util.DeviceBindPhase: deviceBindPhase}
 	if err := util.PatchPodAnnotations(pod, newAnnos); err != nil {
 		klog.Errorf("Failed to patch pod annotations for pod %s/%s: %v", pod.Namespace, pod.Name, err)
-		return
 	}
 	if err := nodelock.ReleaseNodeLock(nodeName, lockName, pod, false); err != nil {
 		klog.Errorf("Failed to release node lock for node %s and lock %s: %v", nodeName, lockName, err)
@@ -526,6 +593,10 @@ func updatePodAnnotationsAndReleaseLock(nodeName string, pod *corev1.Pod, lockNa
 var podAllocationFailed = func(nodeName string, pod *corev1.Pod, lockName string) {
 	klog.Infof("Pod allocation failed for pod %s/%s on node %s", pod.Namespace, pod.Name, nodeName)
 	updatePodAnnotationsAndReleaseLock(nodeName, pod, lockName, util.DeviceBindFailed)
+}
+
+func PodAllocationFailed(nodeName string, pod *corev1.Pod, lockName string) {
+	podAllocationFailed(nodeName, pod, lockName)
 }
 
 func checkCDISpecFile(filePath, kind string) error {

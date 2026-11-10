@@ -17,51 +17,67 @@ limitations under the License.
 package plugin
 
 import (
+	"bytes"
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
+	nvmlmock "github.com/NVIDIA/go-nvml/pkg/nvml/mock"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+	kubeletdevicepluginv1beta1 "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
+
+	"github.com/Project-HAMi/HAMi/pkg/device-plugin/nvidiadevice/nvinternal/rm"
 	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
+	"github.com/Project-HAMi/HAMi/pkg/util"
+	"github.com/Project-HAMi/HAMi/pkg/util/client"
 )
 
-func TestUint8SliceString(t *testing.T) {
+func TestInt8SliceString(t *testing.T) {
 	tests := []struct {
 		name     string
-		input    uint8Slice
+		input    int8Slice
 		expected string
 	}{
 		{
 			name:     "null terminated string",
-			input:    uint8Slice{'h', 'e', 'l', 'l', 'o', 0, 'x', 'y'},
+			input:    int8Slice{'h', 'e', 'l', 'l', 'o', 0, 'x', 'y'},
 			expected: "hello",
 		},
 		{
 			name:     "no null terminator",
-			input:    uint8Slice{'a', 'b', 'c'},
+			input:    int8Slice{'a', 'b', 'c'},
 			expected: "abc",
 		},
 		{
 			name:     "empty slice",
-			input:    uint8Slice{},
+			input:    int8Slice{},
 			expected: "",
 		},
 		{
 			name:     "only null byte",
-			input:    uint8Slice{0},
+			input:    int8Slice{0},
 			expected: "",
 		},
 		{
 			name:     "null at start",
-			input:    uint8Slice{0, 'a', 'b'},
+			input:    int8Slice{0, 'a', 'b'},
 			expected: "",
 		},
 		{
 			name:     "PCI bus ID format",
-			input:    uint8Slice{'0', '0', '0', '0', ':', '3', 'b', ':', '0', '0', '.', '0', 0, 0, 0, 0},
+			input:    int8Slice{'0', '0', '0', '0', ':', '3', 'b', ':', '0', '0', '.', '0', 0, 0, 0, 0},
 			expected: "0000:3b:00.0",
 		},
 		{
 			name:     "single character",
-			input:    uint8Slice{'Z', 0},
+			input:    int8Slice{'Z', 0},
 			expected: "Z",
 		},
 		{
@@ -75,164 +91,218 @@ func TestUint8SliceString(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := tt.input.String()
 			if got != tt.expected {
-				t.Errorf("uint8Slice.String() = %q, want %q", got, tt.expected)
+				t.Errorf("int8Slice.String() = %q, want %q", got, tt.expected)
 			}
 		})
 	}
 }
 
-func TestProcessMigConfigs(t *testing.T) {
-	plugin := &NvidiaDevicePlugin{}
+func TestGetNumaNode(t *testing.T) {
+	t.Run("error getting PCI info", func(t *testing.T) {
+		dev := &nvmlmock.Device{GetPciInfoFunc: func() (nvml.PciInfo, nvml.Return) {
+			return nvml.PciInfo{}, nvml.ERROR_UNKNOWN
+		}}
+		hasNode, node, err := GetNumaNode(dev)
+		if err == nil || hasNode || node != 0 {
+			t.Fatalf("GetNumaNode() = (%v, %v, %v), want (false, 0, error)", hasNode, node, err)
+		}
+	})
 
+	t.Run("numa node file is absent", func(t *testing.T) {
+		dev := &nvmlmock.Device{GetPciInfoFunc: func() (nvml.PciInfo, nvml.Return) {
+			return nvml.PciInfo{BusId: [32]int8{'0', '0', '0', '0', 'D', 'E', 'A', 'D', ':', 'B', 'E', ':', 'E', 'F', '.', '0'}}, nvml.SUCCESS
+		}}
+		hasNode, node, err := GetNumaNode(dev)
+		if err == nil || hasNode || node != 0 {
+			t.Fatalf("GetNumaNode() = (%v, %v, %v), want (false, 0, error)", hasNode, node, err)
+		}
+	})
+}
+
+func TestGetAPIDevicesErrorsOnNVMLInitFailure(t *testing.T) {
+	originalInit := nvmlInit
+	nvmlInit = func() nvml.Return { return nvml.ERROR_LIBRARY_NOT_FOUND }
+	defer func() { nvmlInit = originalInit }()
+
+	plugin := &NvidiaDevicePlugin{rm: &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices { return rm.Devices{} }}}
+	devices, err := plugin.getAPIDevices()
+	if err == nil {
+		t.Fatal("getAPIDevices did not return an error when NVML initialization failed")
+	}
+	if devices != nil {
+		t.Fatalf("getAPIDevices() = %v on NVML init failure, want nil", devices)
+	}
+}
+
+func TestRegisterInAnnotationPropagatesNVMLInitError(t *testing.T) {
+	originalInit := nvmlInit
+	nvmlInit = func() nvml.Return { return nvml.ERROR_LIBRARY_NOT_FOUND }
+	defer func() { nvmlInit = originalInit }()
+
+	plugin := &NvidiaDevicePlugin{rm: &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices { return rm.Devices{} }}}
+	changed, err := plugin.RegisterInAnnotation()
+	if err == nil {
+		t.Fatal("RegisterInAnnotation did not propagate the NVML init error")
+	}
+	if changed {
+		t.Fatal("RegisterInAnnotation() changed = true on NVML init failure, want false")
+	}
+}
+
+func TestGetAPIDevicesShutsDownAfterNVMLInit(t *testing.T) {
+	originalInit := nvmlInit
+	originalShutdown := nvml.Shutdown
+	nvmlInit = func() nvml.Return { return nvml.SUCCESS }
+	nvml.Shutdown = func() nvml.Return { return nvml.SUCCESS }
+	defer func() {
+		nvmlInit = originalInit
+		nvml.Shutdown = originalShutdown
+	}()
+
+	plugin := &NvidiaDevicePlugin{rm: &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices { return rm.Devices{} }}}
+	devices, err := plugin.getAPIDevices()
+	if err != nil {
+		t.Fatalf("getAPIDevices() returned unexpected error: %v", err)
+	}
+	if devices == nil || len(*devices) != 0 {
+		t.Fatalf("getAPIDevices() = %v, want non-nil empty slice", devices)
+	}
+}
+
+func TestGetAPIDevicesSkipsOnPerDeviceNVMLFailures(t *testing.T) {
+	originalInit := nvmlInit
+	originalShutdown := nvml.Shutdown
+	originalGetHandleByUUID := nvml.DeviceGetHandleByUUID
+	nvmlInit = func() nvml.Return { return nvml.SUCCESS }
+	nvml.Shutdown = func() nvml.Return { return nvml.SUCCESS }
+	defer func() {
+		nvmlInit = originalInit
+		nvml.Shutdown = originalShutdown
+		nvml.DeviceGetHandleByUUID = originalGetHandleByUUID
+	}()
+
+	const testUUID = "GPU-test-uuid"
 	tests := []struct {
-		name           string
-		migConfigs     map[string]nvidia.MigConfigSpecSlice
-		deviceCount    int
-		expectErr      bool
-		expectedLen    int
-		validateResult func(t *testing.T, result nvidia.MigConfigSpecSlice)
+		name            string
+		getHandleReturn nvml.Return
+		device          *nvmlmock.Device
 	}{
 		{
-			name:        "nil migConfigs returns error",
-			migConfigs:  nil,
-			deviceCount: 2,
-			expectErr:   true,
+			name:            "DeviceGetHandleByUUID fails",
+			getHandleReturn: nvml.ERROR_UNINITIALIZED,
+			device:          &nvmlmock.Device{},
 		},
 		{
-			name:        "zero deviceCount returns error",
-			migConfigs:  map[string]nvidia.MigConfigSpecSlice{"current": {}},
-			deviceCount: 0,
-			expectErr:   true,
-		},
-		{
-			name:        "negative deviceCount returns error",
-			migConfigs:  map[string]nvidia.MigConfigSpecSlice{"current": {}},
-			deviceCount: -1,
-			expectErr:   true,
-		},
-		{
-			name: "single config with empty devices expands to all devices",
-			migConfigs: map[string]nvidia.MigConfigSpecSlice{
-				"current": {
-					nvidia.MigConfigSpec{
-						Devices:    []int32{},
-						MigEnabled: true,
-						MigDevices: map[string]int32{"1g.5gb": 7},
-					},
+			name:            "GetIndex fails",
+			getHandleReturn: nvml.SUCCESS,
+			device: &nvmlmock.Device{
+				GetIndexFunc: func() (int, nvml.Return) {
+					return 0, nvml.ERROR_UNKNOWN
 				},
 			},
-			deviceCount: 3,
-			expectErr:   false,
-			expectedLen: 3,
-			validateResult: func(t *testing.T, result nvidia.MigConfigSpecSlice) {
-				for i, cfg := range result {
-					if len(cfg.Devices) != 1 || cfg.Devices[0] != int32(i) {
-						t.Errorf("config[%d].Devices = %v, want [%d]", i, cfg.Devices, i)
-					}
-					if !cfg.MigEnabled {
-						t.Errorf("config[%d].MigEnabled = false, want true", i)
-					}
-					if cfg.MigDevices["1g.5gb"] != 7 {
-						t.Errorf("config[%d].MigDevices[1g.5gb] = %d, want 7", i, cfg.MigDevices["1g.5gb"])
-					}
-				}
+		},
+		{
+			name:            "GetMemoryInfo fails",
+			getHandleReturn: nvml.SUCCESS,
+			device: &nvmlmock.Device{
+				GetIndexFunc: func() (int, nvml.Return) {
+					return 0, nvml.SUCCESS
+				},
+				GetMemoryInfoFunc: func() (nvml.Memory, nvml.Return) {
+					return nvml.Memory{}, nvml.ERROR_UNKNOWN
+				},
 			},
 		},
 		{
-			name: "multiple configs with explicit device mapping",
-			migConfigs: map[string]nvidia.MigConfigSpecSlice{
-				"current": {
-					nvidia.MigConfigSpec{
-						Devices:    []int32{0, 1},
-						MigEnabled: true,
-						MigDevices: map[string]int32{"1g.5gb": 7},
-					},
-					nvidia.MigConfigSpec{
-						Devices:    []int32{2},
-						MigEnabled: true,
-						MigDevices: map[string]int32{"2g.10gb": 3},
-					},
+			name:            "GetName fails",
+			getHandleReturn: nvml.SUCCESS,
+			device: &nvmlmock.Device{
+				GetIndexFunc: func() (int, nvml.Return) {
+					return 0, nvml.SUCCESS
 				},
-			},
-			deviceCount: 3,
-			expectErr:   false,
-			expectedLen: 3,
-			validateResult: func(t *testing.T, result nvidia.MigConfigSpecSlice) {
-				// Device 0 should get 1g.5gb config
-				if result[0].MigDevices["1g.5gb"] != 7 {
-					t.Errorf("device 0: MigDevices[1g.5gb] = %d, want 7", result[0].MigDevices["1g.5gb"])
-				}
-				if len(result[0].Devices) != 1 || result[0].Devices[0] != 0 {
-					t.Errorf("device 0: Devices = %v, want [0]", result[0].Devices)
-				}
-				// Device 1 should get 1g.5gb config
-				if result[1].MigDevices["1g.5gb"] != 7 {
-					t.Errorf("device 1: MigDevices[1g.5gb] = %d, want 7", result[1].MigDevices["1g.5gb"])
-				}
-				// Device 2 should get 2g.10gb config
-				if result[2].MigDevices["2g.10gb"] != 3 {
-					t.Errorf("device 2: MigDevices[2g.10gb] = %d, want 3", result[2].MigDevices["2g.10gb"])
-				}
-			},
-		},
-		{
-			name: "device not found in config returns error",
-			migConfigs: map[string]nvidia.MigConfigSpecSlice{
-				"current": {
-					nvidia.MigConfigSpec{
-						Devices:    []int32{0},
-						MigEnabled: true,
-						MigDevices: map[string]int32{"1g.5gb": 7},
-					},
+				GetMemoryInfoFunc: func() (nvml.Memory, nvml.Return) {
+					return nvml.Memory{Total: 8 * 1024 * 1024 * 1024}, nvml.SUCCESS
 				},
-			},
-			deviceCount: 3,
-			expectErr:   true,
-		},
-		{
-			name: "single device single config",
-			migConfigs: map[string]nvidia.MigConfigSpecSlice{
-				"current": {
-					nvidia.MigConfigSpec{
-						Devices:    []int32{0},
-						MigEnabled: false,
-						MigDevices: map[string]int32{},
-					},
+				GetNameFunc: func() (string, nvml.Return) {
+					return "", nvml.ERROR_UNKNOWN
 				},
-			},
-			deviceCount: 1,
-			expectErr:   false,
-			expectedLen: 1,
-			validateResult: func(t *testing.T, result nvidia.MigConfigSpecSlice) {
-				if result[0].MigEnabled {
-					t.Error("config[0].MigEnabled = true, want false")
-				}
-				if len(result[0].Devices) != 1 || result[0].Devices[0] != 0 {
-					t.Errorf("config[0].Devices = %v, want [0]", result[0].Devices)
-				}
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := plugin.processMigConfigs(tt.migConfigs, tt.deviceCount)
-			if tt.expectErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
+			nvml.DeviceGetHandleByUUID = func(uuid string) (nvml.Device, nvml.Return) {
+				return tt.device, tt.getHandleReturn
 			}
+			plugin := &NvidiaDevicePlugin{rm: &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices {
+				return rm.Devices{testUUID: &rm.Device{}}
+			}}}
+			devices, err := plugin.getAPIDevices()
 			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+				t.Fatalf("getAPIDevices returned unexpected error on per-device failure: %v", err)
 			}
-			if len(result) != tt.expectedLen {
-				t.Fatalf("result length = %d, want %d", len(result), tt.expectedLen)
-			}
-			if tt.validateResult != nil {
-				tt.validateResult(t, result)
+			if devices == nil || len(*devices) != 0 {
+				t.Fatalf("getAPIDevices() = %v on per-device NVML failure, want empty list", devices)
 			}
 		})
+	}
+}
+
+func TestGetAPIDevicesRegistersHealthyDevice(t *testing.T) {
+	originalInit := nvmlInit
+	originalShutdown := nvml.Shutdown
+	originalGetHandleByUUID := nvml.DeviceGetHandleByUUID
+	nvmlInit = func() nvml.Return { return nvml.SUCCESS }
+	nvml.Shutdown = func() nvml.Return { return nvml.SUCCESS }
+	nvml.DeviceGetHandleByUUID = func(uuid string) (nvml.Device, nvml.Return) {
+		return &nvmlmock.Device{
+			GetIndexFunc: func() (int, nvml.Return) {
+				return 3, nvml.SUCCESS
+			},
+			GetMemoryInfoFunc: func() (nvml.Memory, nvml.Return) {
+				return nvml.Memory{Total: 8 * 1024 * 1024 * 1024}, nvml.SUCCESS
+			},
+			GetNameFunc: func() (string, nvml.Return) {
+				return "Tesla T4", nvml.SUCCESS
+			},
+			GetPciInfoFunc: func() (nvml.PciInfo, nvml.Return) {
+				return nvml.PciInfo{}, nvml.ERROR_UNKNOWN
+			},
+		}, nvml.SUCCESS
+	}
+	defer func() {
+		nvmlInit = originalInit
+		nvml.Shutdown = originalShutdown
+		nvml.DeviceGetHandleByUUID = originalGetHandleByUUID
+	}()
+
+	const testUUID = "GPU-test-uuid"
+	plugin := &NvidiaDevicePlugin{
+		rm: &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices {
+			return rm.Devices{testUUID: &rm.Device{Device: kubeletdevicepluginv1beta1.Device{ID: testUUID, Health: "healthy"}}}
+		}},
+		schedulerConfig: nvidia.NvidiaConfig{
+			NodeDefaultConfig: nvidia.NodeDefaultConfig{
+				DeviceSplitCount:    ptr[uint](2),
+				DeviceMemoryScaling: ptr[float64](1),
+				DeviceCoreScaling:   ptr[float64](1),
+			},
+		},
+	}
+	devices, err := plugin.getAPIDevices()
+	if err != nil {
+		t.Fatalf("getAPIDevices() returned unexpected error: %v", err)
+	}
+	if devices == nil || len(*devices) != 1 {
+		t.Fatalf("getAPIDevices() = %v, want exactly one device", devices)
+	}
+	got := (*devices)[0]
+	wantDevmem := int64(8 * 1024)
+	if got.ID != testUUID || got.Index != 3 || got.Count != 2 ||
+		got.Devmem != wantDevmem || got.Devcore != 100 ||
+		got.Type != "NVIDIA-Tesla T4" || !got.Health {
+		t.Fatalf("getAPIDevices()[0] = %+v, mismatched device info", got)
 	}
 }
 
@@ -245,10 +315,14 @@ func TestWatchAndRegisterDisableSignal(t *testing.T) {
 
 	// Create a minimal plugin - WatchAndRegister will read the disable signal
 	// and send an ack, then sleep. We verify the ack arrives.
-	plugin := &NvidiaDevicePlugin{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	plugin := &NvidiaDevicePlugin{ctx: ctx}
+	exited := make(chan struct{})
 
 	done := make(chan struct{})
 	go func() {
+		defer close(exited)
 		plugin.WatchAndRegister(disableCh, ackCh)
 	}()
 
@@ -264,9 +338,164 @@ func TestWatchAndRegisterDisableSignal(t *testing.T) {
 	// Use a select with timeout to avoid hanging forever
 	select {
 	case <-done:
-		// Success: received the ack
+		cancel()
+		select {
+		case <-exited:
+		case <-time.After(time.Second):
+			t.Fatal("WatchAndRegister did not stop during its sleep")
+		}
 	case <-timeAfter(3 * time.Second):
 		t.Fatal("timed out waiting for disable ack from WatchAndRegister")
+	}
+}
+
+// TestRegisterInAnnotationUpdatesCacheOnSuccessfulPatch verifies the happy
+// path: once PatchNodeAnnotations succeeds, deviceCache is updated to the
+// newly patched value and the call reports changed=true with no error.
+func TestRegisterInAnnotationUpdatesCacheOnSuccessfulPatch(t *testing.T) {
+	originalInit := nvmlInit
+	originalShutdown := nvml.Shutdown
+	nvmlInit = func() nvml.Return { return nvml.SUCCESS }
+	nvml.Shutdown = func() nvml.Return { return nvml.SUCCESS }
+	defer func() {
+		nvmlInit = originalInit
+		nvml.Shutdown = originalShutdown
+	}()
+
+	previousKubeClient := client.KubeClient
+	previousNodeName := util.NodeName
+	util.NodeName = "test-node"
+	defer func() {
+		client.KubeClient = previousKubeClient
+		util.NodeName = previousNodeName
+	}()
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	client.KubeClient = fake.NewSimpleClientset(node)
+
+	plugin := &NvidiaDevicePlugin{rm: &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices { return rm.Devices{} }}}
+
+	changed, err := plugin.RegisterInAnnotation()
+	if err != nil {
+		t.Fatalf("RegisterInAnnotation() error = %v, want nil on a successful patch", err)
+	}
+	if !changed {
+		t.Fatal("RegisterInAnnotation() changed = false, want true (a patch was applied)")
+	}
+	if plugin.deviceCache == "" {
+		t.Fatal("deviceCache is empty after a successful patch, want it set to the patched device string")
+	}
+
+	// A second call with the same device set must now see deviceCache as
+	// up to date and skip re-patching.
+	changed, err = plugin.RegisterInAnnotation()
+	if err != nil {
+		t.Fatalf("second RegisterInAnnotation() error = %v, want nil", err)
+	}
+	if changed {
+		t.Fatal("second RegisterInAnnotation() changed = true, want false (device info unchanged, patch should be skipped)")
+	}
+}
+
+// TestRegisterInAnnotationRetriesAfterPatchFailure verifies that a failed
+// node-annotation patch does not poison deviceCache: the next call must
+// still see the device info as "changed" and retry the patch, instead of
+// silently early-returning forever because deviceCache already matches.
+func TestRegisterInAnnotationRetriesAfterPatchFailure(t *testing.T) {
+	originalInit := nvmlInit
+	originalShutdown := nvml.Shutdown
+	nvmlInit = func() nvml.Return { return nvml.SUCCESS }
+	nvml.Shutdown = func() nvml.Return { return nvml.SUCCESS }
+	defer func() {
+		nvmlInit = originalInit
+		nvml.Shutdown = originalShutdown
+	}()
+
+	previousKubeClient := client.KubeClient
+	previousNodeName := util.NodeName
+	util.NodeName = "test-node"
+	defer func() {
+		client.KubeClient = previousKubeClient
+		util.NodeName = previousNodeName
+	}()
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	fakeClient := fake.NewSimpleClientset(node)
+	fakeClient.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("simulated patch failure")
+	})
+	client.KubeClient = fakeClient
+
+	plugin := &NvidiaDevicePlugin{rm: &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices { return rm.Devices{} }}}
+
+	changed, err := plugin.RegisterInAnnotation()
+	if err == nil {
+		t.Fatal("RegisterInAnnotation() error = nil, want error from failed patch")
+	}
+	if !changed {
+		t.Fatal("RegisterInAnnotation() changed = false, want true (a patch was attempted)")
+	}
+	if plugin.deviceCache != "" {
+		t.Fatalf("deviceCache = %q after a failed patch, want unchanged (empty)", plugin.deviceCache)
+	}
+
+	// A second call with the same device set must retry the patch (and
+	// surface the same error) rather than treating deviceCache as already
+	// up to date.
+	changed, err = plugin.RegisterInAnnotation()
+	if err == nil {
+		t.Fatal("second RegisterInAnnotation() error = nil, want the retry to also surface the patch failure")
+	}
+	if !changed {
+		t.Fatal("second RegisterInAnnotation() changed = false, want true (patch should be retried, not skipped)")
+	}
+}
+
+// TestRegisterInAnnotationDoesNotPoisonCacheOnScoreError verifies that a
+// failure computing the topology score (ENABLE_TOPOLOGY_SCORE=true) does not
+// poison deviceCache either: the cache is only written after every step,
+// including score calculation, completes successfully - matching the
+// patch-failure behavior verified above.
+func TestRegisterInAnnotationDoesNotPoisonCacheOnScoreError(t *testing.T) {
+	originalInit := nvmlInit
+	originalShutdown := nvml.Shutdown
+	nvmlInit = func() nvml.Return { return nvml.SUCCESS }
+	nvml.Shutdown = func() nvml.Return { return nvml.SUCCESS }
+	defer func() {
+		nvmlInit = originalInit
+		nvml.Shutdown = originalShutdown
+	}()
+
+	originalCalculateGPUScore := calculateGPUScore
+	calculateGPUScore = func([]string) (nvidia.ListDeviceScore, bool, error) {
+		return nil, false, fmt.Errorf("simulated topology score failure")
+	}
+	defer func() { calculateGPUScore = originalCalculateGPUScore }()
+
+	t.Setenv("ENABLE_TOPOLOGY_SCORE", "true")
+
+	previousKubeClient := client.KubeClient
+	previousNodeName := util.NodeName
+	util.NodeName = "test-node"
+	defer func() {
+		client.KubeClient = previousKubeClient
+		util.NodeName = previousNodeName
+	}()
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	client.KubeClient = fake.NewSimpleClientset(node)
+
+	plugin := &NvidiaDevicePlugin{rm: &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices { return rm.Devices{} }}}
+
+	changed, err := plugin.RegisterInAnnotation()
+	if err == nil {
+		t.Fatal("RegisterInAnnotation() error = nil, want error from failed score calculation")
+	}
+	if changed {
+		t.Fatal("RegisterInAnnotation() changed = true, want false (no patch was attempted)")
+	}
+	if plugin.deviceCache != "" {
+		t.Fatalf("deviceCache = %q after a failed score calculation, want unchanged (empty)", plugin.deviceCache)
 	}
 }
 
@@ -278,4 +507,340 @@ func timeAfter(d time.Duration) <-chan struct{} {
 		close(ch)
 	}()
 	return ch
+}
+
+func TestRegisterInAnnotationReportNodeCapacity(t *testing.T) {
+	previousKubeClient := client.KubeClient
+	previousNodeName := util.NodeName
+	t.Cleanup(func() {
+		client.KubeClient = previousKubeClient
+		util.NodeName = previousNodeName
+	})
+
+	fakeClient := fake.NewClientset()
+	client.KubeClient = fakeClient
+
+	nodeName := "node-test-capacity"
+	util.NodeName = nodeName
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+	}
+	_, err := fakeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create fake node: %v", err)
+	}
+
+	mockRM := &rm.ResourceManagerMock{
+		DevicesFunc: func() rm.Devices {
+			return rm.Devices{
+				"GPU-1111": &rm.Device{Device: kubeletdevicepluginv1beta1.Device{ID: "GPU-1111", Health: "Healthy"}},
+			}
+		},
+	}
+
+	originalInit := nvmlInit
+	originalShutdown := nvml.Shutdown
+	nvmlInit = func() nvml.Return { return nvml.SUCCESS }
+	nvml.Shutdown = func() nvml.Return { return nvml.SUCCESS }
+	defer func() {
+		nvmlInit = originalInit
+		nvml.Shutdown = originalShutdown
+	}()
+
+	mockDev := &nvmlmock.Device{
+		GetIndexFunc: func() (int, nvml.Return) { return 0, nvml.SUCCESS },
+		GetMemoryInfoFunc: func() (nvml.Memory, nvml.Return) {
+			return nvml.Memory{Total: 32768 * 1024 * 1024}, nvml.SUCCESS
+		},
+		GetNameFunc: func() (string, nvml.Return) { return "NVIDIA A100", nvml.SUCCESS },
+		GetPciInfoFunc: func() (nvml.PciInfo, nvml.Return) {
+			return nvml.PciInfo{BusId: [32]int8{'0', '0', '0', '0', ':', '0', '0', ':', '0', '0', '.', '0'}}, nvml.SUCCESS
+		},
+	}
+
+	originalGetHandle := nvml.DeviceGetHandleByUUID
+	nvml.DeviceGetHandleByUUID = func(uuid string) (nvml.Device, nvml.Return) {
+		return mockDev, nvml.SUCCESS
+	}
+	defer func() { nvml.DeviceGetHandleByUUID = originalGetHandle }()
+
+	splitCount := uint(2)
+	coreScaling := 1.0
+	memScaling := 1.0
+	reportCap := true
+	plugin := &NvidiaDevicePlugin{
+		rm: mockRM,
+		schedulerConfig: nvidia.NvidiaConfig{
+			ResourceMemoryName: "nvidia.com/gpumem",
+			ResourceCoreName:   "nvidia.com/gpucores",
+			NodeDefaultConfig: nvidia.NodeDefaultConfig{
+				DeviceSplitCount:    &splitCount,
+				DeviceCoreScaling:   &coreScaling,
+				DeviceMemoryScaling: &memScaling,
+				ReportNodeCapacity:  &reportCap,
+			},
+		},
+	}
+
+	changed, err := plugin.RegisterInAnnotation()
+	if err != nil {
+		t.Fatalf("RegisterInAnnotation() error = %v", err)
+	}
+	if !changed {
+		t.Fatalf("RegisterInAnnotation() changed = false, want true")
+	}
+
+	updatedNode, err := fakeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get updated node: %v", err)
+	}
+
+	gpuMem := updatedNode.Status.Capacity["nvidia.com/gpumem"]
+	if gpuMem.Value() != 32768 {
+		t.Errorf("nvidia.com/gpumem capacity = %v, want 32768", gpuMem.Value())
+	}
+	gpuCores := updatedNode.Status.Capacity["nvidia.com/gpucores"]
+	if gpuCores.Value() != 100 {
+		t.Errorf("nvidia.com/gpucores capacity = %v, want 100", gpuCores.Value())
+	}
+}
+
+func TestRegisterInAnnotationReportNodeCapacityAllUnhealthy(t *testing.T) {
+	previousKubeClient := client.KubeClient
+	previousNodeName := util.NodeName
+	t.Cleanup(func() {
+		client.KubeClient = previousKubeClient
+		util.NodeName = previousNodeName
+	})
+
+	fakeClient := fake.NewClientset()
+	client.KubeClient = fakeClient
+
+	nodeName := "node-test-capacity-unhealthy"
+	util.NodeName = nodeName
+
+	// Node starts with stale positive capacity/allocatable from a prior healthy scan.
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+		Status: corev1.NodeStatus{
+			Capacity: corev1.ResourceList{
+				"nvidia.com/gpumem":   *resource.NewQuantity(32768, resource.DecimalSI),
+				"nvidia.com/gpucores": *resource.NewQuantity(100, resource.DecimalSI),
+			},
+			Allocatable: corev1.ResourceList{
+				"nvidia.com/gpumem":   *resource.NewQuantity(32768, resource.DecimalSI),
+				"nvidia.com/gpucores": *resource.NewQuantity(100, resource.DecimalSI),
+			},
+		},
+	}
+	_, err := fakeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create fake node: %v", err)
+	}
+
+	mockRM := &rm.ResourceManagerMock{
+		DevicesFunc: func() rm.Devices {
+			return rm.Devices{
+				"GPU-1111": &rm.Device{Device: kubeletdevicepluginv1beta1.Device{ID: "GPU-1111", Health: "Unhealthy"}},
+			}
+		},
+	}
+
+	originalInit := nvmlInit
+	originalShutdown := nvml.Shutdown
+	nvmlInit = func() nvml.Return { return nvml.SUCCESS }
+	nvml.Shutdown = func() nvml.Return { return nvml.SUCCESS }
+	defer func() {
+		nvmlInit = originalInit
+		nvml.Shutdown = originalShutdown
+	}()
+
+	mockDev := &nvmlmock.Device{
+		GetIndexFunc: func() (int, nvml.Return) { return 0, nvml.SUCCESS },
+		GetMemoryInfoFunc: func() (nvml.Memory, nvml.Return) {
+			return nvml.Memory{Total: 32768 * 1024 * 1024}, nvml.SUCCESS
+		},
+		GetNameFunc: func() (string, nvml.Return) { return "NVIDIA A100", nvml.SUCCESS },
+		GetPciInfoFunc: func() (nvml.PciInfo, nvml.Return) {
+			return nvml.PciInfo{BusId: [32]int8{'0', '0', '0', '0', ':', '0', '0', ':', '0', '0', '.', '0'}}, nvml.SUCCESS
+		},
+	}
+
+	originalGetHandle := nvml.DeviceGetHandleByUUID
+	nvml.DeviceGetHandleByUUID = func(uuid string) (nvml.Device, nvml.Return) {
+		return mockDev, nvml.SUCCESS
+	}
+	defer func() { nvml.DeviceGetHandleByUUID = originalGetHandle }()
+
+	splitCount := uint(2)
+	coreScaling := 1.0
+	memScaling := 1.0
+	reportCap := true
+	plugin := &NvidiaDevicePlugin{
+		rm: mockRM,
+		schedulerConfig: nvidia.NvidiaConfig{
+			ResourceMemoryName: "nvidia.com/gpumem",
+			ResourceCoreName:   "nvidia.com/gpucores",
+			NodeDefaultConfig: nvidia.NodeDefaultConfig{
+				DeviceSplitCount:    &splitCount,
+				DeviceCoreScaling:   &coreScaling,
+				DeviceMemoryScaling: &memScaling,
+				ReportNodeCapacity:  &reportCap,
+			},
+		},
+	}
+
+	if _, err := plugin.RegisterInAnnotation(); err != nil {
+		t.Fatalf("RegisterInAnnotation() error = %v", err)
+	}
+
+	updatedNode, err := fakeClient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get updated node: %v", err)
+	}
+
+	gpuMem := updatedNode.Status.Capacity["nvidia.com/gpumem"]
+	if gpuMem.Value() != 0 {
+		t.Errorf("nvidia.com/gpumem capacity = %v, want 0 once all devices are unhealthy", gpuMem.Value())
+	}
+	gpuCores := updatedNode.Status.Capacity["nvidia.com/gpucores"]
+	if gpuCores.Value() != 0 {
+		t.Errorf("nvidia.com/gpucores capacity = %v, want 0 once all devices are unhealthy", gpuCores.Value())
+	}
+	allocMem := updatedNode.Status.Allocatable["nvidia.com/gpumem"]
+	if allocMem.Value() != 0 {
+		t.Errorf("nvidia.com/gpumem allocatable = %v, want 0 once all devices are unhealthy", allocMem.Value())
+	}
+	allocCores := updatedNode.Status.Allocatable["nvidia.com/gpucores"]
+	if allocCores.Value() != 0 {
+		t.Errorf("nvidia.com/gpucores allocatable = %v, want 0 once all devices are unhealthy", allocCores.Value())
+	}
+}
+
+// TestRegisterInAnnotationReportNodeCapacityDefaultsAndPatchError covers the
+// default resource-name fallback (ResourceMemoryName/ResourceCoreName unset)
+// and the patch-error path, which is logged but does not fail registration.
+func TestRegisterInAnnotationReportNodeCapacityDefaultsAndPatchError(t *testing.T) {
+	previousKubeClient := client.KubeClient
+	previousNodeName := util.NodeName
+	t.Cleanup(func() {
+		client.KubeClient = previousKubeClient
+		util.NodeName = previousNodeName
+	})
+
+	fakeClient := fake.NewClientset()
+	client.KubeClient = fakeClient
+
+	nodeName := "node-test-capacity-defaults"
+	util.NodeName = nodeName
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+	}
+	_, err := fakeClient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create fake node: %v", err)
+	}
+
+	var statusPatchBody []byte
+	fakeClient.PrependReactor("patch", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		patchAction, ok := action.(k8stesting.PatchAction)
+		if !ok || patchAction.GetSubresource() != "status" {
+			return false, nil, nil
+		}
+		statusPatchBody = patchAction.GetPatch()
+		return true, nil, fmt.Errorf("simulated patch failure")
+	})
+
+	mockRM := &rm.ResourceManagerMock{
+		DevicesFunc: func() rm.Devices {
+			return rm.Devices{
+				"GPU-1111": &rm.Device{Device: kubeletdevicepluginv1beta1.Device{ID: "GPU-1111", Health: "Healthy"}},
+			}
+		},
+	}
+
+	originalInit := nvmlInit
+	originalShutdown := nvml.Shutdown
+	nvmlInit = func() nvml.Return { return nvml.SUCCESS }
+	nvml.Shutdown = func() nvml.Return { return nvml.SUCCESS }
+	defer func() {
+		nvmlInit = originalInit
+		nvml.Shutdown = originalShutdown
+	}()
+
+	mockDev := &nvmlmock.Device{
+		GetIndexFunc: func() (int, nvml.Return) { return 0, nvml.SUCCESS },
+		GetMemoryInfoFunc: func() (nvml.Memory, nvml.Return) {
+			return nvml.Memory{Total: 32768 * 1024 * 1024}, nvml.SUCCESS
+		},
+		GetNameFunc: func() (string, nvml.Return) { return "NVIDIA A100", nvml.SUCCESS },
+		GetPciInfoFunc: func() (nvml.PciInfo, nvml.Return) {
+			return nvml.PciInfo{BusId: [32]int8{'0', '0', '0', '0', ':', '0', '0', ':', '0', '0', '.', '0'}}, nvml.SUCCESS
+		},
+	}
+
+	originalGetHandle := nvml.DeviceGetHandleByUUID
+	nvml.DeviceGetHandleByUUID = func(uuid string) (nvml.Device, nvml.Return) {
+		return mockDev, nvml.SUCCESS
+	}
+	defer func() { nvml.DeviceGetHandleByUUID = originalGetHandle }()
+
+	splitCount := uint(2)
+	coreScaling := 1.0
+	memScaling := 1.0
+	reportCap := true
+	plugin := &NvidiaDevicePlugin{
+		rm: mockRM,
+		schedulerConfig: nvidia.NvidiaConfig{
+			// ResourceMemoryName and ResourceCoreName left unset to exercise
+			// the "nvidia.com/gpumem"/"nvidia.com/gpucores" fallback defaults.
+			NodeDefaultConfig: nvidia.NodeDefaultConfig{
+				DeviceSplitCount:    &splitCount,
+				DeviceCoreScaling:   &coreScaling,
+				DeviceMemoryScaling: &memScaling,
+				ReportNodeCapacity:  &reportCap,
+			},
+		},
+	}
+
+	// A failed capacity patch is logged, not propagated: registration itself
+	// must still succeed.
+	if _, err := plugin.RegisterInAnnotation(); err != nil {
+		t.Fatalf("RegisterInAnnotation() error = %v, want nil (patch errors are logged, not returned)", err)
+	}
+
+	if statusPatchBody == nil {
+		t.Fatal("status patch was never attempted")
+	}
+	for _, name := range []string{"nvidia.com/gpumem", "nvidia.com/gpucores"} {
+		if !bytes.Contains(statusPatchBody, []byte(name)) {
+			t.Errorf("status patch body = %s, want it to contain fallback resource name %q", statusPatchBody, name)
+		}
+	}
+}
+
+// Remote Start deliberately leaves the MIG manager inactive. Registration and
+// topology queries must still use the standalone NVML path.
+func TestRemoteRegistrationWithInactiveMIGManager(t *testing.T) {
+	originalInit, originalScore := nvmlInit, calculateGPUScore
+	t.Cleanup(func() { nvmlInit, calculateGPUScore = originalInit, originalScore })
+	initialized := false
+	nvmlInit = func() nvml.Return { initialized = true; return nvml.ERROR_LIBRARY_NOT_FOUND }
+	plugin := &NvidiaDevicePlugin{
+		operatingMode: nvidia.RemoteMode,
+		migMgr:        &MigInstanceManager{},
+		rm:            &rm.ResourceManagerMock{DevicesFunc: func() rm.Devices { return rm.Devices{} }},
+	}
+	_, err := plugin.getAPIDevices()
+	if !initialized || err == nil {
+		t.Fatalf("remote registration must initialize NVML independently: called=%v, err=%v", initialized, err)
+	}
+	scored := false
+	calculateGPUScore = func(available []string) (nvidia.ListDeviceScore, bool, error) { scored = true; return nil, false, nil }
+	_, _, err = plugin.topologyScore(nil)
+	if !scored || err != nil {
+		t.Fatalf("remote topology must not use an inactive MIG session: called=%v, err=%v", scored, err)
+	}
 }

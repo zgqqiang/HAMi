@@ -20,9 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"sort"
-	"strings"
 	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
@@ -31,76 +28,32 @@ import (
 	"github.com/Project-HAMi/HAMi/pkg/monitor/nvidia"
 )
 
-var cgroupDriver int
 var errTemporaryClosed = errors.New("temporary closed")
+
+// feedbackInterval is how often watchAndFeedback checks the lupine label and
+// refreshes NVML. Tests shorten it.
+var feedbackInterval = 5 * time.Second
 
 //type hostGPUPid struct {
 //	hostGPUPid int
 //	mtime      uint64
 //}
 
-type UtilizationPerDevice []int
-
-func setcGgroupDriver() int {
-	// 1 for cgroupfs 2 for systemd
-	kubeletconfig, err := os.ReadFile("/hostvar/lib/kubelet/config.yaml")
-	if err != nil {
-		return 0
-	}
-	content := string(kubeletconfig)
-	pos := strings.LastIndex(content, "cgroupDriver:")
-	if pos < 0 {
-		return 0
-	}
-	if strings.Contains(content, "systemd") {
-		return 2
-	}
-	if strings.Contains(content, "cgroupfs") {
-		return 1
-	}
-	return 0
-}
-
-func getUsedGPUPid() ([]uint, nvml.Return) {
-	tmp := []nvml.ProcessInfo{}
-	count, err := nvml.DeviceGetCount()
-	if err != nvml.SUCCESS {
-		return []uint{}, err
-	}
-	for i := range count {
-		device, err := nvml.DeviceGetHandleByIndex(i)
-		if err != nvml.SUCCESS {
-			return []uint{}, err
-		}
-		ids, err := device.GetComputeRunningProcesses()
-		if err != nvml.SUCCESS {
-			return []uint{}, err
-		}
-		tmp = append(tmp, ids...)
-	}
-	result := make([]uint, 0)
-	m := make(map[uint]bool)
-	for _, v := range tmp {
-		if _, ok := m[uint(v.Pid)]; !ok {
-			result = append(result, uint(v.Pid))
-			m[uint(v.Pid)] = true
-		}
-	}
-	sort.Slice(tmp, func(i, j int) bool { return tmp[i].Pid > tmp[j].Pid })
-	return result, nvml.SUCCESS
-}
+// UtilizationPerDevice counts the containers running on one device, grouped by
+// task priority. The priority is keyed rather than used as a slice index: it is
+// read from the shared memory region the device plugin mounts into the
+// container read-write, so it can be any int32 and must never size an
+// allocation. Keying also keeps every priority class distinct, which is what
+// the checks below compare.
+type UtilizationPerDevice map[int]int
 
 func CheckBlocking(utSwitchOn map[string]UtilizationPerDevice, p int, c *nvidia.ContainerUsage) bool {
 	for i := range c.Info.DeviceMax() {
 		uuid := c.Info.DeviceUUID(i)
-		_, ok := utSwitchOn[uuid]
-		if ok {
-			for i := range min(p, len(utSwitchOn[uuid])) {
-				if utSwitchOn[uuid][i] > 0 {
-					return true
-				}
+		for priority, count := range utSwitchOn[uuid] {
+			if priority < p && count > 0 {
+				return true
 			}
-			return false
 		}
 	}
 	return false
@@ -110,14 +63,14 @@ func CheckBlocking(utSwitchOn map[string]UtilizationPerDevice, p int, c *nvidia.
 func CheckPriority(utSwitchOn map[string]UtilizationPerDevice, p int, c *nvidia.ContainerUsage) bool {
 	for i := range c.Info.DeviceMax() {
 		uuid := c.Info.DeviceUUID(i)
-		_, ok := utSwitchOn[uuid]
+		counts, ok := utSwitchOn[uuid]
 		if ok {
-			for i := range min(p, len(utSwitchOn[uuid])) {
-				if utSwitchOn[uuid][i] > 0 {
+			for priority, count := range counts {
+				if priority < p && count > 0 {
 					return true
 				}
 			}
-			if p >= 0 && p < len(utSwitchOn[uuid]) && utSwitchOn[uuid][p] > 1 {
+			if counts[p] > 1 {
 				return true
 			}
 		}
@@ -125,7 +78,13 @@ func CheckPriority(utSwitchOn map[string]UtilizationPerDevice, p int, c *nvidia.
 	return false
 }
 
+// Observe reads utilization and writes feedback while holding the lister lock to keep mmap
+// pointers valid.
 func Observe(lister *nvidia.ContainerLister) {
+	// Info points into mmap memory. Hold the same lock as Update, Close and
+	// metrics collection through both the reads and the feedback writes.
+	lister.Lock()
+	defer lister.UnLock()
 	utSwitchOn := map[string]UtilizationPerDevice{}
 	containers := lister.ListContainers()
 
@@ -145,8 +104,8 @@ func Observe(lister *nvidia.ContainerLister) {
 					if p < 0 {
 						continue
 					}
-					for p >= len(utSwitchOn[uuid]) {
-						utSwitchOn[uuid] = append(utSwitchOn[uuid], 0)
+					if utSwitchOn[uuid] == nil {
+						utSwitchOn[uuid] = UtilizationPerDevice{}
 					}
 					utSwitchOn[uuid][p]++
 				}
@@ -187,14 +146,25 @@ func Observe(lister *nvidia.ContainerLister) {
 	}
 }
 
-func watchAndFeedback(ctx context.Context, lister *nvidia.ContainerLister, migLockSignal <-chan bool) error {
+func watchAndFeedback(ctx context.Context, lister *nvidia.ContainerLister, migLockSignal <-chan struct{}, lockExistFn func() bool) error {
 	klog.Info("Starting watchAndFeedback")
-	if nvret := nvml.Init(); nvret != nvml.SUCCESS {
-		return fmt.Errorf("failed to initialize NVML: %s", nvml.ErrorString(nvret))
+	var nvmlOn bool
+	shutdownNVML := func() {
+		if !nvmlOn {
+			return
+		}
+		nvml.Shutdown()
+		nvmlOn = false
 	}
-	defer nvml.Shutdown()
+	defer shutdownNVML()
 
-	ticker := time.NewTicker(time.Second * 5)
+	// Catches a lock already held on restart, mid-apply.
+	if lockExistFn() {
+		klog.Info("MIG apply lock file already present")
+		return errTemporaryClosed
+	}
+
+	ticker := time.NewTicker(feedbackInterval)
 	defer ticker.Stop()
 
 	for {
@@ -202,13 +172,30 @@ func watchAndFeedback(ctx context.Context, lister *nvidia.ContainerLister, migLo
 		case <-ctx.Done():
 			klog.Info("Shutting down watchAndFeedback")
 			return nil
-		case signal := <-migLockSignal:
-			if signal {
+		case _, ok := <-migLockSignal:
+			if !ok {
+				klog.Info("MIG apply lock watcher closed")
+				return nil
+			}
+			if lockExistFn() {
 				klog.Info("Received MIG apply lock file")
 				return errTemporaryClosed
 			}
 
 		case <-ticker.C:
+			// A chart-managed lupine server's local NVML view has no remote
+			// client attribution. Publishing that partial picture is worse
+			// than publishing nothing, so drop NVML until the label goes away.
+			if lister.OnLupineServer(ctx) {
+				shutdownNVML()
+				continue
+			}
+			if !nvmlOn {
+				if nvret := nvml.Init(); nvret != nvml.SUCCESS {
+					return fmt.Errorf("failed to initialize NVML: %s", nvml.ErrorString(nvret))
+				}
+				nvmlOn = true
+			}
 			if err := lister.Update(); err != nil {
 				klog.Errorf("Failed to update container list: %v", err)
 				continue

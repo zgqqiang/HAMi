@@ -17,6 +17,7 @@ limitations under the License.
 package nvidia
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/Project-HAMi/HAMi/pkg/device/remotegpu"
 	v0 "github.com/Project-HAMi/HAMi/pkg/monitor/nvidia/v0"
 	v1 "github.com/Project-HAMi/HAMi/pkg/monitor/nvidia/v1"
 	"github.com/Project-HAMi/HAMi/pkg/util"
@@ -78,6 +80,8 @@ type ContainerUsage struct {
 	ContainerName string
 	data          []byte
 	Info          UsageInfo
+	cacheFilePath string
+	cacheFileInfo os.FileInfo
 }
 
 type ContainerLister struct {
@@ -87,15 +91,27 @@ type ContainerLister struct {
 	clientset     *kubernetes.Clientset
 	nodeName      string
 
+	// wholeGPU holds the whole-GPU reconciliation state; nil unless
+	// wholeGPUDisableHAMiCore is set.
+	wholeGPU *wholeGPUState
+
 	// Fields for the informer-based pod cache mechanism
 	informerFactory informers.SharedInformerFactory
 	podInformer     cache.SharedIndexInformer
 	podLister       corelisters.PodLister
 	podListerSynced cache.InformerSynced
 	stopCh          chan struct{}
+	closeOnce       sync.Once
+
+	// lupineServer, when set, replaces the node API lookup. Tests use it.
+	lupineServer func(context.Context) (bool, error)
+	lupineMu     sync.Mutex
+	lupineOn     bool
+	lupineAt     time.Time
+	lupineKnown  bool
 }
 
-var resyncInterval time.Duration = 5 * time.Minute
+var resyncInterval = 5 * time.Minute
 
 func init() {
 	if os.Getenv("HAMI_RESYNC_INTERVAL") != "" {
@@ -108,6 +124,8 @@ func init() {
 	}
 }
 
+// NewContainerLister constructs the monitor mapping owner and starts its node Pod informer. Call
+// Close on shutdown.
 func NewContainerLister() (*ContainerLister, error) {
 	hookPath, ok := os.LookupEnv("HOOK_PATH")
 	if !ok {
@@ -129,8 +147,16 @@ func NewContainerLister() (*ContainerLister, error) {
 		return nil, fmt.Errorf("env %s not set", util.NodeNameEnvName)
 	}
 
+	containerPath := os.Getenv("HAMI_VGPU_CACHE_ROOT")
+	if containerPath == "" {
+		containerPath = filepath.Join(hookPath, "containers")
+	}
+	containerPath = filepath.Clean(containerPath)
+	if !filepath.IsAbs(containerPath) || containerPath == string(filepath.Separator) {
+		return nil, fmt.Errorf("vGPU cache root must be an absolute non-root path: %q", containerPath)
+	}
 	lister := &ContainerLister{
-		containerPath: filepath.Join(hookPath, "containers"),
+		containerPath: containerPath,
 		containers:    make(map[string]*ContainerUsage),
 		clientset:     clientset,
 		nodeName:      nodeName,
@@ -153,6 +179,9 @@ func (l *ContainerLister) UnLock() {
 	l.mutex.Unlock()
 }
 
+// ListContainers exposes the mapped containers. Callers must hold Lock until
+// they finish accessing the map and every returned ContainerUsage.Info, including
+// writes. Keeping a pointer after UnLock does not keep its mmap alive.
 func (l *ContainerLister) ListContainers() map[string]*ContainerUsage {
 	return l.containers
 }
@@ -161,19 +190,119 @@ func (l *ContainerLister) Clientset() *kubernetes.Clientset {
 	return l.clientset
 }
 
+// PodLister returns the lister backed by the node-scoped pod informer that
+// initInformerWithConfig starts and waits for. Callers that only need pods
+// assigned to this node should reuse it rather than starting a second informer.
+func (l *ContainerLister) PodLister() corelisters.PodLister {
+	return l.podLister
+}
+
+const lupineServerLookupTTL = 5 * time.Second
+
+// OnLupineServer reports whether this node is a chart-managed lupine server.
+// That is hami.io/lupine-server present with an empty value. A non-empty value
+// is an operator-chosen port for an externally managed server.
+// A failed lookup keeps the previous answer, or reports false when there is
+// none, so a blip talking to the API does not change a normal GPU node.
+// The device plugin adds and removes the label as the operating mode changes,
+// and the answer is cached for a few seconds.
+func (l *ContainerLister) OnLupineServer(ctx context.Context) bool {
+	if l == nil {
+		return false
+	}
+	l.lupineMu.Lock()
+	defer l.lupineMu.Unlock()
+	if l.lupineServer == nil && l.lupineKnown && time.Since(l.lupineAt) < lupineServerLookupTTL {
+		return l.lupineOn
+	}
+	on, err := l.lookupLupineServer(ctx)
+	if err != nil {
+		klog.V(4).InfoS("lupine server label lookup failed", "node", l.nodeName, "err", err)
+		if l.lupineKnown {
+			return l.lupineOn
+		}
+		return false
+	}
+	if !l.lupineKnown || l.lupineOn != on {
+		if on {
+			klog.InfoS("vGPUmonitor standing by; node is a chart-managed lupine server", "node", l.nodeName)
+		} else if l.lupineKnown {
+			klog.InfoS("vGPUmonitor resuming; node is no longer a chart-managed lupine server", "node", l.nodeName)
+		}
+	}
+	l.lupineOn = on
+	l.lupineAt = time.Now()
+	l.lupineKnown = true
+	return on
+}
+
+func (l *ContainerLister) lookupLupineServer(ctx context.Context) (bool, error) {
+	if l.lupineServer != nil {
+		return l.lupineServer(ctx)
+	}
+	if l.clientset == nil || l.nodeName == "" {
+		return false, fmt.Errorf("node client unavailable")
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	node, err := l.clientset.CoreV1().Nodes().Get(callCtx, l.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	val, ok := node.Labels[remotegpu.LupineServerLabel]
+	if !ok {
+		return false, nil
+	}
+	// Empty value: chart-managed. Non-empty: custom port; keep collecting.
+	return val == "", nil
+}
+
+// SetLupineServerForTest replaces the node lookup. Use only in tests.
+func (l *ContainerLister) SetLupineServerForTest(fn func(context.Context) (bool, error)) {
+	l.lupineMu.Lock()
+	defer l.lupineMu.Unlock()
+	l.lupineServer = fn
+	l.lupineKnown = false
+}
+
+// SetContainersForTest replaces the internal container map; use only in tests.
+func (l *ContainerLister) SetContainersForTest(m map[string]*ContainerUsage) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	l.containers = m
+}
+
+// SetPodListerForTest installs a pod lister; use only in tests that skip
+// NewContainerLister (e.g. zero-value listers).
+func (l *ContainerLister) SetPodListerForTest(pl corelisters.PodLister) {
+	l.podLister = pl
+}
+
+// Update refreshes cache mappings under the lister lock without deleting files owned by the
+// device plugin.
 func (l *ContainerLister) Update() error {
+	// The pod lister reads an informer cache and needs no lister lock.
+	pods, err := l.podLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	// Prefetch before locking: prefetchWholeGPUInputs may run the
+	// node-registry GET, which must not happen while the lock is held.
+	var inputs *wholeGPUInputs
+	if wholeGPUDisableHAMiCore {
+		inputs = l.prefetchWholeGPUInputs(pods)
+	}
 
 	l.mutex.Lock()
 	defer l.mutex.Unlock()
 
 	entries, err := os.ReadDir(l.containerPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			l.unmapAll()
+		}
 		return err
-	}
-
-	pods, err := l.podLister.List(labels.Everything())
-	if err != nil {
-		return fmt.Errorf("failed to list pods: %v", err)
 	}
 
 	podUIDs := make(map[string]bool, len(pods))
@@ -181,27 +310,60 @@ func (l *ContainerLister) Update() error {
 		podUIDs[string(pod.UID)] = true
 	}
 
+	if inputs != nil {
+		l.reconcileWholeGPULocked(inputs)
+	}
+
+	present := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
+		present[entry.Name()] = struct{}{}
+		parts := strings.SplitN(entry.Name(), "_", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			klog.Warningf("Skipping dir with unexpected name format: %s", entry.Name())
+			continue
+		}
 		dirName := filepath.Join(l.containerPath, entry.Name())
-		podUID := strings.Split(entry.Name(), "_")[0]
+		podUID := parts[0]
 		if !podUIDs[podUID] {
 			dirInfo, err := os.Stat(dirName)
 			if err == nil && dirInfo.ModTime().Add(resyncInterval).After(time.Now()) {
 				continue
 			}
-			klog.Infof("Removing dirname %s in monitorpath", dirName)
-			if c, ok := l.containers[entry.Name()]; ok {
-				syscall.Munmap(c.data)
-				delete(l.containers, entry.Name())
-			}
-			_ = os.RemoveAll(dirName)
+			l.unmapContainer(entry.Name())
 			continue
 		}
-		if _, ok := l.containers[entry.Name()]; ok {
-			continue
+		if current, ok := l.containers[entry.Name()]; ok {
+			owned := false
+			if l.wholeGPU != nil {
+				_, owned = l.wholeGPU.ownedContainerKeys[entry.Name()]
+			}
+			if owned {
+				// loadCache maps a supported cache file and remembers its
+				// identity so it can detect when the file has been replaced.
+				usage, err := loadCache(dirName)
+				if err != nil {
+					klog.Errorf("Failed to load cache: %s, error: %v", dirName, err)
+					continue
+				}
+				if usage == nil {
+					continue
+				}
+				klog.InfoS("wholegpu: cache file appeared, handing synthesized entry back to disk monitoring", "directory", dirName)
+				delete(l.wholeGPU.ownedContainerKeys, entry.Name())
+				l.unmapContainer(entry.Name())
+				usage.PodUID = podUID
+				usage.ContainerName = parts[1]
+				l.containers[entry.Name()] = usage
+				continue
+			}
+			if cacheMappingIsCurrent(current) {
+				continue
+			}
+			klog.InfoS("Reloading replaced vGPU cache file", "directory", dirName)
+			l.unmapContainer(entry.Name())
 		}
 		usage, err := loadCache(dirName)
 		if err != nil {
@@ -209,24 +371,96 @@ func (l *ContainerLister) Update() error {
 			continue
 		}
 		if usage == nil {
-			// no cuInit in container
 			continue
 		}
 		usage.PodUID = podUID
-		usage.ContainerName = strings.Split(entry.Name(), "_")[1]
+		usage.ContainerName = parts[1]
 		l.containers[entry.Name()] = usage
 		klog.Infof("Adding ctr dirname %s in monitorpath", dirName)
+	}
+
+	// Device-plugin GC may remove a directory between monitor scans. mmap keeps
+	// the old inode alive, so explicitly release mappings whose directory has
+	// disappeared instead of relying on directory traversal to encounter them.
+	for name := range l.containers {
+		if _, ok := present[name]; ok {
+			continue
+		}
+		if l.wholeGPU != nil {
+			if _, owned := l.wholeGPU.ownedContainerKeys[name]; owned {
+				continue
+			}
+		}
+		klog.InfoS("Releasing mapping for removed vGPU cache directory", "directory", name)
+		l.unmapContainer(name)
 	}
 	return nil
 }
 
+// cacheMappingIsCurrent checks whether a mapping still refers to the same file identity and
+// size.
+func cacheMappingIsCurrent(usage *ContainerUsage) bool {
+	if usage.cacheFilePath == "" || usage.cacheFileInfo == nil {
+		return false
+	}
+	info, err := os.Stat(usage.cacheFilePath)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(usage.cacheFileInfo, info) && usage.cacheFileInfo.Size() == info.Size()
+}
+
+// unmapContainer releases and removes one mapping. The caller must hold the lister lock.
+func (l *ContainerLister) unmapContainer(name string) {
+	usage, ok := l.containers[name]
+	if !ok {
+		return
+	}
+	if len(usage.data) > 0 {
+		if err := syscall.Munmap(usage.data); err != nil {
+			klog.ErrorS(err, "Failed to unmap vGPU cache", "container", name)
+		}
+	}
+	delete(l.containers, name)
+}
+
+// unmapAll releases every mapping. The caller must hold the lister lock.
+func (l *ContainerLister) unmapAll() {
+	for name := range l.containers {
+		l.unmapContainer(name)
+	}
+}
+
+// Close stops the monitor's informer and releases every mmap owned by the
+// monitor. It is safe to call more than once.
+func (l *ContainerLister) Close() {
+	l.closeOnce.Do(func() {
+		close(l.stopCh)
+		l.mutex.Lock()
+		defer l.mutex.Unlock()
+		l.unmapAll()
+		if l.wholeGPU != nil && l.wholeGPU.dcgm != nil {
+			l.wholeGPU.dcgm.Close()
+		}
+	})
+}
+
+// loadCache maps a supported cache file and records its identity for replacement detection. The
+// caller owns the returned mapping.
 func loadCache(fpath string) (*ContainerUsage, error) {
 	klog.Infof("Checking path %s", fpath)
 	files, err := os.ReadDir(fpath)
 	if err != nil {
 		return nil, err
 	}
-	if len(files) > 2 {
+	matchedFiles := 0
+	for _, val := range files {
+		if strings.Contains(val.Name(), "libvgpu.so") ||
+			strings.HasSuffix(val.Name(), ".cache") {
+			matchedFiles++
+		}
+	}
+	if matchedFiles > 2 {
 		return nil, errors.New("cache num not matched")
 	}
 	if len(files) == 0 {
@@ -237,7 +471,7 @@ func loadCache(fpath string) (*ContainerUsage, error) {
 		if strings.Contains(val.Name(), "libvgpu.so") {
 			continue
 		}
-		if !strings.Contains(val.Name(), ".cache") {
+		if !strings.HasSuffix(val.Name(), ".cache") {
 			continue
 		}
 		cacheFile = filepath.Join(fpath, val.Name())
@@ -263,7 +497,7 @@ func loadCache(fpath string) (*ContainerUsage, error) {
 	defer func(f *os.File) {
 		_ = f.Close()
 	}(f)
-	usage := &ContainerUsage{}
+	usage := &ContainerUsage{cacheFilePath: cacheFile, cacheFileInfo: info}
 	usage.data, err = syscall.Mmap(int(f.Fd()), 0, int(info.Size()), syscall.PROT_WRITE|syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
 		klog.Errorf("Failed to mmap cache file: %s, error: %v", cacheFile, err)
@@ -274,15 +508,16 @@ func loadCache(fpath string) (*ContainerUsage, error) {
 		_ = syscall.Munmap(usage.data)
 		return nil, fmt.Errorf("cache file magic flag not matched")
 	}
-	if info.Size() == 1197897 {
+	if info.Size() >= int64(v0.MinSize()) && info.Size() < int64(v1.MinSize()) {
 		klog.Infoln("casting......v0")
 		usage.Info = v0.CastSpec(usage.data)
-	} else if head.majorVersion == 1 {
+	} else if head.majorVersion == 1 && info.Size() >= int64(v1.MinSize()) {
 		klog.Infoln("casting......v1")
 		usage.Info = v1.CastSpec(usage.data)
 	} else {
+		majorVersion, minorVersion := head.majorVersion, head.minorVersion
 		_ = syscall.Munmap(usage.data)
-		return nil, fmt.Errorf("unknown cache file size %d version %d.%d", info.Size(), head.majorVersion, head.minorVersion)
+		return nil, fmt.Errorf("unknown cache file size %d version %d.%d", info.Size(), majorVersion, minorVersion)
 	}
 	return usage, nil
 }

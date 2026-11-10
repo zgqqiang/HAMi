@@ -16,12 +16,16 @@ limitations under the License.
 package device
 
 import (
+	"bytes"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 )
 
 type MockDevices struct {
@@ -60,8 +64,8 @@ func (m *MockDevices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error {
 	return nil
 }
 
-func (m *MockDevices) GenerateResourceRequests(ctr *corev1.Container) ContainerDeviceRequest {
-	return ContainerDeviceRequest{}
+func (m *MockDevices) GenerateResourceRequests(ctr *corev1.Container) (ContainerDeviceRequest, error) {
+	return ContainerDeviceRequest{}, nil
 }
 
 func (m *MockDevices) PatchAnnotations(pod *corev1.Pod, annoinput *map[string]string, pd PodDevices) map[string]string {
@@ -97,6 +101,19 @@ func initTest() {
 	}
 }
 
+// initScaledTest adds a backend that records memory at 256 MiB per unit, like
+// Cambricon.
+func initScaledTest() {
+	initTest()
+	DevicesMap["MLU"] = &MockDevices{
+		resourceNames: ResourceNames{
+			ResourceMemoryName: "cambricon.com/mlu.smlu.vmemory",
+			ResourceCoreName:   "cambricon.com/mlu.smlu.vcore",
+			MemoryFactor:       256,
+		},
+	}
+}
+
 func TestNewQuotaManagerSingleton(t *testing.T) {
 	var wg sync.WaitGroup
 	var managers [2]*QuotaManager
@@ -126,37 +143,76 @@ func TestFitQuota(t *testing.T) {
 	coreName := "nvidia.com/gpucore"
 
 	qm.Quotas[ns] = &DeviceQuota{
-		memName:  &Quota{Used: 1000, Limit: 2000},
-		coreName: &Quota{Used: 200, Limit: 400},
+		memName:  &Quota{Used: 1000, Limit: 2000, LimitSet: true},
+		coreName: &Quota{Used: 200, Limit: 400, LimitSet: true},
 	}
 
 	// Should fit
-	if !qm.FitQuota(ns, 500, 1, 100, deviceName) {
+	if !qm.FitQuota(ns, 500, 100, deviceName) {
 		t.Error("FitQuota should return true when within limits")
 	}
 	// Should not fit memory
-	if qm.FitQuota(ns, 1500, 1, 100, deviceName) {
+	if qm.FitQuota(ns, 1500, 100, deviceName) {
 		t.Error("FitQuota should return false when memory exceeds limit")
 	}
 	// Should not fit core
-	if qm.FitQuota(ns, 500, 1, 300, deviceName) {
+	if qm.FitQuota(ns, 500, 300, deviceName) {
 		t.Error("FitQuota should return false when core exceeds limit")
 	}
-	// Should fit memory with factor
-	if !qm.FitQuota(ns, 1000, 2, 100, deviceName) {
-		t.Error("FitQuota should return true")
-	}
-	// Should not fit memory with factor
-	if qm.FitQuota(ns, 5000, 2, 100, deviceName) {
-		t.Error("FitQuota should return false when memory exceeds limit")
-	}
 	// Should fit if namespace not present
-	if !qm.FitQuota("otherns", 1500, 1, 100, deviceName) {
+	if !qm.FitQuota("otherns", 1500, 100, deviceName) {
 		t.Error("FitQuota should return true if namespace not present")
 	}
 	// Should fit if device not present
-	if !qm.FitQuota(ns, 1000, 1, 100, "unknown-device") {
+	if !qm.FitQuota(ns, 1000, 100, "unknown-device") {
 		t.Error("FitQuota should return true if device not present")
+	}
+}
+
+func TestFitQuotaExplicitZeroBlocks(t *testing.T) {
+	initTest()
+	qm := &QuotaManager{Quotas: make(map[string]*DeviceQuota)}
+	ns := "team-zero"
+	memName := "nvidia.com/gpumem"
+
+	// An operator sets a ResourceQuota of "0" to block all GPU memory in the namespace.
+	rq := &corev1.ResourceQuota{}
+	rq.Namespace = ns
+	rq.Spec.Hard = corev1.ResourceList{
+		corev1.ResourceName("limits." + memName): *resource.NewQuantity(0, resource.DecimalSI),
+	}
+	qm.AddQuota(rq)
+
+	// The explicit zero must block any positive request, not be read as "unlimited".
+	if qm.FitQuota(ns, 500, 0, "NVIDIA") {
+		t.Error(`FitQuota admitted a 500 request under limits.nvidia.com/gpumem: "0"; an explicit zero quota must block`)
+	}
+}
+
+func TestFitQuotaUsesScaledLimit(t *testing.T) {
+	initScaledTest()
+	qm := NewQuotaManager()
+	ns := "team-scaled-fit"
+	memName := "cambricon.com/mlu.smlu.vmemory"
+
+	rq := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "scaled", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName): *resource.NewQuantity(100, resource.DecimalSI),
+			},
+		},
+	}
+	qm.AddQuota(rq)
+
+	// 100 units are 25600 MiB, and requests arrive already scaled
+	// Should fit at the scaled limit
+	if !qm.FitQuota(ns, 25600, 0, "MLU") {
+		t.Error("FitQuota should return true when memory equals the scaled limit")
+	}
+	// Should not fit above the scaled limit
+	if qm.FitQuota(ns, 25601, 0, "MLU") {
+		t.Error("FitQuota should return false when memory exceeds the scaled limit")
 	}
 }
 
@@ -197,6 +253,15 @@ func TestAddUsageAndRmUsage(t *testing.T) {
 	}
 	if (*qm.Quotas[ns])[coreName].Used != 0 {
 		t.Errorf("RmUsage: expected Used core 0, got %d", (*qm.Quotas[ns])[coreName].Used)
+	}
+
+	// remove more than tracked: Used must not go below zero
+	qm.RmUsage(pod, podDev)
+	if (*qm.Quotas[ns])[memName].Used < 0 {
+		t.Errorf("RmUsage: Used memory went negative: %d", (*qm.Quotas[ns])[memName].Used)
+	}
+	if (*qm.Quotas[ns])[coreName].Used < 0 {
+		t.Errorf("RmUsage: Used core went negative: %d", (*qm.Quotas[ns])[coreName].Used)
 	}
 }
 
@@ -241,5 +306,570 @@ func TestAddQuotaAndDelQuota(t *testing.T) {
 	}
 	if (*qm.Quotas[ns])[coreName].Limit != 0 {
 		t.Errorf("DelQuota: expected core limit 0, got %d", (*qm.Quotas[ns])[coreName].Limit)
+	}
+}
+
+func TestAddQuotaScalesMemoryLimit(t *testing.T) {
+	initScaledTest()
+	qm := NewQuotaManager()
+	ns := "team-scaled-limit"
+	memName := "cambricon.com/mlu.smlu.vmemory"
+	coreName := "cambricon.com/mlu.smlu.vcore"
+	nvMemName := "nvidia.com/gpumem"
+
+	rq := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "scaled", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName):   *resource.NewQuantity(100, resource.DecimalSI),
+				corev1.ResourceName("limits." + coreName):  *resource.NewQuantity(50, resource.DecimalSI),
+				corev1.ResourceName("limits." + nvMemName): *resource.NewQuantity(2000, resource.DecimalSI),
+			},
+		},
+	}
+	qm.AddQuota(rq)
+
+	// Used is recorded after memoryFactor, so the limit is stored the same way
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 100*256 {
+		t.Errorf("expected memory limit %d, got %d", 100*256, got)
+	}
+	if got := (*qm.Quotas[ns])[coreName].Limit; got != 50 {
+		t.Errorf("expected core limit 50 (cores are not scaled), got %d", got)
+	}
+	if got := (*qm.Quotas[ns])[nvMemName].Limit; got != 2000 {
+		t.Errorf("expected memory limit 2000 for a backend without memoryFactor, got %d", got)
+	}
+}
+
+func TestAddQuotaIgnoresOverflowingLimit(t *testing.T) {
+	initScaledTest()
+	var buf bytes.Buffer
+	klog.SetOutput(&buf)
+	klog.LogToStderr(false)
+	defer klog.LogToStderr(true)
+
+	ns := "team-overflow-limit"
+	memName := "cambricon.com/mlu.smlu.vmemory"
+	qm := NewQuotaManager()
+	t.Cleanup(func() { delete(qm.Quotas, ns) })
+
+	quotaWith := func(mem int64) *corev1.ResourceQuota {
+		return &corev1.ResourceQuota{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns},
+			Spec: corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName): *resource.NewQuantity(mem, resource.DecimalSI),
+			}},
+		}
+	}
+	const msg = "quota limit overflows int64 after applying memory factor"
+
+	// A limit that overflows int64 once scaled is ignored and logged.
+	old := quotaWith(40000000000000000)
+	qm.AddQuota(old)
+	if dq := qm.Quotas[ns]; dq != nil {
+		if q := (*dq)[memName]; q != nil && q.LimitSet {
+			t.Errorf("expected no memory limit, got %d", q.Limit)
+		}
+	}
+	if !strings.Contains(buf.String(), msg) {
+		t.Errorf("AddQuota did not log the overflowing limit")
+	}
+
+	// A status-only update keeps the same limits and does not log again.
+	buf.Reset()
+	statusOnly := old.DeepCopy()
+	statusOnly.Status.Used = corev1.ResourceList{corev1.ResourceName("limits." + memName): resource.MustParse("1")}
+	qm.UpdateQuota(old, statusOnly)
+	if strings.Contains(buf.String(), msg) {
+		t.Errorf("a status-only update logged the overflow again")
+	}
+
+	// Changing the limits logs again.
+	buf.Reset()
+	qm.UpdateQuota(statusOnly, quotaWith(50000000000000000))
+	if !strings.Contains(buf.String(), msg) {
+		t.Errorf("an update that changes the limits did not log the overflow")
+	}
+}
+
+func TestUpdateQuotaScalesMemoryLimit(t *testing.T) {
+	initScaledTest()
+	ns := "update-scaled"
+	memName := "cambricon.com/mlu.smlu.vmemory"
+	qm := NewQuotaManager()
+	t.Cleanup(func() { delete(qm.Quotas, ns) })
+
+	quotaWith := func(mem int64) *corev1.ResourceQuota {
+		return &corev1.ResourceQuota{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns},
+			Spec: corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName): *resource.NewQuantity(mem, resource.DecimalSI),
+			}},
+		}
+	}
+
+	old := quotaWith(100)
+	qm.AddQuota(old)
+
+	// Raising the limit scales the new value too.
+	qm.UpdateQuota(old, quotaWith(200))
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 200*256 {
+		t.Errorf("memory limit = %d, want %d", got, 200*256)
+	}
+
+	// Deleting the quota releases the scaled limit.
+	qm.DelQuota(quotaWith(200))
+	if got := (*qm.Quotas[ns])[memName]; got.Limit != 0 || got.LimitSet {
+		t.Errorf("memory limit = %d (set %v), want 0 and unset after delete", got.Limit, got.LimitSet)
+	}
+
+	// Updating a limit to one that overflows int64 once scaled drops it.
+	qm.AddQuota(old)
+	qm.UpdateQuota(old, quotaWith(40000000000000000))
+	if got := (*qm.Quotas[ns])[memName]; got.LimitSet {
+		t.Errorf("memory limit = %d, want unset once the scaled limit overflows", got.Limit)
+	}
+}
+
+func TestDelQuotaNonLimitsKey(t *testing.T) {
+	initTest()
+	qm := NewQuotaManager()
+	ns := "testns"
+	memName := "nvidia.com/gpumem"
+	coreName := "nvidia.com/gpucore"
+
+	rq := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "quota-with-limits", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName):  *resource.NewQuantity(100, resource.DecimalSI),
+				corev1.ResourceName("limits." + coreName): *resource.NewQuantity(10, resource.DecimalSI),
+			},
+		},
+	}
+	qm.AddQuota(rq)
+
+	// Quota with non-limits keys (including 7-character prefix key).
+	unrelatedQuota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "quota-without-limits", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("requests." + memName): *resource.NewQuantity(50, resource.DecimalSI),
+				corev1.ResourceName("0123456" + memName):   *resource.NewQuantity(50, resource.DecimalSI),
+			},
+		},
+	}
+
+	// DelQuota on non-limits keys should NOT reset active quota limits.
+	qm.DelQuota(unrelatedQuota)
+	if (*qm.Quotas[ns])[memName].Limit != 100 {
+		t.Errorf("DelQuota: expected memory limit 100 after deleting non-limits quota, got %d", (*qm.Quotas[ns])[memName].Limit)
+	}
+}
+
+// A ResourceQuota update must never leave the limits zeroed, even briefly.
+// FitQuota reads a zero limit as no limit, so a check landing mid-update would
+// be waved through. The kube quota controller rewrites status.used on every pod
+// event, so updates arrive exactly when pods are being scheduled.
+func TestUpdateQuotaKeepsLimitEnforced(t *testing.T) {
+	initTest()
+	ns := "update-window"
+	qm := NewQuotaManager()
+	t.Cleanup(func() { delete(qm.Quotas, ns) })
+
+	quota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits.nvidia.com/gpumem"): *resource.NewQuantity(1000, resource.DecimalSI),
+			},
+		},
+	}
+	qm.AddQuota(quota)
+	// The namespace is already at its limit, so every answer below must be false.
+	(*qm.Quotas[ns])["nvidia.com/gpumem"].Used = 1000
+
+	var wrongAdmits int64
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				qm.UpdateQuota(quota, quota)
+			}
+		}
+	})
+
+	wg.Go(func() {
+		for range 50000 {
+			if qm.FitQuota(ns, 1, 0, "NVIDIA") {
+				atomic.AddInt64(&wrongAdmits, 1)
+			}
+		}
+		close(stop)
+	})
+
+	wg.Wait()
+	if wrongAdmits > 0 {
+		t.Errorf("quota went unenforced for %d checks while updates were in flight", wrongAdmits)
+	}
+}
+
+func TestUpdateQuota(t *testing.T) {
+	initTest()
+	ns := "update-apply"
+	qm := NewQuotaManager()
+	t.Cleanup(func() { delete(qm.Quotas, ns) })
+
+	quotaWith := func(mem, core int64) *corev1.ResourceQuota {
+		hard := corev1.ResourceList{}
+		if mem > 0 {
+			hard["limits.nvidia.com/gpumem"] = *resource.NewQuantity(mem, resource.DecimalSI)
+		}
+		if core > 0 {
+			hard["limits.nvidia.com/gpucore"] = *resource.NewQuantity(core, resource.DecimalSI)
+		}
+		return &corev1.ResourceQuota{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns},
+			Spec:       corev1.ResourceQuotaSpec{Hard: hard},
+		}
+	}
+
+	old := quotaWith(1000, 100)
+	qm.AddQuota(old)
+
+	// Raising the memory limit and dropping the core one entirely.
+	qm.UpdateQuota(old, quotaWith(2000, 0))
+
+	if got := (*qm.Quotas[ns])["nvidia.com/gpumem"].Limit; got != 2000 {
+		t.Errorf("memory limit = %d, want 2000", got)
+	}
+	// A key the new quota no longer carries is released, not left at its old value.
+	if got := (*qm.Quotas[ns])["nvidia.com/gpucore"].Limit; got != 0 {
+		t.Errorf("core limit = %d, want 0 now that the new quota drops it", got)
+	}
+
+	// Usage already recorded survives an update.
+	(*qm.Quotas[ns])["nvidia.com/gpumem"].Used = 500
+	qm.UpdateQuota(quotaWith(2000, 0), quotaWith(3000, 0))
+	if got := (*qm.Quotas[ns])["nvidia.com/gpumem"].Used; got != 500 {
+		t.Errorf("used = %d, want 500 preserved across the update", got)
+	}
+	if got := (*qm.Quotas[ns])["nvidia.com/gpumem"].Limit; got != 3000 {
+		t.Errorf("memory limit = %d, want 3000", got)
+	}
+}
+
+func TestReplaceUsage(t *testing.T) {
+	initTest()
+	qm := NewQuotaManager()
+	ns := "replacens"
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns}}
+
+	oldDev := PodDevices{
+		"NVIDIA": PodSingleDevice{
+			[]ContainerDevice{
+				{Idx: 0, UUID: "GPU0", Usedmem: 1000, Usedcores: 100},
+			},
+		},
+	}
+
+	newDev := PodDevices{
+		"NVIDIA": PodSingleDevice{
+			[]ContainerDevice{
+				{Idx: 0, UUID: "GPU0", Usedmem: 2000, Usedcores: 200},
+			},
+		},
+	}
+
+	qm.Quotas[ns] = &DeviceQuota{}
+	qm.AddUsage(pod, oldDev)
+
+	memName := "nvidia.com/gpumem"
+	coreName := "nvidia.com/gpucore"
+
+	if got := (*qm.Quotas[ns])[memName].Used; got != 1000 {
+		t.Fatalf("AddUsage: expected Used memory 1000, got %d", got)
+	}
+
+	qm.ReplaceUsage(pod, oldDev, newDev)
+
+	if got := (*qm.Quotas[ns])[memName].Used; got != 2000 {
+		t.Errorf("ReplaceUsage: expected Used memory 2000, got %d", got)
+	}
+	if got := (*qm.Quotas[ns])[coreName].Used; got != 200 {
+		t.Errorf("ReplaceUsage: expected Used core 200, got %d", got)
+	}
+
+	// Replacing empty devices should be a no-op
+	qm.ReplaceUsage(pod, PodDevices{}, PodDevices{})
+	if got := (*qm.Quotas[ns])[memName].Used; got != 2000 {
+		t.Errorf("ReplaceUsage with empty devices modified used memory: got %d", got)
+	}
+}
+
+func TestGetResourceQuota(t *testing.T) {
+	initTest()
+	qm := NewQuotaManager()
+	ns := "copyns"
+
+	qm.Quotas[ns] = &DeviceQuota{
+		"nvidia.com/gpumem":  &Quota{Used: 500, Limit: 1000, LimitSet: true},
+		"nvidia.com/gpucore": &Quota{Used: 50, Limit: 100, LimitSet: true},
+	}
+
+	copyMap := qm.GetResourceQuota()
+
+	if _, ok := copyMap[ns]; !ok {
+		t.Fatalf("GetResourceQuota: namespace %s missing from copied map", ns)
+	}
+
+	memQuota, ok := (*copyMap[ns])["nvidia.com/gpumem"]
+	if !ok || memQuota.Used != 500 || memQuota.Limit != 1000 || !memQuota.LimitSet {
+		t.Errorf("GetResourceQuota: invalid memory quota copy: %+v", memQuota)
+	}
+
+	// Mutate the returned copy to verify deep-copy isolation
+	memQuota.Used = 9999
+	memQuota.Limit = 8888
+
+	originalMem := (*qm.Quotas[ns])["nvidia.com/gpumem"]
+	if originalMem.Used != 500 || originalMem.Limit != 1000 {
+		t.Errorf("GetResourceQuota: mutating copied quota affected internal state: %+v", originalMem)
+	}
+}
+
+func TestMultipleResourceQuotasEnforceMinLimit(t *testing.T) {
+	initTest()
+	qm := NewQuotaManager()
+	ns := "team-multi-quota"
+	memName := "nvidia.com/gpumem"
+	coreName := "nvidia.com/gpucore"
+
+	strict := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "strict", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName):  *resource.NewQuantity(1000, resource.DecimalSI),
+				corev1.ResourceName("limits." + coreName): *resource.NewQuantity(50, resource.DecimalSI),
+			},
+		},
+	}
+
+	loose := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "loose", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName):  *resource.NewQuantity(5000, resource.DecimalSI),
+				corev1.ResourceName("limits." + coreName): *resource.NewQuantity(200, resource.DecimalSI),
+			},
+		},
+	}
+
+	// Add loose first, then strict
+	qm.AddQuota(loose)
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 5000 {
+		t.Fatalf("expected memory limit 5000, got %d", got)
+	}
+
+	qm.AddQuota(strict)
+	// Strictest limit (minimum) must be enforced
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 1000 {
+		t.Errorf("expected memory limit 1000 (min of 1000, 5000), got %d", got)
+	}
+	if got := (*qm.Quotas[ns])[coreName].Limit; got != 50 {
+		t.Errorf("expected core limit 50 (min of 50, 200), got %d", got)
+	}
+
+	// Deleting strict quota should raise limit back to loose quota
+	qm.DelQuota(strict)
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 5000 {
+		t.Errorf("expected memory limit 5000 after deleting strict, got %d", got)
+	}
+	if got := (*qm.Quotas[ns])[coreName].Limit; got != 200 {
+		t.Errorf("expected core limit 200 after deleting strict, got %d", got)
+	}
+
+	// Deleting loose quota should clear limit
+	qm.DelQuota(loose)
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 0 {
+		t.Errorf("expected memory limit 0 after deleting all quotas, got %d", got)
+	}
+	if (*qm.Quotas[ns])[memName].LimitSet {
+		t.Errorf("expected LimitSet false after deleting all quotas")
+	}
+}
+
+func TestDelQuotaWithStaleSpec(t *testing.T) {
+	initTest()
+	qm := NewQuotaManager()
+	ns := "team-stale-del"
+	memName := "nvidia.com/gpumem"
+
+	rq := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "quota-stale", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName): *resource.NewQuantity(2000, resource.DecimalSI),
+			},
+		},
+	}
+	qm.AddQuota(rq)
+
+	// Delete event carries an empty Spec.Hard
+	staleDel := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "quota-stale", Namespace: ns},
+		Spec:       corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{}},
+	}
+	qm.DelQuota(staleDel)
+
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 0 {
+		t.Errorf("expected limit 0 after deleting quota with empty spec, got %d", got)
+	}
+	if (*qm.Quotas[ns])[memName].LimitSet {
+		t.Errorf("expected LimitSet false after delete")
+	}
+}
+
+func TestUnrelatedQuotaLeavesNoEntry(t *testing.T) {
+	initTest()
+	qm := NewQuotaManager()
+	ns := "team-unrelated"
+
+	unrelated := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "cpu-only", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("requests.cpu"):    *resource.NewQuantity(4, resource.DecimalSI),
+				corev1.ResourceName("requests.memory"): *resource.NewQuantity(1024, resource.BinarySI),
+			},
+		},
+	}
+
+	qm.AddQuota(unrelated)
+	if qm.objectLimits[ns] != nil {
+		t.Errorf("expected no objectLimits map for quota without managed keys, got: %+v", qm.objectLimits[ns])
+	}
+}
+
+func TestScopedQuotaIgnored(t *testing.T) {
+	initTest()
+	qm := NewQuotaManager()
+	ns := "team-scoped-quota"
+	memName := "nvidia.com/gpumem"
+	coreName := "nvidia.com/gpucore"
+
+	unscoped := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "unscoped-baseline", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName):  *resource.NewQuantity(2000, resource.DecimalSI),
+				corev1.ResourceName("limits." + coreName): *resource.NewQuantity(100, resource.DecimalSI),
+			},
+		},
+	}
+	qm.AddQuota(unscoped)
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 2000 {
+		t.Fatalf("expected memory limit 2000, got %d", got)
+	}
+
+	// Scoped quota with BestEffort scope and explicit 0 limits should be ignored
+	// so it does not clamp non-best-effort pods in the namespace.
+	scopedBestEffort := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "scoped-besteffort", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			Scopes: []corev1.ResourceQuotaScope{corev1.ResourceQuotaScopeBestEffort},
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName):  *resource.NewQuantity(0, resource.DecimalSI),
+				corev1.ResourceName("limits." + coreName): *resource.NewQuantity(0, resource.DecimalSI),
+			},
+		},
+	}
+	qm.AddQuota(scopedBestEffort)
+
+	// Memory limit must remain at unscoped quota's value (2000), not clamped to 0
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 2000 {
+		t.Errorf("expected memory limit 2000 to remain, but scoped quota clamped it to %d", got)
+	}
+	if got := (*qm.Quotas[ns])[coreName].Limit; got != 100 {
+		t.Errorf("expected core limit 100 to remain, but scoped quota clamped it to %d", got)
+	}
+
+	// Scoped quota with ScopeSelector should also be ignored
+	scopedSelector := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "scoped-selector", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			ScopeSelector: &corev1.ScopeSelector{
+				MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
+					{
+						ScopeName: corev1.ResourceQuotaScopePriorityClass,
+						Operator:  corev1.ScopeSelectorOpIn,
+						Values:    []string{"low-priority"},
+					},
+				},
+			},
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName): *resource.NewQuantity(500, resource.DecimalSI),
+			},
+		},
+	}
+	qm.AddQuota(scopedSelector)
+
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 2000 {
+		t.Errorf("expected memory limit 2000 to remain, but scoped selector quota clamped it to %d", got)
+	}
+
+	// Deleting scoped quotas should have no adverse effect
+	qm.DelQuota(scopedBestEffort)
+	qm.DelQuota(scopedSelector)
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 2000 {
+		t.Errorf("expected memory limit 2000 after deleting scoped quotas, got %d", got)
+	}
+
+	// Deleting the unscoped quota restores state to 0
+	qm.DelQuota(unscoped)
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 0 {
+		t.Errorf("expected memory limit 0 after deleting unscoped quota, got %d", got)
+	}
+}
+
+func TestEmptyScopeSelectorTreatedAsUnscoped(t *testing.T) {
+	initTest()
+	qm := NewQuotaManager()
+	ns := "team-empty-selector"
+	memName := "nvidia.com/gpumem"
+
+	// A ResourceQuota with a non-nil ScopeSelector that has empty MatchExpressions
+	// and no Scopes should be treated as unscoped and enforced.
+	emptySelectorQuota := &corev1.ResourceQuota{
+		ObjectMeta: metav1.ObjectMeta{Name: "empty-selector", Namespace: ns},
+		Spec: corev1.ResourceQuotaSpec{
+			ScopeSelector: &corev1.ScopeSelector{
+				MatchExpressions: []corev1.ScopedResourceSelectorRequirement{},
+			},
+			Hard: corev1.ResourceList{
+				corev1.ResourceName("limits." + memName): *resource.NewQuantity(1500, resource.DecimalSI),
+			},
+		},
+	}
+	qm.AddQuota(emptySelectorQuota)
+
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 1500 {
+		t.Fatalf("expected memory limit 1500 for quota with empty ScopeSelector, got %d", got)
+	}
+	if !(*qm.Quotas[ns])[memName].LimitSet {
+		t.Fatalf("expected LimitSet true for quota with empty ScopeSelector")
+	}
+
+	qm.DelQuota(emptySelectorQuota)
+	if got := (*qm.Quotas[ns])[memName].Limit; got != 0 {
+		t.Errorf("expected memory limit 0 after deleting quota with empty ScopeSelector, got %d", got)
+	}
+	if (*qm.Quotas[ns])[memName].LimitSet {
+		t.Errorf("expected LimitSet false after delete")
 	}
 }

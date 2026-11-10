@@ -1,4 +1,4 @@
-{{- if and .Values.devicePlugin.enabled (not .Values.dra.enabled) -}}
+{{- if .Values.devicePlugin.enabled -}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -10,20 +10,25 @@ rules:
       - pods
     verbs:
       - get
-      - create
       - watch
       - list
-      - update
       - patch
   - apiGroups:
       - ""
     resources:
       - nodes
+      - nodes/status
     verbs:
       - get
-      - update
-      - list
       - patch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - list
+      - create
+      - update
 {{- end -}}
     
     

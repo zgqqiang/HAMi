@@ -28,9 +28,9 @@ import (
 
 type PodInfo struct {
 	*corev1.Pod
-	NodeID  string
-	Devices PodDevices
-	CtrIDs  []string
+	NodeID                        string
+	Devices                       PodDevices
+	InitContainerResourceReleased bool
 }
 
 // PodUseDeviceStat counts pod use device info.
@@ -52,6 +52,8 @@ func NewPodManager() *PodManager {
 	return pm
 }
 
+// AddPod stores the effective (collapsed) device usage for the pod.
+// The devices parameter must already be collapsed (caller's responsibility).
 func (m *PodManager) AddPod(pod *corev1.Pod, nodeID string, devices PodDevices) bool {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
@@ -59,9 +61,10 @@ func (m *PodManager) AddPod(pod *corev1.Pod, nodeID string, devices PodDevices) 
 	_, exists := m.pods[pod.UID]
 	if !exists {
 		pi := &PodInfo{
-			Pod:     pod,
-			NodeID:  nodeID,
-			Devices: devices,
+			Pod:                           pod,
+			NodeID:                        nodeID,
+			Devices:                       devices,
+			InitContainerResourceReleased: false,
 		}
 		m.pods[pod.UID] = pi
 		klog.InfoS("Pod added",
@@ -70,26 +73,53 @@ func (m *PodManager) AddPod(pod *corev1.Pod, nodeID string, devices PodDevices) 
 			"devices", devices,
 		)
 	} else {
-		m.pods[pod.UID].Devices = devices
-		klog.V(5).InfoS("Pod devices updated",
-			"pod", klog.KRef(pod.Namespace, pod.Name),
-			"devices", devices,
-		)
+		pi := m.pods[pod.UID]
+		pi.Pod = pod
+		pi.NodeID = nodeID
+		if pi.InitContainerResourceReleased {
+			// Usage was already shrunk after init containers finished; a re-add
+			// (e.g. an informer resync decoding the full annotation) must not
+			// re-inflate it back to the peak value.
+			klog.V(5).InfoS("Pod already exists; keeping shrunk devices",
+				"pod", klog.KRef(pod.Namespace, pod.Name),
+			)
+		} else {
+			pi.Devices = devices
+			klog.V(5).InfoS("Pod already exists; devices updated",
+				"pod", klog.KRef(pod.Namespace, pod.Name),
+				"nodeID", nodeID,
+				"devices", devices,
+			)
+		}
 	}
 
 	return !exists
 }
 
+// UpdatePod updates only the pod object (used for termination state).
 func (m *PodManager) UpdatePod(pod *corev1.Pod) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
 	if pi, exists := m.pods[pod.UID]; exists {
 		pi.Pod = pod
-		klog.V(5).InfoS("Pod object updated in cache (terminating state)",
+		klog.V(5).InfoS("Pod object updated in cache",
 			"pod", klog.KRef(pod.Namespace, pod.Name),
-			"deletionTimestamp", pod.DeletionTimestamp,
 		)
+	}
+}
+
+// Snapshot copies manager-owned state and shares the read-only Pod.
+// Callers must not mutate the shared Pod.
+func (p *PodInfo) Snapshot() *PodInfo {
+	if p == nil {
+		return nil
+	}
+	return &PodInfo{
+		Pod:                           p.Pod,
+		NodeID:                        p.NodeID,
+		Devices:                       p.Devices.DeepCopy(),
+		InitContainerResourceReleased: p.InitContainerResourceReleased,
 	}
 }
 
@@ -111,24 +141,77 @@ func (m *PodManager) DelPod(pod *corev1.Pod) {
 	}
 }
 
+// GetPod returns a snapshot. AddPod and UpdatePod write to the stored PodInfo
+// in place, so handing out the pointer would let the caller read it while the
+// informer is rewriting it.
 func (m *PodManager) GetPod(pod *corev1.Pod) (*PodInfo, bool) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
 
 	pi, ok := m.pods[pod.UID]
-	return pi, ok
+	if !ok {
+		return nil, false
+	}
+	return pi.Snapshot(), true
 }
 
+// TakeAndDeletePod removes the cached allocation for pod and returns it. The
+// UID keys the map, but the name and namespace are checked against the cached
+// pod as well: /filter and /bind take all three from the request body, so a
+// caller pairing one pod's UID with another pod's name must not be able to
+// free a reservation that is still in use.
 func (m *PodManager) TakeAndDeletePod(pod *corev1.Pod) (*PodInfo, bool) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
 	pi, ok := m.pods[pod.UID]
-	if ok {
-		delete(m.pods, pod.UID)
-		klog.InfoS("Pod taken and deleted", "pod", klog.KRef(pod.Namespace, pod.Name), "nodeID", pi.NodeID)
+	if !ok {
+		return nil, false
 	}
-	return pi, ok
+	if pi.Pod != nil && (pi.Name != pod.Name || pi.Namespace != pod.Namespace) {
+		klog.InfoS("Refusing to delete cached pod, the request names a different pod than the UID holds",
+			"requested", klog.KRef(pod.Namespace, pod.Name),
+			"cached", klog.KObj(pi.Pod),
+			"uid", pod.UID)
+		return nil, false
+	}
+	delete(m.pods, pod.UID)
+	klog.InfoS("Pod taken and deleted", "pod", klog.KRef(pod.Namespace, pod.Name), "nodeID", pi.NodeID)
+	return pi, true
+}
+
+// ReplacePodDevices swaps the tracked devices for pod and returns the
+// previous set. Unlike UpdatePodDevice it leaves
+// InitContainerResourceReleased untouched, so a device swap (for example the
+// NUMA refit from #2080) does not disable the init-container usage shrink.
+func (m *PodManager) ReplacePodDevices(pod *corev1.Pod, newDevices PodDevices) (oldDevices PodDevices, ok bool) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	pi, exists := m.pods[pod.UID]
+	if !exists {
+		return nil, false
+	}
+	oldDevices = pi.Devices
+	pi.Devices = newDevices
+	return oldDevices, true
+}
+
+func (m *PodManager) UpdatePodDevice(pod *corev1.Pod, newDevices PodDevices) (oldDevices PodDevices, ok bool) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	pi, exists := m.pods[pod.UID]
+	if !exists {
+		return nil, false
+	}
+	oldDevices = pi.Devices
+	pi.Devices = newDevices
+	pi.InitContainerResourceReleased = true
+	klog.V(4).InfoS("Init container resources released",
+		"pod", klog.KRef(pod.Namespace, pod.Name),
+	)
+	return oldDevices, true
 }
 
 func (m *PodManager) ListPodsUID() ([]*corev1.Pod, error) {
@@ -155,7 +238,7 @@ func (m *PodManager) ListPodsInfo() []*PodInfo {
 
 	pods := make([]*PodInfo, 0, len(m.pods))
 	for _, pod := range m.pods {
-		pods = append(pods, pod)
+		pods = append(pods, pod.Snapshot())
 		klog.V(5).InfoS("Pod info",
 			"pod", klog.KRef(pod.Namespace, pod.Name),
 			"nodeID", pod.NodeID,
@@ -166,18 +249,6 @@ func (m *PodManager) ListPodsInfo() []*PodInfo {
 		"podCount", len(pods),
 	)
 	return pods
-}
-
-func (p *PodInfo) DeepCopy() *PodInfo {
-	if p == nil {
-		return nil
-	}
-	return &PodInfo{
-		Pod:     p.Pod.DeepCopy(),
-		NodeID:  p.NodeID,
-		Devices: p.Devices.DeepCopy(),
-		CtrIDs:  append([]string(nil), p.CtrIDs...),
-	}
 }
 
 func (pd PodDevices) DeepCopy() PodDevices {
@@ -220,6 +291,7 @@ func (c ContainerDevice) DeepCopy() ContainerDevice {
 		Type:      c.Type,
 		Usedmem:   c.Usedmem,
 		Usedcores: c.Usedcores,
+		Slots:     c.Slots,
 	}
 	if c.CustomInfo != nil {
 		dup.CustomInfo = make(map[string]any, len(c.CustomInfo))
@@ -237,9 +309,13 @@ func (m *PodManager) GetScheduledPods() (map[k8stypes.UID]*PodInfo, error) {
 		"podCount", podCount,
 	)
 
-	// Return a shallow copy of the pods map to avoid race conditions.
-	// This prevents a "concurrent map iteration and map write" fatal error.
+	// Copy the entries, not just the map. Copying the map alone keeps callers
+	// off the manager's own map, but leaves them holding the stored *PodInfo,
+	// which AddPod and UpdatePod write to in place. The metrics collector ranges
+	// over Devices after this returns, by which point the read lock is gone.
 	podsCopy := make(map[k8stypes.UID]*PodInfo, podCount)
-	maps.Copy(podsCopy, m.pods)
+	for uid, pi := range m.pods {
+		podsCopy[uid] = pi.Snapshot()
+	}
 	return podsCopy, nil
 }

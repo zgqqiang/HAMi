@@ -50,6 +50,11 @@ const (
 	HAMiComponentLabel = "app.kubernetes.io/component"
 	// HAMiComponentScheduler the label value for hami-scheduler.
 	HAMiComponentScheduler = "hami-scheduler"
+
+	// PodGroupLabel is the label used by scheduler-plugins Coscheduling to mark
+	// a pod as a member of a PodGroup. See
+	// https://github.com/kubernetes-sigs/scheduler-plugins/blob/master/apis/scheduling/v1alpha1/types.go
+	PodGroupLabel = "scheduling.x-k8s.io/pod-group"
 )
 
 var (
@@ -71,6 +76,10 @@ const (
 	GPUSchedulerPolicySpread SchedulerPolicyName = "spread"
 	// GPUSchedulerPolicyTopology is GPU use topology scheduler.
 	GPUSchedulerPolicyTopology SchedulerPolicyName = "topology-aware"
+	// GPUSchedulerPolicyMutex is GPU use mutex scheduler, only idle GPUs are allocated.
+	GPUSchedulerPolicyMutex SchedulerPolicyName = "mutex"
+	// GPUSchedulerPolicyNuma is GPU use numa scheduler, chained as a sort key alongside binpack/spread.
+	GPUSchedulerPolicyNuma SchedulerPolicyName = "numa"
 )
 
 const (
@@ -78,6 +87,12 @@ const (
 	NodeSchedulerPolicyAnnotationKey = "hami.io/node-scheduler-policy"
 	// GPUSchedulerPolicyAnnotationKey is user set Pod annotation to change this default GPU policy.
 	GPUSchedulerPolicyAnnotationKey = "hami.io/gpu-scheduler-policy"
+	// DeviceScoringWeightsAnnotationKey configures per-Pod slot, core, and memory scoring weights.
+	DeviceScoringWeightsAnnotationKey = "hami.io/device-scoring-weights"
+	// NumaAlignmentAnnotationKey is a per-Pod annotation selecting how HAMi
+	// reconciles the scheduler-selected GPU with the NUMA-aligned replica
+	// preferred by kubelet's Topology Manager. See NumaAlignmentMode.
+	NumaAlignmentAnnotationKey = "hami.io/numa-alignment"
 )
 
 func (s SchedulerPolicyName) String() string {
